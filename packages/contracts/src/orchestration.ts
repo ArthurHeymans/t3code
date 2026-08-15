@@ -415,6 +415,8 @@ export const OrchestrationThread = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  // Optional so payloads and cached snapshots from pre-view-state servers decode.
+  viewedAt: Schema.optional(IsoDateTime),
   // Snooze is an overlay on the active lifecycle, not a fourth destination:
   // a snoozed thread stays "active" in the model and is only suppressed from
   // the inbox until snoozedUntil passes (or the thread raises its hand).
@@ -486,6 +488,7 @@ export const OrchestrationThreadShell = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  viewedAt: Schema.optional(IsoDateTime),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
@@ -736,6 +739,18 @@ const ThreadUnsettleCommand = Schema.Struct({
   reason: Schema.Literal("user"),
 });
 
+const ThreadViewCommand = Schema.Struct({
+  type: Schema.Literal("thread.view"),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+
+const ThreadMarkUnreadCommand = Schema.Struct({
+  type: Schema.Literal("thread.mark-unread"),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+
 const ThreadSnoozeCommand = Schema.Struct({
   type: Schema.Literal("thread.snooze"),
   commandId: CommandId,
@@ -942,6 +957,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUnarchiveCommand,
   ThreadSettleCommand,
   ThreadUnsettleCommand,
+  ThreadViewCommand,
+  ThreadMarkUnreadCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
   ThreadPinCommand,
@@ -970,6 +987,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUnarchiveCommand,
   ThreadSettleCommand,
   ThreadUnsettleCommand,
+  ThreadViewCommand,
+  ThreadMarkUnreadCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
   ThreadPinCommand,
@@ -1088,6 +1107,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.unarchived",
   "thread.settled",
   "thread.unsettled",
+  "thread.viewed",
+  "thread.marked-unread",
   "thread.snoozed",
   "thread.unsnoozed",
   "thread.pinned",
@@ -1186,6 +1207,16 @@ export const ThreadUnsettledPayload = Schema.Struct({
   threadId: ThreadId,
   reason: Schema.Literals(["user", "activity"]),
   updatedAt: IsoDateTime,
+});
+
+export const ThreadViewedPayload = Schema.Struct({
+  threadId: ThreadId,
+  viewedAt: IsoDateTime,
+});
+
+export const ThreadMarkedUnreadPayload = Schema.Struct({
+  threadId: ThreadId,
+  viewedAt: IsoDateTime,
 });
 
 export const ThreadSnoozedPayload = Schema.Struct({
@@ -1422,6 +1453,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.unsettled"),
     payload: ThreadUnsettledPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.viewed"),
+    payload: ThreadViewedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.marked-unread"),
+    payload: ThreadMarkedUnreadPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
