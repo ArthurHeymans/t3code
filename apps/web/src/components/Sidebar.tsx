@@ -96,7 +96,11 @@ import {
   buildSidebarProjectSnapshots,
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
-import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
+import {
+  legacyProjectCwdPreferenceKey,
+  resolveThreadViewedAt,
+  useUiStateStore,
+} from "../uiStateStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useThreadActions } from "../hooks/useThreadActions";
 import { useThreadViewState } from "../hooks/useThreadViewState";
@@ -780,7 +784,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   const threadKey = scopedThreadKey(threadRef);
   const isRegeneratingTitle = thread.titleRegeneration != null;
   const localLastVisitedAt = useUiStateStore((state) => state.threadLastVisitedAtById[threadKey]);
-  const lastVisitedAt = thread.viewedAt ?? localLastVisitedAt;
+  const pendingViewState = useUiStateStore((state) => state.threadViewStatePendingById[threadKey]);
+  const lastVisitedAt = resolveThreadViewedAt({
+    serverViewedAt: thread.viewedAt,
+    localViewedAt: localLastVisitedAt,
+    pending: pendingViewState,
+  });
   const isSelected = useThreadSelectionStore((state) => state.selectedThreadKeys.has(threadKey));
   const openPrLink = useOpenPrLink();
   const runningTerminalIds = useThreadRunningTerminalIds({
