@@ -3104,9 +3104,6 @@ export function makeClaudeAdapterV2(
               driver: CLAUDE_PROVIDER,
               nativeThreadId: `${input.context.input.providerThread.id}:${input.taskId}`,
             });
-          const turnItemOrdinal =
-            existingSubagent?.turnItemOrdinal ??
-            (yield* resolveItemOrdinal(input.context, `${nativeItemId}:subagent`));
           // A resumed subagent's previous final answer and progress no longer
           // represent its outcome; the next task_progress/task_notification
           // carry the new ones.
@@ -3119,6 +3116,17 @@ export function makeClaudeAdapterV2(
                   )
                 : existingSubagent.task;
           const startsActivation = existingSubagent === undefined || isReopen;
+          const activationOrdinal = startsActivation
+            ? (existingSubagent?.task.activationCount ?? 0) + 1
+            : (existingSubagent?.task.activationCount ?? 1);
+          const activationItemNativeId =
+            activationOrdinal === 1
+              ? `${nativeItemId}:subagent`
+              : `${nativeItemId}:subagent:activation:${activationOrdinal}`;
+          const turnItemOrdinal =
+            existingSubagent !== undefined && !startsActivation
+              ? existingSubagent.turnItemOrdinal
+              : yield* resolveItemOrdinal(input.context, activationItemNativeId);
           const task = {
             ...(priorTask ?? {
               id: nodeId,
@@ -3181,10 +3189,7 @@ export function makeClaudeAdapterV2(
               startsActivation ? undefined : existingSubagent?.activation.usage,
               input.usage,
             ),
-            activationCount:
-              existingSubagent === undefined || isReopen
-                ? (priorTask?.activationCount ?? 0) + 1
-                : (priorTask?.activationCount ?? 1),
+            activationCount: activationOrdinal,
             recentActivity: appendSubagentActivity(
               priorTask?.recentActivity ?? [],
               input.progress,
@@ -3227,16 +3232,23 @@ export function makeClaudeAdapterV2(
             childThreadId,
             childRootNodeId,
             turnItemId:
-              existingSubagent?.turnItemId ??
-              idAllocator.derive.turnItemFromProviderItem({
-                driver: CLAUDE_PROVIDER,
-                nativeItemId: `${nativeItemId}:subagent`,
-              }),
+              existingSubagent !== undefined && !startsActivation
+                ? existingSubagent.turnItemId
+                : idAllocator.derive.turnItemFromProviderItem({
+                    driver: CLAUDE_PROVIDER,
+                    nativeItemId: activationItemNativeId,
+                  }),
             turnItemOrdinal,
             nextChildItemOrdinal: existingSubagent?.nextChildItemOrdinal ?? 100,
-            progressItemOrdinal: existingSubagent?.progressItemOrdinal ?? null,
-            progressStartedAt: existingSubagent?.progressStartedAt ?? null,
-            resultItemOrdinal: existingSubagent?.resultItemOrdinal ?? null,
+            progressItemOrdinal: startsActivation
+              ? null
+              : (existingSubagent?.progressItemOrdinal ?? null),
+            progressStartedAt: startsActivation
+              ? null
+              : (existingSubagent?.progressStartedAt ?? null),
+            resultItemOrdinal: startsActivation
+              ? null
+              : (existingSubagent?.resultItemOrdinal ?? null),
             // Consumed once the reopen it was recording has been applied.
             resumePending: isReopen ? false : (existingSubagent?.resumePending ?? false),
           } satisfies ActiveClaudeSubagent;
@@ -3444,7 +3456,7 @@ export function makeClaudeAdapterV2(
             progress.length > 0 &&
             (input.progress !== undefined || (lifecycleChanged && input.status !== "running"))
           ) {
-            const progressNativeItemId = `${nativeItemId}:progress`;
+            const progressNativeItemId = `${activationItemNativeId}:progress`;
             const progressItemOrdinal =
               subagent.progressItemOrdinal ?? ++subagent.nextChildItemOrdinal;
             const progressStartedAt = subagent.progressStartedAt ?? now;
@@ -3487,7 +3499,7 @@ export function makeClaudeAdapterV2(
             input.result.trim().length > 0 &&
             input.status !== "running"
           ) {
-            const resultNativeItemId = `${nativeItemId}:result`;
+            const resultNativeItemId = `${activationItemNativeId}:result`;
             const resultItemOrdinal = subagent.resultItemOrdinal ?? ++subagent.nextChildItemOrdinal;
             subagent.resultItemOrdinal = resultItemOrdinal;
             const resultArtifacts = makeSubagentConversationArtifacts({

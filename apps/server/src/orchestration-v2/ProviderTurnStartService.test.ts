@@ -160,6 +160,8 @@ function makeRootProjection(now: DateTime.Utc): OrchestrationV2ThreadProjection 
     providerThreads: [
       {
         id: providerThreadId,
+        driver,
+        providerInstanceId,
         providerSessionId,
         nativeThreadRef: {
           driver,
@@ -190,6 +192,8 @@ function makeRootProjection(now: DateTime.Utc): OrchestrationV2ThreadProjection 
     subagents: [
       {
         id: subagentId,
+        driver,
+        providerInstanceId,
         status: "idle",
         childThreadId,
         providerThreadId: childProviderThreadId,
@@ -213,6 +217,8 @@ function makeChildProjection(now: DateTime.Utc): OrchestrationV2ThreadProjection
     providerThreads: [
       {
         id: childProviderThreadId,
+        driver,
+        providerInstanceId,
         nativeThreadRef: {
           driver,
           nativeId: "native-child-thread",
@@ -408,6 +414,42 @@ it.effect("rehydrates a provider-native subagent without a child provider thread
     );
 
     assert.deepEqual(yield* Ref.get(existingSubagentCounts), [1]);
+    assert.equal(yield* Ref.get(providerSessionOpens), 1);
+    assert.equal(yield* Ref.get(runningWrites), 1);
+  }),
+);
+
+it.effect("does not rehydrate a subagent owned by another provider instance", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const existingSubagentCounts = yield* Ref.make<ReadonlyArray<number>>([]);
+    const providerSessionOpens = yield* Ref.make(0);
+    const runningWrites = yield* Ref.make(0);
+    const rootProjection = makeRootProjection(now);
+    const mismatchedProjection = {
+      ...rootProjection,
+      subagents: rootProjection.subagents.map((subagent) => ({
+        ...subagent,
+        providerInstanceId: ProviderInstanceId.make("codex-secondary"),
+      })),
+    };
+
+    yield* Effect.gen(function* () {
+      const service = yield* ProviderTurnStart.ProviderTurnStartServiceV2;
+      yield* service.start({ threadId, runId });
+    }).pipe(
+      Effect.provide(
+        makeTestLayer({
+          rootProjection: mismatchedProjection,
+          childProjection: Effect.die("mismatched child projection must not be loaded"),
+          existingSubagentCounts,
+          providerSessionOpens,
+          runningWrites,
+        }),
+      ),
+    );
+
+    assert.deepEqual(yield* Ref.get(existingSubagentCounts), [0]);
     assert.equal(yield* Ref.get(providerSessionOpens), 1);
     assert.equal(yield* Ref.get(runningWrites), 1);
   }),

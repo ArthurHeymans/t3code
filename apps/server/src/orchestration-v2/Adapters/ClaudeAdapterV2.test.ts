@@ -1708,6 +1708,19 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           0,
           "rehydration must not create a duplicate child thread",
         );
+        const subagentTurnItemIds = new Set(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "subagent"
+              ? [event.turnItem.id]
+              : [],
+          ),
+        );
+        assert.lengthOf(subagentTurnItemIds, 1);
+        assert.notInclude(
+          [...subagentTurnItemIds],
+          existing.turnItemId,
+          "a recovered agent's next activation must not overwrite its previous item",
+        );
       }).pipe(Effect.provide(Layer.merge(idAllocatorLayer, NodeServices.layer))),
     ),
   );

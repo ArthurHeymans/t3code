@@ -879,8 +879,8 @@ interface CodexSubagentThreadContext {
   readonly nativeToolCallId: string;
   readonly ordinal: number;
   readonly startedAt: DateTime.Utc;
-  readonly turnItemId: OrchestrationV2TurnItem["id"];
-  readonly turnItemOrdinal: number;
+  turnItemId: OrchestrationV2TurnItem["id"];
+  turnItemOrdinal: number;
   task: OrchestrationV2Subagent;
 }
 
@@ -1616,7 +1616,14 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
          */
         const seedExistingSubagents = (context: ActiveCodexTurnContext) =>
           Effect.gen(function* () {
-            const existing = context.input.existingSubagents ?? [];
+            const existing = (context.input.existingSubagents ?? []).filter(
+              (entry) =>
+                entry.subagent.driver === CODEX_PROVIDER &&
+                entry.subagent.providerInstanceId === adapterOptions.instanceId &&
+                entry.subagent.nativeTaskRef?.driver === CODEX_PROVIDER &&
+                entry.childProviderThread?.driver === CODEX_PROVIDER &&
+                entry.childProviderThread.providerInstanceId === adapterOptions.instanceId,
+            );
             if (existing.length === 0) return;
             yield* Ref.update(subagentThreads, (current) => {
               const updated = new Map(current);
@@ -2093,6 +2100,17 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               completedAt: null,
               updatedAt: turn.startedAt,
             } satisfies OrchestrationV2SubagentActivation;
+            if (activationOrdinal > 1) {
+              const activationItemNativeId = `${subagent.task.nativeTaskRef?.nativeId ?? subagent.nativeToolCallId}:activation:${activationOrdinal}`;
+              subagent.turnItemId = idAllocator.derive.turnItemFromProviderItem({
+                driver: CODEX_PROVIDER,
+                nativeItemId: activationItemNativeId,
+              });
+              subagent.turnItemOrdinal = yield* resolveItemOrdinal(
+                subagent.parentContext,
+                activationItemNativeId,
+              );
+            }
             activeContext.subagentActivation = activation;
             yield* Ref.update(subagentActivationsByNativeTurnId, (current) =>
               new Map(current).set(turn.nativeTurnId, activation),

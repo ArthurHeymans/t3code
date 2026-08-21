@@ -150,8 +150,11 @@ export const layer: Layer.Layer<
       // Broader than the child-thread list above: an interrupted agent is still
       // resumable, so it stays re-activatable even though its thread must not
       // be adopted up front.
-      const reactivatableSubagents = projection.subagents.filter((subagent) =>
-        canReactivateSubagent(subagent.status),
+      const reactivatableSubagents = projection.subagents.filter(
+        (subagent) =>
+          canReactivateSubagent(subagent.status) &&
+          subagent.driver === providerThread.driver &&
+          subagent.providerInstanceId === providerThread.providerInstanceId,
       );
       // Resolve the persisted registry before opening the provider session or
       // advancing the run. Operational read failures must leave the run in
@@ -162,9 +165,21 @@ export const layer: Layer.Layer<
           Effect.gen(function* () {
             const childThreadId = subagent.childThreadId;
             if (childThreadId === null) return [];
-            const turnItem = projection.turnItems.find(
+            const latestActivation = (projection.subagentActivations ?? [])
+              .filter((activation) => activation.subagentId === subagent.id)
+              .reduce<OrchestrationV2SubagentActivation | null>(
+                (latest, activation) =>
+                  latest === null || activation.ordinal > latest.ordinal ? activation : latest,
+                null,
+              );
+            const turnItems = projection.turnItems.filter(
               (item) => item.type === "subagent" && item.subagentId === subagent.id,
             );
+            const turnItem =
+              turnItems
+                .filter((item) => item.runId === latestActivation?.runId)
+                .toSorted((left, right) => right.ordinal - left.ordinal)[0] ??
+              turnItems.toSorted((left, right) => right.ordinal - left.ordinal)[0];
             if (turnItem === undefined) return [];
             const childProjection = yield* projectionStore.getThreadProjection(childThreadId).pipe(
               Effect.catchTags({
@@ -179,13 +194,13 @@ export const layer: Layer.Layer<
                     (candidate) => candidate.id === subagent.providerThreadId,
                   );
             if (childProviderThread === undefined) return [];
-            const latestActivation = (projection.subagentActivations ?? [])
-              .filter((activation) => activation.subagentId === subagent.id)
-              .reduce<OrchestrationV2SubagentActivation | null>(
-                (latest, activation) =>
-                  latest === null || activation.ordinal > latest.ordinal ? activation : latest,
-                null,
-              );
+            if (
+              childProviderThread !== null &&
+              (childProviderThread.driver !== providerThread.driver ||
+                childProviderThread.providerInstanceId !== providerThread.providerInstanceId)
+            ) {
+              return [];
+            }
             return [
               {
                 subagent,
@@ -198,7 +213,7 @@ export const layer: Layer.Layer<
               },
             ];
           }),
-        { concurrency: "unbounded" },
+        { concurrency: 8 },
       ).pipe(Effect.map((entries) => entries.flat()));
       const isCurrentAttemptInStatus = (
         expectedStatus: OrchestrationV2Run["status"],

@@ -259,13 +259,14 @@ function subagentTimelineEntry(input: {
   readonly prompt?: string;
   readonly progress?: string | null;
   readonly result?: string | null;
+  readonly position?: number;
 }): TimelineEntry {
   return {
     id: input.itemId,
     kind: "event",
     createdAt: MESSAGE_CREATED_AT,
     projectedItem: {
-      position: 0,
+      position: input.position ?? 0,
       visibility: "local",
       sourceThreadId: "thread-1",
       sourceItemId: input.itemId,
@@ -1521,7 +1522,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("3 failed");
   });
 
-  it("keeps an older CTA on its activation after the agent identity is reused", () => {
+  it("keeps separate CTAs when an agent identity is reused in a later run", () => {
     const now = DateTime.makeUnsafe(MESSAGE_CREATED_AT);
     const subagentId = NodeId.make("node-subagent-reused");
     const oldRunId = RunId.make("run-subagent-old");
@@ -1576,15 +1577,23 @@ describe("MessagesTimeline", () => {
             runId: oldRunId,
             status: "completed",
           }),
+          subagentTimelineEntry({
+            itemId: "subagent-new-item",
+            subagentId,
+            runId: newRunId,
+            status: "running",
+            position: 1,
+          }),
         ]}
       />,
     );
 
     expect(markup).toContain("Ran 1 subagent");
+    expect(markup).toContain("Kicked off 1 subagent");
     expect(markup).toContain("✓ completed");
     expect(markup).toContain("Σ 120");
-    expect(markup).not.toContain("Σ 900");
-    expect(markup).not.toContain("working");
+    expect(markup).toContain("Σ 900");
+    expect(markup).toContain("working");
   });
 
   it("renders V2 provider retries in the normal work log", () => {

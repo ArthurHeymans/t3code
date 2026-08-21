@@ -3746,6 +3746,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
         assert.lengthOf(harness.terminalEvents(), 1);
         assert.lengthOf(harness.continuationRequests, 0);
+        const subagentTurnItemIds = new Set(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "subagent"
+              ? [event.turnItem.id]
+              : [],
+          ),
+        );
+        assert.lengthOf(
+          subagentTurnItemIds,
+          2,
+          "each activation keeps its own parent timeline item",
+        );
       }).pipe(Effect.provide(Layer.merge(idAllocatorLayer, NodeServices.layer))),
     ),
   );
@@ -4103,6 +4115,19 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           [RESTART_SUBAGENT_ID],
         );
         assert.equal(activations.at(-1)?.activation.usage?.totalTokens, 150);
+        const subagentTurnItemIds = new Set(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "subagent"
+              ? [event.turnItem.id]
+              : [],
+          ),
+        );
+        assert.lengthOf(subagentTurnItemIds, 1);
+        assert.notInclude(
+          [...subagentTurnItemIds],
+          existing.turnItemId,
+          "a recovered agent's next activation must not overwrite its previous item",
+        );
       }).pipe(Effect.provide(Layer.merge(idAllocatorLayer, NodeServices.layer))),
     ),
   );
