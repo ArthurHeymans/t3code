@@ -580,14 +580,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      const viewedThrough = DateTime.make(command.viewedThrough);
+      if (Option.isNone(viewedThrough)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} view boundary ${command.viewedThrough} is not a valid timestamp`,
+        });
+      }
       const occurredAt = yield* nowIso;
-      const cappedViewedAt = DateTime.make(command.viewedThrough).pipe(
-        Option.filter(
-          (viewedThrough) => DateTime.Order(viewedThrough, DateTime.makeUnsafe(occurredAt)) <= 0,
-        ),
-        Option.as(command.viewedThrough),
-        Option.getOrElse(() => occurredAt),
-      );
+      const cappedViewedAt =
+        DateTime.Order(viewedThrough.value, DateTime.makeUnsafe(occurredAt)) <= 0
+          ? command.viewedThrough
+          : occurredAt;
       const viewedAt = DateTime.make(thread.viewedAt ?? thread.createdAt).pipe(
         Option.filter(
           (previousViewedAt) =>

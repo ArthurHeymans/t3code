@@ -122,6 +122,25 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
     }),
   );
 
+  it.effect("rejects an invalid viewed boundary instead of marking the thread read", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-invalid"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: "not-a-timestamp",
+        },
+        readModel: makeReadModel(),
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.view",
+      });
+    }),
+  );
+
   it.effect("marks unread just before the latest completion", () =>
     Effect.gen(function* () {
       const event = yield* decideOrchestrationCommand({

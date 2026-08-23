@@ -62,6 +62,7 @@ export function useThreadViewState() {
 
   const markViewed = useCallback(
     (threadRef: ScopedThreadRef, viewedThrough: string, serverSupportsViewState?: boolean) => {
+      if (!Number.isFinite(Date.parse(viewedThrough))) return;
       const threadKey = scopedThreadKey(threadRef);
       if (!(serverSupportsViewState ?? readEnvironmentSupportsViewState(threadRef.environmentId))) {
         markLocalViewed(threadKey, viewedThrough);
@@ -99,6 +100,7 @@ export function useThreadViewState() {
       const threadKey = scopedThreadKey(threadRef);
       if (
         latestTurnCompletedAt == null ||
+        !Number.isFinite(Date.parse(latestTurnCompletedAt)) ||
         !readEnvironmentSupportsViewState(threadRef.environmentId)
       ) {
         markLocalUnread(threadKey, latestTurnCompletedAt);

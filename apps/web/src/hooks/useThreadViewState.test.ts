@@ -20,9 +20,9 @@ const testState = vi.hoisted(() => {
     }),
     markThreadUnread: vi.fn((threadKey: string, completedAt: string | null | undefined) => {
       if (completedAt === null || completedAt === undefined) return;
-      uiState.threadLastVisitedAtById[threadKey] = new Date(
-        Date.parse(completedAt) - 1,
-      ).toISOString();
+      const completedAtMs = Date.parse(completedAt);
+      if (!Number.isFinite(completedAtMs)) return;
+      uiState.threadLastVisitedAtById[threadKey] = new Date(completedAtMs - 1).toISOString();
     }),
     setThreadViewStatePending: vi.fn((threadKey: string, pending: PendingState) => {
       uiState.threadViewStatePendingById[threadKey] = pending;
@@ -218,5 +218,16 @@ describe("useThreadViewState", () => {
     testState.supported = true;
     markViewed(threadRef, completedAt, true);
     expect(testState.viewThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send invalid view or completion timestamps", () => {
+    const { markUnread, markViewed } = renderHook();
+
+    markViewed(threadRef, "not-a-timestamp");
+    markUnread(threadRef, "not-a-timestamp");
+
+    expect(testState.viewThread).not.toHaveBeenCalled();
+    expect(testState.markUnreadOnServer).not.toHaveBeenCalled();
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
   });
 });

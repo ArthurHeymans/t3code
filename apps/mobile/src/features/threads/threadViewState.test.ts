@@ -29,4 +29,15 @@ describe("shouldAcknowledgeThreadView", () => {
     ).toBe(false);
     expect(shouldAcknowledgeThreadView({ ...input, viewedAt: undefined })).toBe(true);
   });
+
+  it("does not acknowledge an invalid completion timestamp", () => {
+    expect(shouldAcknowledgeThreadView({ ...input, completedAt: "not-a-timestamp" })).toBe(false);
+    expect(
+      shouldAcknowledgeThreadView({
+        ...input,
+        completedAt: "not-a-timestamp",
+        viewedAt: undefined,
+      }),
+    ).toBe(false);
+  });
 });

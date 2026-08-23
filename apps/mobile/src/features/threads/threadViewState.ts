@@ -16,11 +16,10 @@ export function shouldAcknowledgeThreadView(input: {
   ) {
     return false;
   }
+  const completedAtMs = Date.parse(input.completedAt);
+  if (!Number.isFinite(completedAtMs)) return false;
   if (input.viewedAt === undefined) return true;
 
   const viewedAtMs = Date.parse(input.viewedAt);
-  const completedAtMs = Date.parse(input.completedAt);
-  return (
-    !Number.isFinite(viewedAtMs) || !Number.isFinite(completedAtMs) || viewedAtMs < completedAtMs
-  );
+  return !Number.isFinite(viewedAtMs) || viewedAtMs < completedAtMs;
 }
