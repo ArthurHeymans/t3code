@@ -1,10 +1,13 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef } from "@t3tools/contracts";
+import * as Option from "effect/Option";
 import { useCallback, useMemo } from "react";
 
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import { readEnvironmentSupportsViewState, readThreadShell } from "../state/entities";
+import { environmentShell } from "../state/shell";
 import { threadEnvironment } from "../state/threads";
-import { useUiStateStore } from "../uiStateStore";
+import { type PendingThreadViewState, useUiStateStore } from "../uiStateStore";
 import { useAtomCommand } from "../state/use-atom-command";
 
 function timestampCovers(timestamp: string | undefined, target: string): boolean {
@@ -12,6 +15,40 @@ function timestampCovers(timestamp: string | undefined, target: string): boolean
   const timestampMs = Date.parse(timestamp);
   const targetMs = Date.parse(target);
   return Number.isFinite(timestampMs) && Number.isFinite(targetMs) && timestampMs >= targetMs;
+}
+
+function clearPendingWhenShellCatchesUp(
+  threadRef: ScopedThreadRef,
+  pending: PendingThreadViewState,
+  sequence: number,
+  clearPending: (threadKey: string, pending: PendingThreadViewState) => void,
+): void {
+  const threadKey = scopedThreadKey(threadRef);
+  const shellStateAtom = environmentShell.stateValueAtom(threadRef.environmentId);
+  let unsubscribe: (() => void) | undefined;
+  let completed = false;
+  const finishIfCaughtUp = () => {
+    if (completed) return;
+    if (useUiStateStore.getState().threadViewStatePendingById[threadKey] !== pending) {
+      completed = true;
+      unsubscribe?.();
+      return;
+    }
+    const snapshot = appAtomRegistry.get(shellStateAtom).snapshot;
+    if (Option.isNone(snapshot) || snapshot.value.snapshotSequence < sequence) return;
+    completed = true;
+    unsubscribe?.();
+    clearPending(threadKey, pending);
+  };
+
+  finishIfCaughtUp();
+  if (completed) return;
+  unsubscribe = appAtomRegistry.subscribe(shellStateAtom, finishIfCaughtUp);
+  if (completed) {
+    unsubscribe();
+    return;
+  }
+  finishIfCaughtUp();
 }
 
 /** Keeps the local compatibility marker and the server view marker in sync. */
@@ -24,21 +61,35 @@ export function useThreadViewState() {
   const markUnreadOnServer = useAtomCommand(threadEnvironment.markUnread, "thread mark unread");
 
   const markViewed = useCallback(
-    (threadRef: ScopedThreadRef, viewedThrough: string) => {
+    (threadRef: ScopedThreadRef, viewedThrough: string, serverSupportsViewState?: boolean) => {
       const threadKey = scopedThreadKey(threadRef);
-      if (!readEnvironmentSupportsViewState(threadRef.environmentId)) {
+      if (!(serverSupportsViewState ?? readEnvironmentSupportsViewState(threadRef.environmentId))) {
         markLocalViewed(threadKey, viewedThrough);
         return;
       }
       const thread = readThreadShell(threadRef);
-      if (timestampCovers(thread?.viewedAt, viewedThrough)) return;
+      const previousPending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
+      if (
+        previousPending?.kind !== "unread" &&
+        (timestampCovers(thread?.viewedAt, viewedThrough) ||
+          (previousPending?.kind === "viewed" &&
+            timestampCovers(previousPending.targetAt, viewedThrough)))
+      ) {
+        return;
+      }
       const pending = { kind: "viewed", targetAt: viewedThrough } as const;
       setPending(threadKey, pending);
       markLocalViewed(threadKey, viewedThrough);
       void viewThread({
         environmentId: threadRef.environmentId,
         input: { threadId: threadRef.threadId, viewedThrough },
-      }).then(() => clearPending(threadKey, pending));
+      }).then((result) => {
+        if (result._tag === "Failure") {
+          clearPending(threadKey, pending);
+          return;
+        }
+        clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
+      });
     },
     [clearPending, markLocalViewed, setPending, viewThread],
   );
@@ -59,7 +110,13 @@ export function useThreadViewState() {
       void markUnreadOnServer({
         environmentId: threadRef.environmentId,
         input: { threadId: threadRef.threadId },
-      }).then(() => clearPending(threadKey, pending));
+      }).then((result) => {
+        if (result._tag === "Failure") {
+          clearPending(threadKey, pending);
+          return;
+        }
+        clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
+      });
     },
     [clearPending, markLocalUnread, markUnreadOnServer, setPending],
   );

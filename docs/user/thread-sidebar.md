@@ -19,6 +19,14 @@ If reordering is unavailable for one environment, update the T3 Code server runn
 environment. Older servers can still pin and unpin threads, but do not understand synced ordering;
 their pinned threads keep the default newest-first order below the ones you have arranged.
 
+## Read and unread threads
+
+Open a completed thread to clear its **Done** indicator on your connected devices. On web and
+desktop, open the thread's context menu and choose **Mark unread** to restore the indicator.
+
+Older servers keep read and unread changes on the current device. Update the server to sync those
+changes across your devices.
+
 ## Environment artwork
 
 Dev and Nightly environments can identify themselves with artwork at the top of the sidebar and in

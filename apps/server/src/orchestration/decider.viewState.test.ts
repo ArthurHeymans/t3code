@@ -71,9 +71,53 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
       });
       const viewed = Array.isArray(event) ? event[0] : event;
 
-      expect(viewed?.type).toBe("thread.viewed");
-      if (viewed?.type === "thread.viewed") {
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
         expect(viewed.payload.viewedAt).toBe(VIEWED_THROUGH);
+        expect(viewed.payload.updatedAt).toBe(COMPLETED_AT);
+      }
+    }),
+  );
+
+  it.effect("caps future view boundaries at the server clock", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-02T00:00:00.000Z";
+      yield* TestClock.setTime(Date.parse(now));
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-future"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: "2026-01-03T00:00:00.000Z",
+        },
+        readModel: makeReadModel(),
+      });
+      const viewed = Array.isArray(event) ? event[0] : event;
+
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
+        expect(viewed.payload.viewedAt).toBe(now);
+      }
+    }),
+  );
+
+  it.effect("does not move the viewed boundary backward", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z"));
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-stale"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: "2026-01-01T00:00:15.000Z",
+        },
+        readModel: makeReadModel(),
+      });
+      const viewed = Array.isArray(event) ? event[0] : event;
+
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
+        expect(viewed.payload.viewedAt).toBe("2026-01-01T00:00:30.000Z");
       }
     }),
   );
@@ -90,9 +134,10 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
       });
       const markedUnread = Array.isArray(event) ? event[0] : event;
 
-      expect(markedUnread?.type).toBe("thread.marked-unread");
-      if (markedUnread?.type === "thread.marked-unread") {
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
         expect(markedUnread.payload.viewedAt).toBe("2026-01-01T00:00:59.999Z");
+        expect(markedUnread.payload.updatedAt).toBe(COMPLETED_AT);
       }
     }),
   );

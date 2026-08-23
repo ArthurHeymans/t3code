@@ -1360,6 +1360,9 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [routeKind, routeThreadRef, routeThreadState]);
   const { markViewed } = useThreadViewState();
+  const supportsThreadViewState =
+    useAtomValue(serverEnvironment.configValueAtom(environmentId))?.environment.capabilities
+      .threadViewState === true;
   const settings = useEnvironmentSettings(environmentId);
   // New-thread defaults live in the primary environment's settings.json (the
   // settings UI never writes to remote environments), so read them from the
@@ -1789,17 +1792,30 @@ function ChatViewContent(props: ChatViewProps) {
   // Reading a finished thread clears the sidebar's Done badge. The visit is
   // stamped at the turn's completion time — not now/updatedAt — so it clears
   // exactly the completion the user is looking at: a wake or completion that
-  // lands later still gets its signal (markThreadVisited never moves the
+  // lands later still gets its signal (markViewed never moves the
   // timestamp backwards).
   useEffect(() => {
     const completedAt = serverThread?.latestTurn?.completedAt;
     if (!serverThread?.id || !completedAt) return;
-    markViewed(scopeThreadRef(serverThread.environmentId, serverThread.id), completedAt);
+    const threadRef = scopeThreadRef(serverThread.environmentId, serverThread.id);
+    const acknowledgeVisibleThread = () => {
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+      markViewed(threadRef, completedAt, supportsThreadViewState);
+    };
+
+    acknowledgeVisibleThread();
+    document.addEventListener("visibilitychange", acknowledgeVisibleThread);
+    window.addEventListener("focus", acknowledgeVisibleThread);
+    return () => {
+      document.removeEventListener("visibilitychange", acknowledgeVisibleThread);
+      window.removeEventListener("focus", acknowledgeVisibleThread);
+    };
   }, [
     markViewed,
     serverThread?.environmentId,
     serverThread?.id,
     serverThread?.latestTurn?.completedAt,
+    supportsThreadViewState,
   ]);
   useEffect(() => {
     setMountedTerminalThreadKeys((currentThreadIds) => {

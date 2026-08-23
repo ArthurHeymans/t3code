@@ -231,32 +231,6 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
-  describe("thread.viewed / thread.marked-unread", () => {
-    it.each(["thread.viewed", "thread.marked-unread"] as const)(
-      "stores viewedAt for %s",
-      (type) => {
-        const viewedAt = "2026-04-01T05:00:00.000Z";
-        const result = applyThreadDetailEvent(baseThread, {
-          ...baseEventFields,
-          sequence: 5,
-          occurredAt: viewedAt,
-          aggregateKind: "thread",
-          aggregateId: ThreadId.make("thread-1"),
-          type,
-          payload: {
-            threadId: ThreadId.make("thread-1"),
-            viewedAt,
-          },
-        });
-
-        expect(result.kind).toBe("updated");
-        if (result.kind === "updated") {
-          expect(result.thread.viewedAt).toBe(viewedAt);
-        }
-      },
-    );
-  });
-
   describe("thread.pinned / thread.unpinned", () => {
     it("sets pinnedAt", () => {
       const pinnedAt = "2026-04-01T05:00:00.000Z";
@@ -374,6 +348,29 @@ describe("applyThreadDetailEvent", () => {
       expect(cleared.kind).toBe("updated");
       if (cleared.kind === "updated") {
         expect(cleared.thread.linkedPullRequest).toBeNull();
+      }
+    });
+
+    it("patches viewedAt without changing the thread update time", () => {
+      const viewedAt = "2026-04-01T05:00:00.000Z";
+      const result = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 5,
+        occurredAt: viewedAt,
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.meta-updated",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          viewedAt,
+          updatedAt: baseThread.updatedAt,
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.viewedAt).toBe(viewedAt);
+        expect(result.thread.updatedAt).toBe(baseThread.updatedAt);
       }
     });
   });

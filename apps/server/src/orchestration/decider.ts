@@ -603,10 +603,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           occurredAt,
           commandId: command.commandId,
         })),
-        type: "thread.viewed",
+        type: "thread.meta-updated",
         payload: {
           threadId: command.threadId,
           viewedAt,
+          updatedAt: thread.updatedAt,
         },
       };
     }
@@ -634,10 +635,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           occurredAt,
           commandId: command.commandId,
         })),
-        type: "thread.marked-unread",
+        type: "thread.meta-updated",
         payload: {
           threadId: command.threadId,
           viewedAt,
+          updatedAt: thread.updatedAt,
         },
       };
     }

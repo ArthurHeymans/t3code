@@ -56,6 +56,9 @@ function getOptionValue(
 const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPayload);
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
+const decodeLegacyThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(
+  Schema.Struct({ threadId: Schema.String, updatedAt: Schema.String }),
+);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 const decodeDispatchCommandError = Schema.decodeUnknownEffect(OrchestrationDispatchCommandError);
 
@@ -497,8 +500,10 @@ it.effect("defaults settled fields when decoding historical thread data", () =>
 
     assert.strictEqual(thread.settledOverride, null);
     assert.strictEqual(thread.settledAt, null);
+    assert.strictEqual(thread.viewedAt, undefined);
     assert.strictEqual(shell.settledOverride, null);
     assert.strictEqual(shell.settledAt, null);
+    assert.strictEqual(shell.viewedAt, undefined);
   }),
 );
 
@@ -588,38 +593,30 @@ it.effect("decodes thread settled and unsettled events", () =>
   }),
 );
 
-it.effect("decodes thread view-state events", () =>
+it.effect("stores viewed state in metadata events that older decoders can read", () =>
   Effect.gen(function* () {
     const viewedAt = "2026-01-02T00:00:00.000Z";
+    const updatedAt = "2026-01-01T00:00:00.000Z";
     const viewed = yield* decodeOrchestrationEvent({
       sequence: 1,
       eventId: "event-viewed-1",
       aggregateKind: "thread",
       aggregateId: "thread-1",
-      type: "thread.viewed",
+      type: "thread.meta-updated",
       occurredAt: viewedAt,
       commandId: "cmd-viewed-1",
       causationEventId: null,
       correlationId: "cmd-viewed-1",
       metadata: {},
-      payload: { threadId: "thread-1", viewedAt },
+      payload: { threadId: "thread-1", viewedAt, updatedAt },
     });
-    const markedUnread = yield* decodeOrchestrationEvent({
-      sequence: 2,
-      eventId: "event-marked-unread-1",
-      aggregateKind: "thread",
-      aggregateId: "thread-1",
-      type: "thread.marked-unread",
-      occurredAt: viewedAt,
-      commandId: "cmd-marked-unread-1",
-      causationEventId: null,
-      correlationId: "cmd-marked-unread-1",
-      metadata: {},
-      payload: { threadId: "thread-1", viewedAt },
-    });
+    const legacyPayload = yield* decodeLegacyThreadMetaUpdatedPayload(viewed.payload);
 
-    assert.strictEqual(viewed.type, "thread.viewed");
-    assert.strictEqual(markedUnread.type, "thread.marked-unread");
+    assert.strictEqual(viewed.type, "thread.meta-updated");
+    if (viewed.type === "thread.meta-updated") {
+      assert.strictEqual(viewed.payload.viewedAt, viewedAt);
+    }
+    assert.deepEqual(legacyPayload, { threadId: "thread-1", updatedAt });
   }),
 );
 

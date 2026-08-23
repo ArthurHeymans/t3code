@@ -13,7 +13,7 @@ import {
   threadHasOlderTurns,
 } from "@t3tools/client-runtime/state/threads";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/projectScripts";
-import { Platform, ScrollView, View } from "react-native";
+import { AppState, Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useWorkspaceState } from "../../state/workspace";
 import { useEnvironmentQuery } from "../../state/query";
@@ -75,6 +75,7 @@ import {
   ThreadInspectorContentStack,
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
+import { shouldAcknowledgeThreadView } from "./threadViewState";
 
 interface ThreadInspectorSelection {
   readonly routeThreadIdentity: string | null;
@@ -94,13 +95,6 @@ function firstRouteParam(value: string | string[] | undefined): string | null {
   }
 
   return value ?? null;
-}
-
-function timestampCovers(timestamp: string | undefined, target: string): boolean {
-  if (timestamp === undefined) return false;
-  const timestampMs = Date.parse(timestamp);
-  const targetMs = Date.parse(target);
-  return Number.isFinite(timestampMs) && Number.isFinite(targetMs) && timestampMs >= targetMs;
 }
 
 function OpeningThreadLoadingScreen() {
@@ -298,17 +292,27 @@ function ThreadRouteContent(
   const selectedThreadViewedAtRef = useRef(selectedThread?.viewedAt);
   selectedThreadViewedAtRef.current = selectedThread?.viewedAt;
   const supportsThreadViewState = serverConfig?.environment.capabilities.threadViewState === true;
+  const [appState, setAppState] = useState(() => AppState.currentState);
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", setAppState);
+    return () => {
+      subscription.remove();
+    };
+  }, []);
   useFocusEffect(
     useCallback(() => {
       if (
         selectedThreadEnvironmentId === null ||
         selectedThreadId === null ||
         selectedThreadCompletedAt === null ||
-        !supportsThreadViewState
+        !shouldAcknowledgeThreadView({
+          appState,
+          connectionState: routeConnectionState,
+          completedAt: selectedThreadCompletedAt,
+          viewedAt: selectedThreadViewedAtRef.current,
+          supported: supportsThreadViewState,
+        })
       ) {
-        return;
-      }
-      if (timestampCovers(selectedThreadViewedAtRef.current, selectedThreadCompletedAt)) {
         return;
       }
       void viewThread({
@@ -319,6 +323,8 @@ function ThreadRouteContent(
         },
       });
     }, [
+      appState,
+      routeConnectionState,
       selectedThreadCompletedAt,
       selectedThreadEnvironmentId,
       selectedThreadId,
