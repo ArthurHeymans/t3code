@@ -855,8 +855,9 @@ describe("CheckpointReactor", () => {
       seedFilesystemCheckpoints: false,
       threadWorktreePath: null,
     });
+    if (runtime === null) throw new Error("Checkpoint test runtime was not initialized.");
 
-    await Effect.runPromise(
+    await runtime.runPromise(
       harness.engine.dispatch({
         type: "thread.history.import",
         commandId: CommandId.make("cmd-import-history-without-checkpoint"),
