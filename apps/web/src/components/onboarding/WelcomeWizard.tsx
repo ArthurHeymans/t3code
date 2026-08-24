@@ -3,6 +3,7 @@ import { useAtomValue } from "@effect/atom-react";
 import type {
   AgentSessionProjectCandidate,
   EnvironmentId,
+  ProjectId,
   ServerProvider,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -913,9 +914,9 @@ function ImportStep({
   const [deselected, setDeselected] = useState<ReadonlySet<string>>(new Set());
   const [isImporting, setIsImporting] = useState(false);
   const [importError, setImportError] = useState("");
-  // Paths that already imported this session, so a retry after a partial
-  // failure skips them instead of tripping the duplicate-root invariant.
+  // Keep created projects separate from completed imports so history failures can retry.
   const importedPathsRef = useRef(new Set<string>());
+  const createdProjectIdsRef = useRef(new Map<string, ProjectId>());
   const importGenerationRef = useRef(0);
 
   // Candidate paths are per-environment; a target switch would otherwise
@@ -926,6 +927,7 @@ function ImportStep({
     setIsImporting(false);
     setImportError("");
     importedPathsRef.current = new Set();
+    createdProjectIdsRef.current = new Map();
     return () => {
       importGenerationRef.current += 1;
     };
@@ -947,6 +949,7 @@ function ImportStep({
     setImportError("");
     const importGeneration = importGenerationRef.current;
     const importedPaths = importedPathsRef.current;
+    const createdProjectIds = createdProjectIdsRef.current;
     const defaultModelSelection = resolveDefaultProviderModelSelection(providers ?? [], null);
     // Interrupted imports are neither failures nor successes — the command was
     // superseded or the environment dropped — but they still didn't land, so
@@ -965,29 +968,18 @@ function ImportStep({
         return;
       }
       if (importedPaths.has(candidate.path)) continue;
-      const projectId = newProjectId();
-      const result = await createProject({
-        environmentId,
-        input: {
-          projectId,
-          title: candidate.title,
-          workspaceRoot: candidate.path,
-          createWorkspaceRootIfMissing: false,
-          defaultModelSelection,
-        },
-      });
-      if (
-        importGeneration !== importGenerationRef.current ||
-        importedPaths !== importedPathsRef.current
-      ) {
-        return;
-      }
-      if (result._tag === "Success") {
-        imported += 1;
-        importedPaths.add(candidate.path);
-        await importThreads({
+      let projectId = createdProjectIds.get(candidate.path);
+      if (projectId === undefined) {
+        projectId = newProjectId();
+        const result = await createProject({
           environmentId,
-          input: { projectId, workspaceRoot: candidate.path },
+          input: {
+            projectId,
+            title: candidate.title,
+            workspaceRoot: candidate.path,
+            createWorkspaceRootIfMissing: false,
+            defaultModelSelection,
+          },
         });
         if (
           importGeneration !== importGenerationRef.current ||
@@ -995,6 +987,26 @@ function ImportStep({
         ) {
           return;
         }
+        if (result._tag !== "Success") continue;
+        createdProjectIds.set(candidate.path, projectId);
+      }
+
+      const threadImportResult = await importThreads({
+        environmentId,
+        input: { projectId, workspaceRoot: candidate.path },
+      });
+      if (
+        importGeneration !== importGenerationRef.current ||
+        importedPaths !== importedPathsRef.current
+      ) {
+        return;
+      }
+      if (
+        threadImportResult._tag === "Success" &&
+        (threadImportResult.value.importedCount > 0 || threadImportResult.value.skippedCount === 0)
+      ) {
+        imported += 1;
+        importedPaths.add(candidate.path);
       }
     }
     setIsImporting(false);

@@ -6,6 +6,7 @@ import * as Stream from "effect/Stream";
 
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
+import { ProviderSessionDirectoryPersistenceError } from "../provider/Errors.ts";
 import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
 import { importRecentAgentThreads } from "./AgentSessionImporter.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
@@ -133,6 +134,88 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
 
         expect(result).toEqual({ importedCount: 1, skippedCount: 1 });
         expect(bindings[0]?.provider).toBe("claudeAgent");
+      }),
+    );
+
+    it.effect("retries a partially imported session with the original command receipts", () =>
+      Effect.gen(function* () {
+        const acceptedCommandIds = new Set<string>();
+        const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
+        let threadCreated = false;
+        let historyAttemptCount = 0;
+        let bindingAttemptCount = 0;
+        const scanner = AgentSessionScanner.AgentSessionScanner.of({
+          scan: Effect.die("unused"),
+          recentThreads: () => Effect.succeed([makeThread("codex")]),
+        });
+        const engine = OrchestrationEngine.OrchestrationEngineService.of({
+          dispatch: (command) => {
+            if (acceptedCommandIds.has(command.commandId)) {
+              return Effect.succeed({ sequence: 1 });
+            }
+            if (command.type === "thread.create") {
+              if (threadCreated) {
+                return Effect.fail(
+                  new OrchestrationCommandInvariantError({
+                    commandType: command.type,
+                    detail: "The thread already exists.",
+                  }),
+                );
+              }
+              threadCreated = true;
+              acceptedCommandIds.add(command.commandId);
+              return Effect.succeed({ sequence: 1 });
+            }
+            historyAttemptCount += 1;
+            if (historyAttemptCount === 1) {
+              return Effect.fail(
+                new OrchestrationCommandInvariantError({
+                  commandType: command.type,
+                  detail: "Temporary history import failure.",
+                }),
+              );
+            }
+            acceptedCommandIds.add(command.commandId);
+            return Effect.succeed({ sequence: 2 });
+          },
+          readEvents: () => Stream.empty,
+          streamDomainEvents: Stream.empty,
+          latestSequence: Effect.succeed(0),
+        });
+        const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+          upsert: (binding) => {
+            bindingAttemptCount += 1;
+            if (bindingAttemptCount === 1) {
+              return Effect.fail(
+                new ProviderSessionDirectoryPersistenceError({
+                  operation: "upsert",
+                  detail: "Temporary session storage failure.",
+                }),
+              );
+            }
+            bindings.push(binding);
+            return Effect.void;
+          },
+          getProvider: () => Effect.die("unused"),
+          getBinding: () => Effect.die("unused"),
+          listThreadIds: () => Effect.die("unused"),
+          listBindings: () => Effect.die("unused"),
+        });
+        const runImport = () =>
+          importRecentAgentThreads({
+            projectId: ProjectId.make("project-1"),
+            workspaceRoot: "/tmp/project",
+          }).pipe(
+            Effect.provideService(AgentSessionScanner.AgentSessionScanner, scanner),
+            Effect.provideService(OrchestrationEngine.OrchestrationEngineService, engine),
+            Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, directory),
+          );
+
+        expect(yield* runImport()).toEqual({ importedCount: 0, skippedCount: 1 });
+        expect(yield* runImport()).toEqual({ importedCount: 0, skippedCount: 1 });
+        expect(yield* runImport()).toEqual({ importedCount: 1, skippedCount: 0 });
+        expect(bindings).toHaveLength(1);
+        expect(historyAttemptCount).toBe(2);
       }),
     );
   });

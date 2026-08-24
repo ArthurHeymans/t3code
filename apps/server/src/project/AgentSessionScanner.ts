@@ -141,7 +141,7 @@ type AgentSessionSource = AgentSessionProjectCandidate["sources"][number];
 interface RawCandidate {
   readonly cwd: string;
   readonly source: AgentSessionSource;
-  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerInstanceIds: Array<ProviderInstanceId>;
   readonly threadCount: number;
   readonly lastActiveAtMs: number | null;
   readonly transcripts: ReadonlyArray<{
@@ -421,72 +421,66 @@ export const make = Effect.gen(function* () {
   ) {
     const projectsDir = path.join(homePath, "projects");
     const projectDirectories = yield* listDirectory(projectsDir);
-    const candidates: Array<RawCandidate> = [];
-    let readBudget = MAX_TRANSCRIPTS_PER_SOURCE;
     let statBudget = MAX_STATS_PER_SOURCE;
+    const transcripts: Array<{ filePath: string; mtimeMs: number }> = [];
 
     for (const projectDirectory of projectDirectories) {
-      if (readBudget <= 0 || statBudget <= 0) break;
+      if (statBudget <= 0) break;
       const directory = path.join(projectsDir, projectDirectory);
-      const transcripts = (yield* listDirectory(directory))
+      const directoryTranscripts = (yield* listDirectory(directory))
         .filter((entry) => entry.endsWith(".jsonl"))
         .map((entry) => path.join(directory, entry));
-      if (transcripts.length === 0) continue;
+      if (directoryTranscripts.length === 0) continue;
 
-      // Stat (bounded), then spend the read budget newest-first, so the cap
-      // only ever drops the oldest transcripts.
-      const statted = transcripts.slice(0, statBudget);
+      const statted = directoryTranscripts.slice(0, statBudget);
       statBudget -= statted.length;
-      const withMtimes: Array<{ filePath: string; mtimeMs: number }> = [];
       for (const filePath of statted) {
         const stats = yield* statOption(filePath);
         if (Option.isNone(stats) || Option.isNone(stats.value.mtime)) continue;
-        withMtimes.push({ filePath, mtimeMs: stats.value.mtime.value.getTime() });
+        transcripts.push({ filePath, mtimeMs: stats.value.mtime.value.getTime() });
       }
-      withMtimes.sort((left, right) => right.mtimeMs - left.mtimeMs);
-      withMtimes.splice(readBudget);
-      readBudget -= withMtimes.length;
+    }
 
-      // The slug is lossy (`/a/b.c` and `/a/b/c` share a directory), so a
-      // directory can hold sessions from several distinct paths — group by
-      // the recorded cwd like the Codex scan does.
-      const byCwd = new Map<
-        string,
-        {
-          threadCount: number;
-          lastActiveAtMs: number;
-          transcripts: Array<{ filePath: string; mtimeMs: number }>;
-        }
-      >();
-      for (const entry of withMtimes) {
-        const cwd = yield* readCwd(entry.filePath);
-        if (cwd === null) continue;
-        const existing = byCwd.get(cwd);
-        if (existing) {
-          existing.threadCount += 1;
-          existing.lastActiveAtMs = Math.max(existing.lastActiveAtMs, entry.mtimeMs);
-          existing.transcripts.push(entry);
-        } else {
-          byCwd.set(cwd, {
-            threadCount: 1,
-            lastActiveAtMs: entry.mtimeMs,
-            transcripts: [entry],
-          });
-        }
+    // Apply the read budget across every project, not separately by directory.
+    transcripts.sort((left, right) => right.mtimeMs - left.mtimeMs);
+    transcripts.splice(MAX_TRANSCRIPTS_PER_SOURCE);
+
+    const byCwd = new Map<
+      string,
+      {
+        threadCount: number;
+        lastActiveAtMs: number;
+        transcripts: Array<{ filePath: string; mtimeMs: number }>;
       }
-      for (const [cwd, group] of byCwd) {
-        candidates.push({
-          cwd,
-          source: "claudeAgent",
-          providerInstanceId,
-          threadCount: group.threadCount,
-          lastActiveAtMs: group.lastActiveAtMs,
-          transcripts: group.transcripts,
+    >();
+    for (const entry of transcripts) {
+      const cwd = yield* readCwd(entry.filePath);
+      if (cwd === null) continue;
+      const existing = byCwd.get(cwd);
+      if (existing) {
+        existing.threadCount += 1;
+        existing.lastActiveAtMs = Math.max(existing.lastActiveAtMs, entry.mtimeMs);
+        existing.transcripts.push(entry);
+      } else {
+        byCwd.set(cwd, {
+          threadCount: 1,
+          lastActiveAtMs: entry.mtimeMs,
+          transcripts: [entry],
         });
       }
     }
 
-    return candidates;
+    return Array.from(
+      byCwd,
+      ([cwd, group]): RawCandidate => ({
+        cwd,
+        source: "claudeAgent",
+        providerInstanceIds: [providerInstanceId],
+        threadCount: group.threadCount,
+        lastActiveAtMs: group.lastActiveAtMs,
+        transcripts: group.transcripts,
+      }),
+    );
   });
 
   /**
@@ -545,7 +539,7 @@ export const make = Effect.gen(function* () {
       candidates.push({
         cwd,
         source: "codex",
-        providerInstanceId,
+        providerInstanceIds: [providerInstanceId],
         threadCount: transcripts.length,
         lastActiveAtMs: transcripts.reduce<number | null>(
           (latest, transcript) =>
@@ -568,7 +562,7 @@ export const make = Effect.gen(function* () {
     );
 
     const raw: Array<RawCandidate> = [];
-    const scannedHomes = new Set<string>();
+    const scannedHomes = new Map<string, ReadonlyArray<RawCandidate>>();
 
     for (const source of ["claudeAgent", "codex"] as const) {
       const instances: Array<{
@@ -620,13 +614,20 @@ export const make = Effect.gen(function* () {
           .realPath(homePath)
           .pipe(Effect.orElseSucceed(() => homePath));
         const homeKey = `${source}\0${normalizeProjectPathForComparison(realHomePath)}`;
-        if (scannedHomes.has(homeKey)) continue;
-        scannedHomes.add(homeKey);
-        raw.push(
-          ...(yield* source === "claudeAgent"
-            ? scanClaude(homePath, instanceId)
-            : scanCodex(homePath, instanceId)),
-        );
+        const existingCandidates = scannedHomes.get(homeKey);
+        if (existingCandidates !== undefined) {
+          for (const candidate of existingCandidates) {
+            if (!candidate.providerInstanceIds.includes(instanceId)) {
+              candidate.providerInstanceIds.push(instanceId);
+            }
+          }
+          continue;
+        }
+        const candidates = yield* source === "claudeAgent"
+          ? scanClaude(homePath, instanceId)
+          : scanCodex(homePath, instanceId);
+        scannedHomes.set(homeKey, candidates);
+        raw.push(...candidates);
       }
     }
 
@@ -778,18 +779,26 @@ export const make = Effect.gen(function* () {
           .pipe(Effect.map(Option.some), Effect.orElseSucceed(Option.none));
         if (Option.isNone(contents)) continue;
 
-        const thread = parseAgentSessionTranscript({
+        const primaryInstanceId = candidate.providerInstanceIds[0];
+        if (primaryInstanceId === undefined) continue;
+        const parsedThread = parseAgentSessionTranscript({
           contents: contents.value,
           source: candidate.source,
-          providerInstanceId: candidate.providerInstanceId,
+          providerInstanceId: primaryInstanceId,
           fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
           lastActiveAtMs: transcript.mtimeMs,
         });
-        if (thread === null) continue;
-        const sessionKey = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
-        if (importedSessions.has(sessionKey)) continue;
-        importedSessions.add(sessionKey);
-        threads.push(thread);
+        if (parsedThread === null) continue;
+        for (const providerInstanceId of candidate.providerInstanceIds) {
+          const thread =
+            providerInstanceId === primaryInstanceId
+              ? parsedThread
+              : { ...parsedThread, providerInstanceId };
+          const sessionKey = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
+          if (importedSessions.has(sessionKey)) continue;
+          importedSessions.add(sessionKey);
+          threads.push(thread);
+        }
       }
     }
 

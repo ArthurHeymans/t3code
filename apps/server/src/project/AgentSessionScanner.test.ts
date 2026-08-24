@@ -844,6 +844,119 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         expect(threads[0]?.providerInstanceId).toBe("codex-work");
       }),
     );
+
+    it.effect("keeps every provider instance associated with a shared session home", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+
+        yield* writeTranscript({
+          filePath: path.join(sharedHome, "sessions", "2026", "08", "24", "rollout-shared.jsonl"),
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "shared-session", cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Use the shared session" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs,
+        });
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+          providerInstances: {
+            [ProviderInstanceId.make("codex-personal")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: sharedHome },
+            },
+            [ProviderInstanceId.make("codex-work")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: sharedHome },
+            },
+          },
+        });
+
+        expect(threads.map((thread) => thread.providerInstanceId).sort()).toEqual([
+          "codex-personal",
+          "codex-work",
+        ]);
+      }),
+    );
+
+    it.effect(
+      "finds recent Claude sessions after an older directory exhausts the read budget",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const oldWorkspace = yield* makeTempDir("t3code-workspace-old-");
+          const recentWorkspace = yield* makeTempDir("t3code-workspace-recent-");
+          const oldDirectory = path.join(claudeHomePath, "projects", "-aaa-old");
+          const oldTranscript = path.join(oldDirectory, "old.jsonl");
+          const recentDirectory = path.join(claudeHomePath, "projects", "-zzz-recent");
+
+          yield* writeTranscript({
+            filePath: oldTranscript,
+            contents: encodeTranscriptRecord({
+              type: "user",
+              cwd: oldWorkspace,
+              sessionId: "old-session",
+              message: { role: "user", content: "Old work" },
+            }),
+            mtimeMs: nowMs - 45 * 24 * 60 * 60 * 1000,
+          });
+          yield* writeTranscript({
+            filePath: path.join(recentDirectory, "recent.jsonl"),
+            contents: encodeTranscriptRecord({
+              type: "user",
+              cwd: recentWorkspace,
+              sessionId: "recent-session",
+              message: { role: "user", content: "Recent work" },
+            }),
+            mtimeMs: nowMs,
+          });
+
+          const simulatedOldTranscripts = Array.from(
+            { length: 5_000 },
+            (_, index) => `old-${index}.jsonl`,
+          );
+          const resolveTranscript = (filePath: string) =>
+            path.dirname(filePath) === oldDirectory && path.basename(filePath).startsWith("old-")
+              ? oldTranscript
+              : filePath;
+          const simulatedFileSystem = FileSystem.FileSystem.of({
+            ...fileSystem,
+            readDirectory: (directory, options) =>
+              directory === oldDirectory
+                ? Effect.succeed(simulatedOldTranscripts)
+                : fileSystem.readDirectory(directory, options),
+            stat: (filePath) => fileSystem.stat(resolveTranscript(filePath)),
+            open: (filePath, options) => fileSystem.open(resolveTranscript(filePath), options),
+          });
+
+          const threads = yield* runRecentThreads({
+            claudeHomePath,
+            codexHomePath,
+            workspaceRoot: recentWorkspace,
+          }).pipe(Effect.provideService(FileSystem.FileSystem, simulatedFileSystem));
+
+          expect(threads.map((thread) => thread.providerSessionId)).toEqual(["recent-session"]);
+        }),
+    );
   });
 });
 

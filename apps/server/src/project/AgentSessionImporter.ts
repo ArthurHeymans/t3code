@@ -10,7 +10,6 @@ import {
   type AgentSessionImportInput,
   type AgentSessionImportResult,
 } from "@t3tools/contracts";
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
@@ -24,7 +23,6 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
   const engine = yield* OrchestrationEngine.OrchestrationEngineService;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
-  const crypto = yield* Crypto.Crypto;
   const threads = yield* scanner.recentThreads(input.workspaceRoot);
   let importedCount = 0;
   let skippedCount = 0;
@@ -36,11 +34,10 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
       );
       const provider = ProviderDriverKind.make(thread.source);
       const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
-      const createCommandId = CommandId.make(yield* crypto.randomUUIDv4);
 
       yield* engine.dispatch({
         type: "thread.create",
-        commandId: createCommandId,
+        commandId: CommandId.make(`agent-session:create:${threadId}`),
         threadId,
         projectId: input.projectId,
         title: thread.title,
@@ -54,7 +51,7 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
 
       yield* engine.dispatch({
         type: "thread.history.import",
-        commandId: CommandId.make(yield* crypto.randomUUIDv4),
+        commandId: CommandId.make(`agent-session:history:${threadId}`),
         threadId,
         messages: thread.messages.map((message, index) => ({
           messageId: MessageId.make(`${threadId}:${index}`),

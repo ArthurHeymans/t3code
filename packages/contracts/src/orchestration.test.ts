@@ -1016,6 +1016,21 @@ it.effect("project favicon overrides accept only supported image files", () =>
   }),
 );
 
+it.effect("rejects thread history imports without messages", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeOrchestrationCommand({
+        type: "thread.history.import",
+        commandId: "command-empty-history",
+        threadId: "thread-1",
+        messages: [],
+      }),
+    );
+
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
 it("isProviderSendTurnSupportedImageMimeType accepts raster formats and rejects svg", () => {
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/png"), true);
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("IMAGE/JPEG"), true);
