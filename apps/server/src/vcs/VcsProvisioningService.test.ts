@@ -16,6 +16,7 @@ function makeDriver(calls: string[]): VcsDriver.VcsDriver["Service"] {
     capabilities: {
       kind: "git",
       supportsWorktrees: true,
+      supportsWorkspaceSelection: true,
       supportsBookmarks: false,
       supportsAtomicSnapshot: false,
       supportsPushDefaultRemote: true,
@@ -41,6 +42,7 @@ function makeDriver(calls: string[]): VcsDriver.VcsDriver["Service"] {
           expiresAt: Option.none(),
         },
       }),
+    listWorkspaces: () => Effect.succeed([]),
     listRemotes: () =>
       Effect.succeed({
         remotes: [],

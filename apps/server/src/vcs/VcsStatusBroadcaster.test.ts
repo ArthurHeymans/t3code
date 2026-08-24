@@ -32,6 +32,7 @@ import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 const baseLocalStatus: VcsStatusLocalResult = {
+  kind: "git",
   isRepo: true,
   sourceControlProvider: {
     kind: "github",

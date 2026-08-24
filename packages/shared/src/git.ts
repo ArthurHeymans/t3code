@@ -364,6 +364,7 @@ function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
 
 function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
   return {
+    kind: status.kind,
     isRepo: status.isRepo,
     ...(status.sourceControlProvider
       ? { sourceControlProvider: status.sourceControlProvider }
@@ -389,6 +390,7 @@ export function applyGitStatusStreamEvent(
       if (current === null) {
         return mergeGitStatusParts(
           {
+            kind: "unknown",
             isRepo: true,
             hasPrimaryRemote: false,
             isDefaultRef: false,

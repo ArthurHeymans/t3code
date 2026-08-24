@@ -22,6 +22,7 @@ export type VcsFreshness = typeof VcsFreshness.Type;
 export const VcsDriverCapabilities = Schema.Struct({
   kind: VcsDriverKind,
   supportsWorktrees: Schema.Boolean,
+  supportsWorkspaceSelection: Schema.Boolean,
   supportsBookmarks: Schema.Boolean,
   supportsAtomicSnapshot: Schema.Boolean,
   supportsPushDefaultRemote: Schema.Boolean,
@@ -36,6 +37,26 @@ export const VcsRepositoryIdentity = Schema.Struct({
   freshness: VcsFreshness,
 });
 export type VcsRepositoryIdentity = typeof VcsRepositoryIdentity.Type;
+
+export const VcsWorkspace = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  path: TrimmedNonEmptyString,
+  current: Schema.Boolean,
+});
+export type VcsWorkspace = typeof VcsWorkspace.Type;
+
+export const VcsListWorkspacesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+});
+export type VcsListWorkspacesInput = typeof VcsListWorkspacesInput.Type;
+
+export const VcsListWorkspacesResult = Schema.Struct({
+  kind: VcsDriverKind,
+  isRepo: Schema.Boolean,
+  canCreateWorkspace: Schema.Boolean,
+  workspaces: Schema.Array(VcsWorkspace),
+});
+export type VcsListWorkspacesResult = typeof VcsListWorkspacesResult.Type;
 
 export const VcsListWorkspaceFilesResult = Schema.Struct({
   paths: Schema.Array(TrimmedNonEmptyString),
