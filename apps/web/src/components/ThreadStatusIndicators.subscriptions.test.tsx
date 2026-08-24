@@ -16,6 +16,7 @@ vi.mock("../state/vcs", async () => {
     Atom.make(() => {
       state.queries.push(`vcs:${cwd}`);
       return AsyncResult.success({
+        kind: "git",
         isRepo: true,
         hasPrimaryRemote: true,
         isDefaultRef: false,

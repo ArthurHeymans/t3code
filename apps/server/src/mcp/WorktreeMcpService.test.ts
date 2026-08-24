@@ -250,6 +250,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
   );
   const localStatus = vi.fn((_: unknown) =>
     Effect.succeed({
+      kind: "git" as const,
       isRepo: options.notARepo !== true,
       hasPrimaryRemote: true,
       isDefaultRef: false,
