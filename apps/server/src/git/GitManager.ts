@@ -958,6 +958,7 @@ export const make = Effect.gen(function* () {
       : null;
 
     return {
+      kind: "git",
       isRepo: details.isRepo,
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
       hasPrimaryRemote: details.hasOriginRemote,

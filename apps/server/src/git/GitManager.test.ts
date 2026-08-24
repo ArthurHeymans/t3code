@@ -909,6 +909,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd });
 
       expect(status).toEqual({
+        kind: "git",
         isRepo: false,
         hasPrimaryRemote: false,
         isDefaultRef: false,
@@ -939,6 +940,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd });
 
       expect(status).toEqual({
+        kind: "git",
         isRepo: false,
         hasPrimaryRemote: false,
         isDefaultRef: false,

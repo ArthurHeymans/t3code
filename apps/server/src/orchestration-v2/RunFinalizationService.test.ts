@@ -89,6 +89,7 @@ for (const scenario of [
           Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({
             refreshLocalStatus: () =>
               Effect.succeed({
+                kind: "git",
                 isRepo: true,
                 hasPrimaryRemote: true,
                 isDefaultRef: scenario.checkedOut === "main",

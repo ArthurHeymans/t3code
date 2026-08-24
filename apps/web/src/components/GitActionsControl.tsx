@@ -114,6 +114,7 @@ import {
 } from "./chat/threadDetailsPanelStyles";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useOpenLink } from "~/browser/useOpenLink";
+import { resolveVcsActionPresentation } from "~/vcsPresentation";
 
 interface GitActionsControlProps {
   gitCwd: string | null;
@@ -1176,6 +1177,7 @@ export default function GitActionsControl({
   const isRepo = gitStatus?.isRepo ?? true;
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
   const gitStatusForActions = gitStatus;
+  const vcsActionPresentation = resolveVcsActionPresentation(gitStatus?.kind);
 
   const allFiles = gitStatusForActions?.workingTree.files ?? [];
   const selectedFiles = allFiles.filter((f) => !excludedFiles.has(f.path));
@@ -1632,6 +1634,25 @@ export default function GitActionsControl({
             {initAction.isPending ? "Initializing..." : "Initialize Git"}
           </span>
         </Button>
+      ) : !vcsActionPresentation.supportsGitWorkflowActions ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                size="xs"
+                variant={isPanel ? "ghost" : "outline"}
+                className={isPanel ? THREAD_DETAILS_PANEL_ROW_CLASS : undefined}
+                disabled
+              />
+            }
+          >
+            <InfoIcon className="size-3.5" aria-hidden />
+            <span className="ml-0.5">Git actions unavailable</span>
+          </TooltipTrigger>
+          <TooltipPopup side="bottom" className="max-w-80">
+            {vcsActionPresentation.unsupportedGitWorkflowDescription}
+          </TooltipPopup>
+        </Tooltip>
       ) : (
         <ActionGroup
           role="group"

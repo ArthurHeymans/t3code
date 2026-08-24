@@ -190,6 +190,7 @@ describe("applyGitStatusStreamEvent", () => {
     };
 
     expect(applyGitStatusStreamEvent(null, { _tag: "remoteUpdated", remote })).toEqual({
+      kind: "unknown",
       isRepo: true,
       hasPrimaryRemote: false,
       isDefaultRef: false,
@@ -205,6 +206,7 @@ describe("applyGitStatusStreamEvent", () => {
 
   it("preserves local-only fields when applying a remote update", () => {
     const current: VcsStatusResult = {
+      kind: "git",
       isRepo: true,
       sourceControlProvider: {
         kind: "github",
