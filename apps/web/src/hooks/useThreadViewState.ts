@@ -56,6 +56,7 @@ export function useThreadViewState() {
   const markLocalViewed = useUiStateStore((state) => state.markThreadVisited);
   const markLocalUnread = useUiStateStore((state) => state.markThreadUnread);
   const setPending = useUiStateStore((state) => state.setThreadViewStatePending);
+  const keepLocal = useUiStateStore((state) => state.keepThreadViewStateLocal);
   const clearPending = useUiStateStore((state) => state.clearThreadViewStatePending);
   const viewThread = useAtomCommand(threadEnvironment.view, { reportFailure: false });
   const markUnreadOnServer = useAtomCommand(threadEnvironment.markUnread, "thread mark unread");
@@ -86,13 +87,13 @@ export function useThreadViewState() {
         input: { threadId: threadRef.threadId, viewedThrough },
       }).then((result) => {
         if (result._tag === "Failure") {
-          clearPending(threadKey, pending);
+          keepLocal(threadKey, pending);
           return;
         }
         clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
       });
     },
-    [clearPending, markLocalViewed, setPending, viewThread],
+    [clearPending, keepLocal, markLocalViewed, setPending, viewThread],
   );
 
   const markUnread = useCallback(
@@ -114,13 +115,13 @@ export function useThreadViewState() {
         input: { threadId: threadRef.threadId },
       }).then((result) => {
         if (result._tag === "Failure") {
-          clearPending(threadKey, pending);
+          keepLocal(threadKey, pending);
           return;
         }
         clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
       });
     },
-    [clearPending, markLocalUnread, markUnreadOnServer, setPending],
+    [clearPending, keepLocal, markLocalUnread, markUnreadOnServer, setPending],
   );
 
   return useMemo(() => ({ markViewed, markUnread }), [markUnread, markViewed]);

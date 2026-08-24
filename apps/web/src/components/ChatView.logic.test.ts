@@ -16,6 +16,7 @@ import {
   buildExpiredTerminalContextToastCopy,
   buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
+  createVisibleThreadAcknowledger,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
@@ -43,6 +44,39 @@ const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");
 const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
+
+describe("createVisibleThreadAcknowledger", () => {
+  it("does not clear an explicit unread marker when the same thread regains focus", () => {
+    const acknowledge = vi.fn();
+    const acknowledgeVisibleThread = createVisibleThreadAcknowledger({
+      isVisible: () => true,
+      acknowledge,
+    });
+
+    acknowledgeVisibleThread();
+    acknowledgeVisibleThread();
+
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it("waits until a background thread is visible before acknowledging it", () => {
+    const acknowledge = vi.fn();
+    let visible = false;
+    const acknowledgeVisibleThread = createVisibleThreadAcknowledger({
+      isVisible: () => visible,
+      acknowledge,
+    });
+
+    acknowledgeVisibleThread();
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    visible = true;
+    acknowledgeVisibleThread();
+    acknowledgeVisibleThread();
+
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+});
 
 describe("draft hero submission transition", () => {
   it("does not dock the composer before a background submission", () => {

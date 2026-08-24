@@ -4,7 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { reactHookHarness as hooks } from "../test/reactHookHarness";
 
-type PendingState = { readonly kind: "viewed" | "unread"; readonly targetAt: string };
+type PendingState = {
+  readonly kind: "viewed" | "unread";
+  readonly targetAt: string;
+  readonly localOnly?: boolean;
+};
 type ShellListener = () => void;
 
 const testState = vi.hoisted(() => {
@@ -26,6 +30,11 @@ const testState = vi.hoisted(() => {
     }),
     setThreadViewStatePending: vi.fn((threadKey: string, pending: PendingState) => {
       uiState.threadViewStatePendingById[threadKey] = pending;
+    }),
+    keepThreadViewStateLocal: vi.fn((threadKey: string, pending: PendingState) => {
+      if (uiState.threadViewStatePendingById[threadKey] === pending) {
+        uiState.threadViewStatePendingById[threadKey] = { ...pending, localOnly: true };
+      }
     }),
     clearThreadViewStatePending: vi.fn((threadKey: string, pending: PendingState) => {
       if (uiState.threadViewStatePendingById[threadKey] === pending) {
@@ -141,6 +150,7 @@ describe("useThreadViewState", () => {
     testState.uiState.markThreadVisited.mockClear();
     testState.uiState.markThreadUnread.mockClear();
     testState.uiState.setThreadViewStatePending.mockClear();
+    testState.uiState.keepThreadViewStateLocal.mockClear();
     testState.uiState.clearThreadViewStatePending.mockClear();
     testState.viewThread.mockReset().mockResolvedValue({ _tag: "Success", value: { sequence: 2 } });
     testState.markUnreadOnServer
@@ -188,14 +198,54 @@ describe("useThreadViewState", () => {
     expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
   });
 
-  it("clears pending state immediately when a server command fails", async () => {
+  it("keeps a local read marker when the server rejects the view command", async () => {
     testState.viewThread.mockResolvedValue({ _tag: "Failure" });
 
     renderHook().markViewed(threadRef, completedAt);
     await flushCommands();
 
-    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toEqual({
+      kind: "viewed",
+      targetAt: completedAt,
+      localOnly: true,
+    });
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
     expect(testState.listeners).toHaveLength(0);
+  });
+
+  it("keeps a local unread marker when the server rejects the unread command", async () => {
+    testState.markUnreadOnServer.mockResolvedValue({ _tag: "Failure" });
+
+    renderHook().markUnread(threadRef, completedAt);
+    await flushCommands();
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toEqual({
+      kind: "unread",
+      targetAt: completedAt,
+      localOnly: true,
+    });
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe("2026-01-01T00:00:59.999Z");
+    expect(testState.listeners).toHaveLength(0);
+  });
+
+  it("does not let an earlier failed view replace a newer unread action", async () => {
+    let resolveView: ((result: { readonly _tag: "Failure" }) => void) | undefined;
+    testState.viewThread.mockReturnValue(
+      new Promise((resolve) => {
+        resolveView = resolve;
+      }),
+    );
+    const { markViewed, markUnread } = renderHook();
+
+    markViewed(threadRef, completedAt);
+    markUnread(threadRef, completedAt);
+    resolveView?.({ _tag: "Failure" });
+    await flushCommands();
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toMatchObject({
+      kind: "unread",
+      targetAt: completedAt,
+    });
   });
 
   it("clears pending state when the shell arrives before the command receipt", async () => {

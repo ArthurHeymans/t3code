@@ -101,6 +101,27 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
     }),
   );
 
+  it.effect("stores accepted view boundaries in canonical ISO format", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z"));
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-noncanonical"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: "2026-01-01T00:00:45Z",
+        },
+        readModel: makeReadModel(),
+      });
+      const viewed = Array.isArray(event) ? event[0] : event;
+
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
+        expect(viewed.payload.viewedAt).toBe("2026-01-01T00:00:45.000Z");
+      }
+    }),
+  );
+
   it.effect("does not move the viewed boundary backward", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z"));
@@ -157,6 +178,35 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
       if (markedUnread?.type === "thread.meta-updated") {
         expect(markedUnread.payload.viewedAt).toBe("2026-01-01T00:00:59.999Z");
         expect(markedUnread.payload.updatedAt).toBe(COMPLETED_AT);
+      }
+    }),
+  );
+
+  it.effect("preserves the existing view boundary while the latest turn is running", () =>
+    Effect.gen(function* () {
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-running"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: {
+          ...readModel,
+          threads: [
+            {
+              ...thread,
+              latestTurn: { ...thread.latestTurn!, state: "running", completedAt: null },
+            },
+          ],
+        },
+      });
+      const markedUnread = Array.isArray(event) ? event[0] : event;
+
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
+        expect(markedUnread.payload.viewedAt).toBe(thread.viewedAt);
       }
     }),
   );

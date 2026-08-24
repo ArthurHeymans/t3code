@@ -336,6 +336,7 @@ import {
   buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
   collectUserMessageBlobPreviewUrls,
+  createVisibleThreadAcknowledger,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
@@ -1798,10 +1799,10 @@ function ChatViewContent(props: ChatViewProps) {
     const completedAt = serverThread?.latestTurn?.completedAt;
     if (!serverThread?.id || !completedAt) return;
     const threadRef = scopeThreadRef(serverThread.environmentId, serverThread.id);
-    const acknowledgeVisibleThread = () => {
-      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
-      markViewed(threadRef, completedAt, supportsThreadViewState);
-    };
+    const acknowledgeVisibleThread = createVisibleThreadAcknowledger({
+      isVisible: () => document.visibilityState === "visible" && document.hasFocus(),
+      acknowledge: () => markViewed(threadRef, completedAt, supportsThreadViewState),
+    });
 
     acknowledgeVisibleThread();
     document.addEventListener("visibilitychange", acknowledgeVisibleThread);

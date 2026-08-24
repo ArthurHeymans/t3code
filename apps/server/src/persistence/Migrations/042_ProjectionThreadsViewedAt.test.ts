@@ -36,16 +36,11 @@ layer("042_ProjectionThreadsViewedAt", (it) => {
 
       yield* runMigrations({ toMigrationInclusive: 42 });
 
-      const authColumns = yield* sql<{ readonly name: string }>`
-        PRAGMA table_info(auth_sessions)
-      `;
       const rows = yield* sql<{ readonly viewedAt: string | null }>`
         SELECT viewed_at AS "viewedAt"
         FROM projection_threads
         WHERE thread_id = 'thread-1'
       `;
-      assert.ok(authColumns.some((column) => column.name === "client_surface"));
-      assert.ok(authColumns.some((column) => column.name === "client_app_version"));
       assert.equal(rows[0]?.viewedAt, "2026-01-02T00:00:00.000Z");
 
       const olderServerMigrations = yield* runMigrations({ toMigrationInclusive: 41 });

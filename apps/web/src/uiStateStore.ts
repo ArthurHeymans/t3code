@@ -48,6 +48,7 @@ export interface UiState extends UiProjectState, UiThreadState, UiEndpointState 
 export interface PendingThreadViewState {
   kind: "viewed" | "unread";
   targetAt: string;
+  localOnly?: boolean;
 }
 
 const initialState: UiState = {
@@ -401,6 +402,7 @@ interface UiStateStore extends UiState {
   markThreadVisited: (threadId: string, visitedAt: string) => void;
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
   setThreadViewStatePending: (threadId: string, pending: PendingThreadViewState) => void;
+  keepThreadViewStateLocal: (threadId: string, pending: PendingThreadViewState) => void;
   clearThreadViewStatePending: (threadId: string, pending: PendingThreadViewState) => void;
   setThreadChangedFilesExpanded: (threadId: string, turnId: string, expanded: boolean) => void;
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
@@ -426,6 +428,16 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
         [threadId]: pending,
       },
     })),
+  keepThreadViewStateLocal: (threadId, pending) =>
+    set((state) => {
+      if (state.threadViewStatePendingById[threadId] !== pending) return state;
+      return {
+        threadViewStatePendingById: {
+          ...state.threadViewStatePendingById,
+          [threadId]: { ...pending, localOnly: true },
+        },
+      };
+    }),
   clearThreadViewStatePending: (threadId, pending) =>
     set((state) => {
       if (state.threadViewStatePendingById[threadId] !== pending) return state;

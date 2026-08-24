@@ -27,6 +27,10 @@ desktop, open the thread's context menu and choose **Mark unread** to restore th
 Older servers keep read and unread changes on the current device. Update the server to sync those
 changes across your devices.
 
+When you first update a server that did not store read state, existing threads are marked as read.
+Connections without permission to update threads keep read and unread changes on the current
+device.
+
 ## Environment artwork
 
 Dev and Nightly environments can identify themselves with artwork at the top of the sidebar and in

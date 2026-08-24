@@ -785,6 +785,50 @@ describe("runtime command runner", () => {
     registry.dispose();
   });
 
+  it("keeps passive view updates ordered without blocking user actions", async () => {
+    const viewLatch = Latch.makeUnsafe();
+    const events: string[] = [];
+    const runtime = Atom.runtime(Layer.empty);
+    const viewScheduler = createAtomCommandScheduler();
+    const actionScheduler = createAtomCommandScheduler();
+    const concurrency = { mode: "serial" as const, key: () => "same-thread" };
+    const viewCommand = createRuntimeCommand(runtime, {
+      label: "test.view-thread",
+      scheduler: viewScheduler,
+      concurrency,
+      execute: () =>
+        Effect.sync(() => events.push("view:start")).pipe(
+          Effect.andThen(viewLatch.await),
+          Effect.tap(() => Effect.sync(() => events.push("view:end"))),
+        ),
+    });
+    const unreadCommand = createRuntimeCommand(runtime, {
+      label: "test.mark-unread",
+      scheduler: viewScheduler,
+      concurrency,
+      execute: () => Effect.sync(() => events.push("unread:start")),
+    });
+    const actionCommand = createRuntimeCommand(runtime, {
+      label: "test.start-turn",
+      scheduler: actionScheduler,
+      concurrency,
+      execute: () => Effect.sync(() => events.push("action:start")),
+    });
+    const registry = AtomRegistry.make();
+
+    const view = viewCommand.run(registry, undefined);
+    const unread = unreadCommand.run(registry, undefined);
+    const action = actionCommand.run(registry, undefined);
+    await action;
+
+    expect(events).toEqual(["view:start", "action:start"]);
+
+    viewLatch.openUnsafe();
+    await Promise.all([view, unread]);
+    expect(events).toEqual(["view:start", "action:start", "view:end", "unread:start"]);
+    registry.dispose();
+  });
+
   it.effect("releases a shared scheduler lane before the outer command finishes", () =>
     Effect.gen(function* () {
       const handoffStarted = Latch.makeUnsafe();

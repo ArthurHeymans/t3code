@@ -590,7 +590,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const occurredAt = yield* nowIso;
       const cappedViewedAt =
         DateTime.Order(viewedThrough.value, DateTime.makeUnsafe(occurredAt)) <= 0
-          ? command.viewedThrough
+          ? DateTime.formatIso(viewedThrough.value)
           : occurredAt;
       const viewedAt = DateTime.make(thread.viewedAt ?? thread.createdAt).pipe(
         Option.filter(

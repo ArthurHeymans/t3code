@@ -54,7 +54,7 @@ describe("uiStateStore pure functions", () => {
     expect(markThreadUnread(next, threadId, null)).toBe(next);
   });
 
-  it("uses local view state only while its server command is pending", () => {
+  it("uses local view state while syncing or after a rejected server command", () => {
     const input = {
       serverViewedAt: "2026-02-25T12:30:00.000Z",
       localViewedAt: "2026-02-25T12:35:00.000Z",
@@ -67,6 +67,16 @@ describe("uiStateStore pure functions", () => {
       resolveThreadViewedAt({
         ...input,
         pending: { kind: "viewed", targetAt: "2026-02-25T12:35:00.000Z" },
+      }),
+    ).toBe("2026-02-25T12:35:00.000Z");
+    expect(
+      resolveThreadViewedAt({
+        ...input,
+        pending: {
+          kind: "viewed",
+          targetAt: "2026-02-25T12:35:00.000Z",
+          localOnly: true,
+        },
       }),
     ).toBe("2026-02-25T12:35:00.000Z");
   });

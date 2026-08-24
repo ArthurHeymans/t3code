@@ -84,6 +84,7 @@ export function createThreadEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
 ) {
   const scheduler = createAtomCommandScheduler();
+  const viewStateScheduler = createAtomCommandScheduler();
   const concurrency = {
     mode: "serial" as const,
     key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
@@ -129,13 +130,13 @@ export function createThreadEnvironmentAtoms<R, E>(
     view: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:view",
       execute: (input: ViewThreadInput) => viewThread(input),
-      scheduler,
+      scheduler: viewStateScheduler,
       concurrency,
     }),
     markUnread: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:mark-unread",
       execute: (input: MarkThreadUnreadInput) => markThreadUnread(input),
-      scheduler,
+      scheduler: viewStateScheduler,
       concurrency,
     }),
     snooze: createEnvironmentCommand(runtime, {

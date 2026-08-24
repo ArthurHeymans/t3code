@@ -32,6 +32,19 @@ export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 
+/** Acknowledge one completion once, after its thread becomes visible and focused. */
+export function createVisibleThreadAcknowledger(input: {
+  readonly isVisible: () => boolean;
+  readonly acknowledge: () => void;
+}): () => void {
+  let acknowledged = false;
+  return () => {
+    if (acknowledged || !input.isVisible()) return;
+    acknowledged = true;
+    input.acknowledge();
+  };
+}
+
 export function shouldDockDraftHeroForSubmission(input: {
   isDraftHeroState: boolean;
   activeThreadKey: string | null;
