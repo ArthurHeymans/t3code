@@ -75,6 +75,7 @@ export function useThreadViewState() {
         previousPending?.kind !== "unread" &&
         (timestampCovers(thread?.viewedAt, viewedThrough) ||
           (previousPending?.kind === "viewed" &&
+            previousPending.localOnly !== true &&
             timestampCovers(previousPending.targetAt, viewedThrough)))
       ) {
         return;

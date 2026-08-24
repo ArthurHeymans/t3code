@@ -228,6 +228,29 @@ describe("useThreadViewState", () => {
     expect(testState.listeners).toHaveLength(0);
   });
 
+  it("retries a local-only view when the same completion is acknowledged again", async () => {
+    testState.viewThread
+      .mockResolvedValueOnce({ _tag: "Failure" })
+      .mockResolvedValueOnce({ _tag: "Success", value: { sequence: 2 } });
+    const { markViewed } = renderHook();
+
+    markViewed(threadRef, completedAt);
+    await flushCommands();
+    expect(testState.uiState.threadViewStatePendingById[threadKey]?.localOnly).toBe(true);
+
+    markViewed(threadRef, completedAt);
+    await flushCommands();
+
+    expect(testState.viewThread).toHaveBeenCalledTimes(2);
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toEqual({
+      kind: "viewed",
+      targetAt: completedAt,
+    });
+
+    advanceShell(2, completedAt);
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
+  });
+
   it("does not let an earlier failed view replace a newer unread action", async () => {
     let resolveView: ((result: { readonly _tag: "Failure" }) => void) | undefined;
     testState.viewThread.mockReturnValue(
