@@ -26,6 +26,7 @@ import {
   type DesktopWslState,
   type EnvironmentId,
   type FilesystemBrowseResult,
+  type PiSessionSummary,
   type ProjectId,
   type SourceControlDiscoveryResult,
   type SourceControlProviderKind,
@@ -40,6 +41,7 @@ import {
   FileSearchIcon,
   FolderIcon,
   FolderPlusIcon,
+  HistoryIcon,
   LinkIcon,
   MessageSquareIcon,
   PaletteIcon,
@@ -71,6 +73,7 @@ import { readLocalApi } from "../localApi";
 import { desktopLocalBackendId } from "../connection/desktopLocal";
 import { filesystemEnvironment } from "../state/filesystem";
 import { projectEnvironment } from "../state/projects";
+import { orchestrationEnvironment } from "../state/orchestration";
 import { useEnvironmentQuery } from "../state/query";
 import { sourceControlEnvironment } from "../state/sourceControl";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -84,6 +87,7 @@ import {
   ensureBrowseDirectoryPath,
   findProjectByPath,
   getBrowseDirectoryPath,
+  normalizeProjectPathForComparison,
   hasTrailingPathSeparator,
   inferProjectTitleFromPath,
   isExplicitRelativeProjectPath,
@@ -593,6 +597,12 @@ function OpenCommandPaletteDialog(props: {
     reportDefect: false,
   });
   const cloneRepository = useAtomCommand(sourceControlEnvironment.cloneRepository, {
+    reportFailure: false,
+  });
+  const listPiSessions = useAtomQueryRunner(orchestrationEnvironment.v2.listPiSessions, {
+    reportFailure: false,
+  });
+  const adoptPiSession = useAtomCommand(orchestrationEnvironment.v2.adoptPiSession, {
     reportFailure: false,
   });
   const { environments } = useEnvironments();
@@ -1499,6 +1509,16 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+  const piSessionItemIcon = <HistoryIcon className={ITEM_ICON_CLASS} />;
+  const piSessionAddonIcon = <HistoryIcon className={ADDON_ICON_CLASS} />;
+  const selectedPiProject =
+    currentProjectEnvironmentId !== null && currentProjectId !== null
+      ? projects.find(
+          (project) =>
+            project.environmentId === currentProjectEnvironmentId &&
+            project.id === currentProjectId,
+        )
+      : undefined;
 
   if (projects.length > 0) {
     const activeProjectTitle =
@@ -1538,6 +1558,103 @@ function OpenCommandPaletteDialog(props: {
       groups: [{ value: "projects", label: "Projects", items: projectThreadItems }],
     });
   }
+
+  actionItems.push({
+    kind: "action",
+    value: "action:continue-pi-session",
+    searchTerms: ["pi", "session", "continue", "resume", "recover", "import"],
+    title: "Continue Pi session...",
+    description:
+      selectedPiProject === undefined
+        ? "Open a project before continuing a Pi session"
+        : `Resume a Pi conversation in ${selectedPiProject.title}`,
+    icon: piSessionItemIcon,
+    keepOpen: true,
+    disabled: selectedPiProject === undefined,
+    run: async () => {
+      if (selectedPiProject === undefined) return;
+      const environmentId = selectedPiProject.environmentId;
+      const result = await listPiSessions({ environmentId, input: { limit: 200 } });
+      const projectPath = normalizeProjectPathForComparison(selectedPiProject.workspaceRoot);
+      const sessions =
+        result._tag === "Success"
+          ? result.value.sessions.filter(
+              (session) => normalizeProjectPathForComparison(session.cwd) === projectPath,
+            )
+          : [];
+      if (sessions.length === 0) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "info",
+            title: "No Pi sessions found",
+            description: `No Pi sessions were found for ${selectedPiProject.title}.`,
+          }),
+        );
+        return;
+      }
+
+      const piProvider = Array.from(providerEntryByEnvironmentAndInstanceId.entries())
+        .filter(([key]) => key.startsWith(`${environmentId}:`))
+        .map(([, entry]) => entry)
+        .find(
+          (entry) =>
+            entry.driverKind === "pi" && entry.enabled && entry.installed && entry.isAvailable,
+        );
+      const items: CommandPaletteActionItem[] = sessions.map((session: PiSessionSummary) => ({
+        kind: "action",
+        value: `pi-session:${environmentId}:${session.sessionId}`,
+        searchTerms: [session.name ?? "", session.firstUserText ?? "", session.cwd],
+        title: session.name ?? session.firstUserText?.split("\n")[0] ?? session.sessionId,
+        description:
+          piProvider === undefined
+            ? "Enable a Pi provider for this environment first"
+            : session.cwd,
+        timestamp: session.updatedAt,
+        icon: piSessionItemIcon,
+        disabled: piProvider === undefined,
+        run: async () => {
+          if (piProvider === undefined) return;
+          const adoptResult = await adoptPiSession({
+            environmentId,
+            input: {
+              sessionPath: session.sessionPath,
+              projectId: selectedPiProject.id,
+              providerInstanceId: piProvider.instanceId,
+            },
+          });
+          if (adoptResult._tag === "Failure") {
+            if (!isAtomCommandInterrupted(adoptResult)) {
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Could not continue Pi session",
+                  description: errorMessage(squashAtomCommandFailure(adoptResult)),
+                }),
+              );
+            }
+            return;
+          }
+          setOpen(false);
+          await navigate({
+            to: "/$environmentId/$threadId",
+            params: buildThreadRouteParams(
+              scopeThreadRef(environmentId, adoptResult.value.threadId),
+            ),
+          });
+        },
+      }));
+      pushPaletteView({
+        addonIcon: piSessionAddonIcon,
+        groups: [
+          {
+            value: `pi-sessions:${environmentId}:${selectedPiProject.id}`,
+            label: selectedPiProject.title,
+            items,
+          },
+        ],
+      });
+    },
+  });
 
   actionItems.push({
     kind: "action",

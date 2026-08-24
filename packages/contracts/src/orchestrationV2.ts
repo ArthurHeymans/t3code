@@ -2004,6 +2004,20 @@ export const OrchestrationV2Command = Schema.Union([
     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   }),
   Schema.Struct({
+    type: Schema.Literal("thread.import"),
+    ...OrchestrationV2CreationFields,
+    commandId: CommandId,
+    threadId: ThreadId,
+    projectId: ProjectId,
+    title: TrimmedNonEmptyString,
+    modelSelection: ModelSelection,
+    runtimeMode: RuntimeMode,
+    interactionMode: ProviderInteractionMode,
+    branch: Schema.NullOr(TrimmedNonEmptyString),
+    worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+    nativeThreadId: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
     type: Schema.Literal("thread.archive"),
     commandId: CommandId,
     threadId: ThreadId,
@@ -2427,6 +2441,11 @@ export const OrchestrationV2SubscribeThreadInput = Schema.Struct({
   afterSequence: Schema.optionalKey(NonNegativeInt),
   /** Requests a marker between initial catch-up and live delivery. */
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Controls resume overflow. `full` preserves the legacy full-snapshot
+   * fallback; `error` lets bounded clients refetch their HTTP window instead.
+   */
+  snapshotFallback: Schema.optionalKey(Schema.Literals(["full", "error"])),
 });
 export type OrchestrationV2SubscribeThreadInput = typeof OrchestrationV2SubscribeThreadInput.Type;
 

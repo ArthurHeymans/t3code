@@ -114,6 +114,7 @@ export class OrchestratorV2ScenarioStepError extends Schema.TaggedErrorClass<Orc
 function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<ThreadId> {
   switch (command.type) {
     case "thread.create":
+    case "thread.import":
     case "thread.archive":
     case "thread.unarchive":
     case "thread.delete":

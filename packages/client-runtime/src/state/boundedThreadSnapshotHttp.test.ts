@@ -2,10 +2,14 @@ import { ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import { PrimaryConnectionTarget, type PreparedConnection } from "../connection/model.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
-import { boundedThreadSnapshotLoaderLayer } from "./boundedThreadSnapshotHttp.ts";
+import {
+  boundedThreadSnapshotLoaderLayer,
+  fetchEnvironmentBoundedThreadSnapshot,
+} from "./boundedThreadSnapshotHttp.ts";
 import { ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -77,6 +81,29 @@ const FULL_SNAPSHOT_BODY = {
 };
 
 describe("boundedThreadSnapshotLoader", () => {
+  it.effect("encodes provider-derived thread IDs as one path segment", () => {
+    const alias = ThreadId.make("thread:provider:pi:native-thread:%2Ftmp%2Fsession.jsonl");
+    const fetchFn = ((input: RequestInfo | URL) => {
+      expect(String(input)).toContain(
+        "/api/orchestration/threads/thread%3Aprovider%3Api%3Anative-thread%3A%252Ftmp%252Fsession.jsonl/bounded",
+      );
+      return Promise.resolve(
+        Response.json({
+          ...FULL_SNAPSHOT_BODY,
+          historyCursor: null,
+          hasMoreHistory: false,
+          latestLocalTurnOrdinal: null,
+        }),
+      );
+    }) satisfies typeof fetch;
+
+    return fetchEnvironmentBoundedThreadSnapshot({
+      prepared: PREPARED,
+      threadId: alias,
+      signer: Option.none(),
+    }).pipe(Effect.provide(remoteHttpClientLayer(fetchFn)));
+  });
+
   it.effect("falls back to full HTTP snapshot when bounded returns a plain route 404", () => {
     const fetchFn = ((input: RequestInfo | URL) => {
       const url = String(input);

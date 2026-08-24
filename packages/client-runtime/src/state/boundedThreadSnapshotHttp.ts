@@ -34,7 +34,7 @@ export const fetchEnvironmentBoundedThreadSnapshot = Effect.fn(
 }) {
   const requestUrl = environmentEndpointUrl(
     input.prepared.httpBaseUrl,
-    `/api/orchestration/threads/${input.threadId}/bounded`,
+    `/api/orchestration/threads/${encodeURIComponent(input.threadId)}/bounded`,
   );
   const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
   const headers = yield* buildEnvironmentAuthHeaders(

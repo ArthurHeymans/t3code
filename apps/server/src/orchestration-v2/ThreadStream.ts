@@ -14,6 +14,8 @@ export function threadReplayEncodedBytes(items: ReadonlyArray<unknown>): number 
   return total;
 }
 
+export type ThreadResumeSnapshotFallback = "full" | "error" | undefined;
+
 export type ThreadResumePlan =
   | {
       readonly mode: "replay";
@@ -30,6 +32,14 @@ export type ThreadResumePlan =
  * limits reducer churn while encoded bytes limit a small number of large
  * updates. Either excess is cheaper to replace with one current snapshot.
  */
+export function threadResumeSnapshotAction(
+  plan: ThreadResumePlan,
+  fallback: ThreadResumeSnapshotFallback,
+): "replay" | "full-snapshot" | "bounded-refetch" {
+  if (plan.mode === "replay") return "replay";
+  return fallback === "error" ? "bounded-refetch" : "full-snapshot";
+}
+
 export function decideThreadResume(input: {
   readonly afterSequence: number;
   readonly highWater: number;

@@ -49,6 +49,7 @@ export function withCreationProvenance(
 ): OrchestrationV2Command {
   switch (command.type) {
     case "thread.create":
+    case "thread.import":
     case "message.dispatch":
     case "thread.fork":
     case "thread.merge_back":
@@ -64,6 +65,7 @@ export function existingThreadIdsForCommand(
 ): ReadonlyArray<ThreadId> {
   switch (command.type) {
     case "thread.create":
+    case "thread.import":
       return [];
     // Read-state commands only rewrite the thread payload's visited/unread
     // watermark; they never touch messages, so they do not need the imported

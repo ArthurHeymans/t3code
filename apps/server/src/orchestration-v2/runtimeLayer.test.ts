@@ -1,5 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics preferSchemaOverJson:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import {
   type ApplicationStoredEvent,
   CommandId,
@@ -48,6 +53,7 @@ import {
 import { OrchestrationEffectWorkerV2 } from "./EffectWorker.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import { ProjectionMaintenanceV2 } from "./ProjectionMaintenance.ts";
+import { PiSessionTranscriptImporter } from "./PiSessionTranscriptImporter.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import { OrchestrationV2EventSinkLayerLive, OrchestrationV2LayerLive } from "./runtimeLayer.ts";
 import { shellStreamItemFromThreadShell } from "./ShellStream.ts";
@@ -199,6 +205,124 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
       assert.equal(projection.thread.providerInstanceId, "codex");
       assert.deepEqual(projection.runs, []);
     }),
+  );
+
+  it.effect("imports a native Pi session as the active provider thread", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-imported-pi-thread");
+      const sessionPath = "/home/test/.pi/agent/sessions/project/session.jsonl";
+
+      yield* orchestrator.dispatch({
+        type: "thread.import",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-import-pi"),
+        threadId,
+        projectId: ProjectId.make("runtime-layer-imported-pi-project"),
+        title: "Imported Pi session",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: "default",
+          options: [{ id: "thinking", value: "inherit" }],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        nativeThreadId: sessionPath,
+      });
+
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.providerThreads.length, 1);
+      assert.equal(projection.thread.activeProviderThreadId, projection.providerThreads[0]?.id);
+      assert.equal(projection.providerThreads[0]?.driver, "pi");
+      assert.equal(projection.providerThreads[0]?.nativeThreadRef?.nativeId, sessionPath);
+      assert.equal(projection.providerThreads[0]?.status, "not_loaded");
+    }),
+  );
+
+  it.effect("hydrates an imported Pi session transcript idempotently", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-import-"))),
+      (directory) =>
+        Effect.gen(function* () {
+          const orchestrator = yield* OrchestratorV2;
+          const importer = yield* PiSessionTranscriptImporter;
+          const threadId = ThreadId.make("runtime-layer-hydrated-pi-thread");
+          const sessionPath = NodePath.join(directory, "session.jsonl");
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              sessionPath,
+              [
+                JSON.stringify({
+                  type: "session",
+                  version: 3,
+                  id: "pi-session",
+                  timestamp: "2026-01-01T00:00:00.000Z",
+                  cwd: "/workspace",
+                }),
+                JSON.stringify({
+                  type: "message",
+                  id: "user-entry",
+                  parentId: null,
+                  timestamp: "2026-01-01T00:00:01.000Z",
+                  message: { role: "user", content: [{ type: "text", text: "Hello" }] },
+                }),
+                JSON.stringify({
+                  type: "message",
+                  id: "assistant-entry",
+                  parentId: "user-entry",
+                  timestamp: "2026-01-01T00:00:02.000Z",
+                  message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+                }),
+              ].join("\n"),
+            ),
+          );
+
+          yield* orchestrator.dispatch({
+            type: "thread.import",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("runtime-layer-hydrate-pi"),
+            threadId,
+            projectId: ProjectId.make("runtime-layer-hydrated-pi-project"),
+            title: "Hydrated Pi session",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("pi"),
+              model: "default",
+              options: [{ id: "thinking", value: "inherit" }],
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            nativeThreadId: sessionPath,
+          });
+
+          assert.equal(
+            (yield* importer.importTranscript({ threadId, sessionPath })).importedMessageCount,
+            2,
+          );
+          assert.equal(
+            (yield* importer.importTranscript({ threadId, sessionPath })).importedMessageCount,
+            0,
+          );
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(
+            projection.messages.map(({ role, text }) => ({ role, text })),
+            [
+              { role: "user", text: "Hello" },
+              { role: "assistant", text: "Hi" },
+            ],
+          );
+          assert.deepEqual(
+            projection.visibleTurnItems.map(({ item }) => item.type),
+            ["user_message", "assistant_message"],
+          );
+        }),
+      (directory) => Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+    ),
   );
 
   it.effect("merges an explicit provider-finished run while checkpoint capture is pending", () =>

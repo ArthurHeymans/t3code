@@ -32,6 +32,7 @@ policy in [CONTRIBUTING.md](../CONTRIBUTING.md); agent rules in [AGENTS.md](../A
 - [Scripts](./internals/scripts.md)
 - [Connection runtime](./internals/connection-runtime.md)
 - [Voice input](./internals/voice-input.md)
+- [Version-matched stdio client](./internals/stdio-client.md)
 - [Providers](./internals/providers.md)
 - [Remote environments](./internals/remote.md)
 - [Server updates](./internals/server-updates.md)

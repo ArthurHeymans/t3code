@@ -25,7 +25,7 @@ export const fetchEnvironmentThreadHistoryPage = Effect.fn(
 }) {
   const requestUrl = environmentEndpointUrl(
     input.prepared.httpBaseUrl,
-    `/api/orchestration/threads/${input.threadId}/history`,
+    `/api/orchestration/threads/${encodeURIComponent(input.threadId)}/history`,
   );
   const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
   const headers = yield* buildEnvironmentAuthHeaders(
