@@ -40,7 +40,7 @@ import { resolveOnboardingTargetEnvironment } from "../../onboarding/targetEnvir
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { newProjectId, randomUUID } from "../../lib/utils";
 import { resolveDefaultProviderModelSelection } from "../../providerInstances";
-import { agentSessionScan } from "../../state/agentSessions";
+import { agentSessionImport, agentSessionScan } from "../../state/agentSessions";
 import { useEnvironments, usePrimaryEnvironment } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { projectEnvironment } from "../../state/projects";
@@ -884,8 +884,8 @@ function AgentInstallTerminal({
 /**
  * One-decision import (4B): a summary line with Import recent / Choose /
  * Skip. The default imports only projects touched in the last 30 days;
- * Choose expands a checklist including older ones. Projects only — thread
- * history import is a follow-up.
+ * Choose expands a checklist including older ones. Imported projects also
+ * receive Codex and Claude threads active within the last 30 days.
  */
 function ImportStep({
   mode,
@@ -908,6 +908,7 @@ function ImportStep({
     environmentId === null ? null : agentSessionScan({ environmentId, input: {} }),
   );
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
+  const importThreads = useAtomCommand(agentSessionImport, { reportFailure: false });
   const [choosing, setChoosing] = useState(false);
   const [deselected, setDeselected] = useState<ReadonlySet<string>>(new Set());
   const [isImporting, setIsImporting] = useState(false);
@@ -964,10 +965,11 @@ function ImportStep({
         return;
       }
       if (importedPaths.has(candidate.path)) continue;
+      const projectId = newProjectId();
       const result = await createProject({
         environmentId,
         input: {
-          projectId: newProjectId(),
+          projectId,
           title: candidate.title,
           workspaceRoot: candidate.path,
           createWorkspaceRootIfMissing: false,
@@ -983,6 +985,16 @@ function ImportStep({
       if (result._tag === "Success") {
         imported += 1;
         importedPaths.add(candidate.path);
+        await importThreads({
+          environmentId,
+          input: { projectId, workspaceRoot: candidate.path },
+        });
+        if (
+          importGeneration !== importGenerationRef.current ||
+          importedPaths !== importedPathsRef.current
+        ) {
+          return;
+        }
       }
     }
     setIsImporting(false);

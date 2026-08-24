@@ -12,6 +12,8 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -58,41 +60,48 @@ const makeProjectionSnapshotQueryLayer = (importedWorkspaceRoots: ReadonlyArray<
  * Run a scan against the given homes. Homes are temp dirs created inside the
  * test, so the layer is built per run rather than shared.
  */
-const runScan = (input: {
+interface ScannerTestInput {
   readonly claudeHomePath: string;
   readonly codexHomePath: string;
   readonly importedWorkspaceRoots?: ReadonlyArray<string>;
   /** Base dir for the test ServerConfig; worktreesDir derives from it. */
   readonly configBaseDir?: string;
   readonly providerInstances?: ContractServerSettings["providerInstances"];
-}) =>
-  Effect.gen(function* () {
-    const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-    return yield* scanner.scan;
-  }).pipe(
-    Effect.provide(
-      AgentSessionScanner.layer.pipe(
-        Layer.provide(
-          Layer.mergeAll(
-            ServerSettings.layerTest({
-              providers: {
-                claudeAgent: { homePath: input.claudeHomePath },
-                codex: { homePath: input.codexHomePath },
-              },
-              ...(input.providerInstances === undefined
-                ? {}
-                : { providerInstances: input.providerInstances }),
-            }),
-            ServerConfig.layerTest(
-              input.claudeHomePath,
-              input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
-            ),
-            makeProjectionSnapshotQueryLayer(input.importedWorkspaceRoots ?? []),
-          ),
+}
+
+const makeScannerTestLayer = (input: ScannerTestInput) =>
+  AgentSessionScanner.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ServerSettings.layerTest({
+          providers: {
+            claudeAgent: { homePath: input.claudeHomePath },
+            codex: { homePath: input.codexHomePath },
+          },
+          ...(input.providerInstances === undefined
+            ? {}
+            : { providerInstances: input.providerInstances }),
+        }),
+        ServerConfig.layerTest(
+          input.claudeHomePath,
+          input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
+        makeProjectionSnapshotQueryLayer(input.importedWorkspaceRoots ?? []),
       ),
     ),
   );
+
+const runScan = (input: ScannerTestInput) =>
+  Effect.gen(function* () {
+    const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+    return yield* scanner.scan;
+  }).pipe(Effect.provide(makeScannerTestLayer(input)));
+
+const runRecentThreads = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
+  Effect.gen(function* () {
+    const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+    return yield* scanner.recentThreads(input.workspaceRoot);
+  }).pipe(Effect.provide(makeScannerTestLayer(input)));
 
 const makeTempDir = Effect.fn("AgentSessionScanner.test.makeTempDir")(function* (prefix: string) {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -121,6 +130,8 @@ const claudeSessionLine = (cwd: string) =>
 /** Codex rollout line: session metadata is nested under `payload`. */
 const codexRolloutLine = (cwd: string) =>
   `${JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", type: "session_meta", payload: { id: "r1", cwd } })}\n`;
+
+const encodeTranscriptRecord = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
   describe("scan", () => {
@@ -702,5 +713,261 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         expect(result.scannedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
       }),
     );
+  });
+
+  describe("recentThreads", () => {
+    it.effect("imports recent Claude and Codex sessions for the selected project only", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const otherWorkspace = yield* makeTempDir("t3code-workspace-other-");
+
+        const claudeTranscript = (cwd: string, sessionId: string) =>
+          `${JSON.stringify({
+            type: "user",
+            cwd,
+            sessionId,
+            timestamp: "2026-08-23T12:00:00.000Z",
+            message: { role: "user", content: "Fix the project" },
+          })}\n${JSON.stringify({
+            type: "assistant",
+            sessionId,
+            timestamp: "2026-08-23T12:01:00.000Z",
+            message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+          })}\n`;
+
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-recent.jsonl"),
+          contents: claudeTranscript(workspace, "claude-recent"),
+          mtimeMs: nowMs - 24 * 60 * 60 * 1000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-old.jsonl"),
+          contents: claudeTranscript(workspace, "claude-old"),
+          mtimeMs: nowMs - 31 * 24 * 60 * 60 * 1000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-other", "claude-other.jsonl"),
+          contents: claudeTranscript(otherWorkspace, "claude-other"),
+          mtimeMs: nowMs - 24 * 60 * 60 * 1000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2026",
+            "08",
+            "24",
+            "rollout-codex-recent.jsonl",
+          ),
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "codex-recent", cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              timestamp: "2026-08-24T10:00:00.000Z",
+              payload: { type: "user_message", message: "Review this code" },
+            }),
+            encodeTranscriptRecord({
+              type: "response_item",
+              timestamp: "2026-08-24T10:01:00.000Z",
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "Looks good" }],
+              },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 60 * 60 * 1000,
+        });
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+
+        expect(threads.map((thread) => thread.providerSessionId)).toEqual([
+          "codex-recent",
+          "claude-recent",
+        ]);
+        expect(threads.map((thread) => thread.messages.map((message) => message.text))).toEqual([
+          ["Review this code", "Looks good"],
+          ["Fix the project", "Done"],
+        ]);
+      }),
+    );
+
+    it.effect("keeps the provider instance that owns a custom session home", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const customHome = yield* makeTempDir("t3code-codex-custom-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+
+        yield* writeTranscript({
+          filePath: path.join(customHome, "sessions", "2026", "08", "24", "rollout-custom.jsonl"),
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "custom-session", cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Use my work account" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs,
+        });
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+          providerInstances: {
+            [ProviderInstanceId.make("codex-work")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: customHome },
+            },
+          },
+        });
+
+        expect(threads[0]?.providerInstanceId).toBe("codex-work");
+      }),
+    );
+  });
+});
+
+describe("parseAgentSessionTranscript", () => {
+  it("keeps Claude text and titles while dropping malformed and tool records", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        "not valid json",
+        JSON.stringify({ type: "ai-title", aiTitle: "Fix authentication" }),
+        JSON.stringify({
+          type: "user",
+          sessionId: "claude-session",
+          timestamp: "2026-08-24T10:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "Fix authentication" }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          sessionId: "claude-session",
+          message: { role: "user", content: [{ type: "tool_result", text: "hidden" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          sessionId: "claude-session",
+          message: {
+            role: "assistant",
+            model: "claude-sonnet-5",
+            content: [{ type: "text", text: "Updated the login flow" }],
+          },
+        }),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread).toMatchObject({
+      providerSessionId: "claude-session",
+      title: "Fix authentication",
+      model: "claude-sonnet-5",
+      messages: [
+        { role: "user", text: "Fix authentication" },
+        { role: "assistant", text: "Updated the login flow" },
+      ],
+    });
+  });
+
+  it("uses Codex user events instead of duplicate instruction messages", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session" } }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Internal setup instructions" }],
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: { type: "user_message", message: "Fix the actual bug" },
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Fixed" }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.messages.map((message) => message.text)).toEqual([
+      "Fix the actual bug",
+      "Fixed",
+    ]);
+  });
+
+  it("skips sessions without a visible user message", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: "Done" },
+      }),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread).toBeNull();
+  });
+
+  it("keeps the first prompt when later assistant output exceeds the message limit", () => {
+    const transcript = [
+      encodeTranscriptRecord({
+        type: "user",
+        sessionId: "claude-session",
+        message: { role: "user", content: "Keep this prompt" },
+      }),
+      ...Array.from({ length: 250 }, (_, index) =>
+        encodeTranscriptRecord({
+          type: "assistant",
+          message: { role: "assistant", content: `Assistant update ${index}` },
+        }),
+      ),
+    ].join("\n");
+
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: transcript,
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages[0]?.text).toBe("Keep this prompt");
+    expect(thread?.messages.at(-1)?.text).toBe("Assistant update 249");
   });
 });

@@ -20,6 +20,7 @@ import {
   ClaudeSettings,
   CodexSettings,
   ProviderDriverKind,
+  ProviderInstanceId,
   type AgentSessionProjectCandidate,
   type AgentSessionScanResult,
   type ProviderInstanceConfig,
@@ -61,9 +62,61 @@ const MAX_TRANSCRIPTS_PER_SOURCE = 5000;
  * indefinitely.
  */
 const MAX_STATS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
+const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_IMPORTED_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
+const MAX_IMPORTED_MESSAGES = 200;
+
+const TranscriptContentBlock = Schema.Struct({
+  type: Schema.optional(Schema.String),
+  text: Schema.optional(Schema.String),
+});
+
+const TranscriptMessage = Schema.Struct({
+  role: Schema.optional(Schema.String),
+  content: Schema.optional(Schema.Union([Schema.String, Schema.Array(TranscriptContentBlock)])),
+  model: Schema.optional(Schema.String),
+});
+
+const TranscriptRecord = Schema.Struct({
+  type: Schema.optional(Schema.String),
+  timestamp: Schema.optional(Schema.String),
+  sessionId: Schema.optional(Schema.String),
+  aiTitle: Schema.optional(Schema.String),
+  isSidechain: Schema.optional(Schema.Boolean),
+  message: Schema.optional(TranscriptMessage),
+  payload: Schema.optional(
+    Schema.Struct({
+      id: Schema.optional(Schema.String),
+      session_id: Schema.optional(Schema.String),
+      type: Schema.optional(Schema.String),
+      role: Schema.optional(Schema.String),
+      message: Schema.optional(Schema.String),
+      model: Schema.optional(Schema.String),
+      content: Schema.optional(Schema.Array(TranscriptContentBlock)),
+    }),
+  ),
+});
 
 const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
+const decodeTranscriptRecord = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptRecord));
+
+export interface AgentSessionThreadMessage {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly createdAt: string;
+}
+
+export interface AgentSessionThread {
+  readonly source: AgentSessionSource;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+  readonly title: string;
+  readonly model: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
+}
 
 /** Service tag for agent session discovery. */
 export class AgentSessionScanner extends Context.Service<
@@ -76,6 +129,9 @@ export class AgentSessionScanner extends Context.Service<
      * error directly — there is no server-local context worth wrapping.
      */
     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
+    readonly recentThreads: (
+      workspaceRoot: string,
+    ) => Effect.Effect<ReadonlyArray<AgentSessionThread>, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -85,8 +141,134 @@ type AgentSessionSource = AgentSessionProjectCandidate["sources"][number];
 interface RawCandidate {
   readonly cwd: string;
   readonly source: AgentSessionSource;
+  readonly providerInstanceId: ProviderInstanceId;
   readonly threadCount: number;
   readonly lastActiveAtMs: number | null;
+  readonly transcripts: ReadonlyArray<{
+    readonly filePath: string;
+    readonly mtimeMs: number | null;
+  }>;
+}
+
+function extractText(
+  content: string | ReadonlyArray<typeof TranscriptContentBlock.Type> | undefined,
+): string {
+  if (typeof content === "string") return content.trim();
+  if (content === undefined) return "";
+  return content
+    .filter(
+      (block) =>
+        block.type === "text" || block.type === "input_text" || block.type === "output_text",
+    )
+    .map((block) => block.text?.trim() ?? "")
+    .filter((text) => text.length > 0)
+    .join("\n");
+}
+
+function normalizeTimestamp(value: string | undefined, fallback: string): string {
+  if (value === undefined) return fallback;
+  const parsed = DateTime.make(value);
+  return Option.isSome(parsed) ? DateTime.formatIso(parsed.value) : fallback;
+}
+
+/** Keep visible user and assistant text while ignoring tools, reasoning, and malformed records. */
+export function parseAgentSessionTranscript(input: {
+  readonly contents: string;
+  readonly source: AgentSessionSource;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly fallbackSessionId: string;
+  readonly lastActiveAtMs: number;
+}): AgentSessionThread | null {
+  const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
+  let providerSessionId = input.fallbackSessionId;
+  let title: string | null = null;
+  let model: string | null = null;
+  let hasExplicitCodexUserMessages = false;
+  const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
+
+  for (const line of input.contents.split("\n")) {
+    const decoded = decodeTranscriptRecord(line);
+    if (Option.isNone(decoded)) continue;
+    const record = decoded.value;
+
+    if (input.source === "claudeAgent") {
+      if (record.sessionId?.trim()) providerSessionId = record.sessionId.trim();
+      if (record.aiTitle?.trim()) title = record.aiTitle.trim();
+      if (record.message?.model?.trim()) model = record.message.model.trim();
+      if (record.isSidechain === true || (record.type !== "user" && record.type !== "assistant")) {
+        continue;
+      }
+
+      const text = extractText(record.message?.content);
+      if (text.length === 0) continue;
+      messages.push({
+        role: record.type,
+        text,
+        createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        codexResponseUser: false,
+      });
+      continue;
+    }
+
+    if (record.type === "session_meta") {
+      providerSessionId =
+        record.payload?.id?.trim() || record.payload?.session_id?.trim() || providerSessionId;
+      continue;
+    }
+    if (record.type === "turn_context" && record.payload?.model?.trim()) {
+      model = record.payload.model.trim();
+      continue;
+    }
+    if (record.type === "event_msg" && record.payload?.type === "user_message") {
+      const text = record.payload.message?.trim() ?? "";
+      if (text.length === 0) continue;
+      hasExplicitCodexUserMessages = true;
+      messages.push({
+        role: "user",
+        text,
+        createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        codexResponseUser: false,
+      });
+      continue;
+    }
+    if (
+      record.type !== "response_item" ||
+      record.payload?.type !== "message" ||
+      (record.payload.role !== "user" && record.payload.role !== "assistant")
+    ) {
+      continue;
+    }
+
+    const text = extractText(record.payload.content);
+    if (text.length === 0) continue;
+    messages.push({
+      role: record.payload.role,
+      text,
+      createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+      codexResponseUser: record.payload.role === "user",
+    });
+  }
+
+  const visibleMessages = messages
+    .filter((message) => !hasExplicitCodexUserMessages || !message.codexResponseUser)
+    .map(({ codexResponseUser: _codexResponseUser, ...message }) => message);
+  const firstUserMessage = visibleMessages.find((message) => message.role === "user");
+  if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) return null;
+  const latestMessages = visibleMessages.slice(-MAX_IMPORTED_MESSAGES);
+  const retainedMessages = latestMessages.some((message) => message.role === "user")
+    ? latestMessages
+    : [firstUserMessage, ...latestMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+
+  return {
+    source: input.source,
+    providerInstanceId: input.providerInstanceId,
+    providerSessionId,
+    title: title ?? firstUserMessage.text.split("\n")[0]?.slice(0, 100).trim() ?? "Imported thread",
+    model,
+    createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
+    updatedAt: fallbackTimestamp,
+    messages: retainedMessages,
+  };
 }
 
 /**
@@ -209,23 +391,6 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.orElseSucceed(() => null));
   });
 
-  const latestMtimeMs = Effect.fn("AgentSessionScanner.latestMtimeMs")(function* (
-    filePaths: ReadonlyArray<string>,
-  ) {
-    let latest: number | null = null;
-    for (const filePath of filePaths) {
-      const stats = yield* statOption(filePath);
-      if (Option.isNone(stats)) continue;
-      const mtime = stats.value.mtime;
-      if (Option.isNone(mtime)) continue;
-      const value = mtime.value.getTime();
-      if (latest === null || value > latest) {
-        latest = value;
-      }
-    }
-    return latest;
-  });
-
   /**
    * Resolve the Claude config directory the CLI would use, matching the
    * precedence the spawned CLI sees: the instance's `homePath` (exported as
@@ -250,7 +415,10 @@ export const make = Effect.gen(function* () {
    * `-`), so the real path comes from the `cwd` recorded in the newest
    * transcript inside it.
    */
-  const scanClaude = Effect.fn("AgentSessionScanner.scanClaude")(function* (homePath: string) {
+  const scanClaude = Effect.fn("AgentSessionScanner.scanClaude")(function* (
+    homePath: string,
+    providerInstanceId: ProviderInstanceId,
+  ) {
     const projectsDir = path.join(homePath, "projects");
     const projectDirectories = yield* listDirectory(projectsDir);
     const candidates: Array<RawCandidate> = [];
@@ -282,7 +450,14 @@ export const make = Effect.gen(function* () {
       // The slug is lossy (`/a/b.c` and `/a/b/c` share a directory), so a
       // directory can hold sessions from several distinct paths — group by
       // the recorded cwd like the Codex scan does.
-      const byCwd = new Map<string, { threadCount: number; lastActiveAtMs: number }>();
+      const byCwd = new Map<
+        string,
+        {
+          threadCount: number;
+          lastActiveAtMs: number;
+          transcripts: Array<{ filePath: string; mtimeMs: number }>;
+        }
+      >();
       for (const entry of withMtimes) {
         const cwd = yield* readCwd(entry.filePath);
         if (cwd === null) continue;
@@ -290,16 +465,23 @@ export const make = Effect.gen(function* () {
         if (existing) {
           existing.threadCount += 1;
           existing.lastActiveAtMs = Math.max(existing.lastActiveAtMs, entry.mtimeMs);
+          existing.transcripts.push(entry);
         } else {
-          byCwd.set(cwd, { threadCount: 1, lastActiveAtMs: entry.mtimeMs });
+          byCwd.set(cwd, {
+            threadCount: 1,
+            lastActiveAtMs: entry.mtimeMs,
+            transcripts: [entry],
+          });
         }
       }
       for (const [cwd, group] of byCwd) {
         candidates.push({
           cwd,
           source: "claudeAgent",
+          providerInstanceId,
           threadCount: group.threadCount,
           lastActiveAtMs: group.lastActiveAtMs,
+          transcripts: group.transcripts,
         });
       }
     }
@@ -311,7 +493,10 @@ export const make = Effect.gen(function* () {
    * Codex writes `sessions/YYYY/MM/DD/rollout-*.jsonl`. Always scan the shared
    * home: in auth-overlay mode the effective home only symlinks to it.
    */
-  const scanCodex = Effect.fn("AgentSessionScanner.scanCodex")(function* (homePath: string) {
+  const scanCodex = Effect.fn("AgentSessionScanner.scanCodex")(function* (
+    homePath: string,
+    providerInstanceId: ProviderInstanceId,
+  ) {
     const sessionsDir = path.join(homePath, "sessions");
 
     const rollouts: Array<string> = [];
@@ -337,31 +522,47 @@ export const make = Effect.gen(function* () {
       if (rollouts.length >= MAX_TRANSCRIPTS_PER_SOURCE) break;
     }
 
-    const byCwd = new Map<string, Array<string>>();
+    const byCwd = new Map<string, Array<{ filePath: string; mtimeMs: number | null }>>();
     for (const rollout of rollouts) {
       const cwd = yield* readCwd(rollout);
       if (cwd === null) continue;
+      const stats = yield* statOption(rollout);
+      const mtimeMs =
+        Option.isSome(stats) && Option.isSome(stats.value.mtime)
+          ? stats.value.mtime.value.getTime()
+          : null;
+      const transcript = { filePath: rollout, mtimeMs };
       const existing = byCwd.get(cwd);
       if (existing) {
-        existing.push(rollout);
+        existing.push(transcript);
       } else {
-        byCwd.set(cwd, [rollout]);
+        byCwd.set(cwd, [transcript]);
       }
     }
 
     const candidates: Array<RawCandidate> = [];
-    for (const [cwd, filePaths] of byCwd) {
+    for (const [cwd, transcripts] of byCwd) {
       candidates.push({
         cwd,
         source: "codex",
-        threadCount: filePaths.length,
-        lastActiveAtMs: yield* latestMtimeMs(filePaths),
+        providerInstanceId,
+        threadCount: transcripts.length,
+        lastActiveAtMs: transcripts.reduce<number | null>(
+          (latest, transcript) =>
+            transcript.mtimeMs === null
+              ? latest
+              : latest === null
+                ? transcript.mtimeMs
+                : Math.max(latest, transcript.mtimeMs),
+          null,
+        ),
+        transcripts,
       });
     }
     return candidates;
   });
 
-  const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
+  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* () {
     const settings = yield* serverSettings.getSettings.pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
     );
@@ -370,17 +571,26 @@ export const make = Effect.gen(function* () {
     const scannedHomes = new Set<string>();
 
     for (const source of ["claudeAgent", "codex"] as const) {
-      const instances: Array<ProviderInstanceConfig> = Object.values(
-        settings.providerInstances,
-      ).filter((instance) => instance.driver === source);
+      const instances: Array<{
+        readonly instanceId: ProviderInstanceId;
+        readonly config: ProviderInstanceConfig;
+      }> = Object.entries(settings.providerInstances)
+        .filter(([, instance]) => instance.driver === source)
+        .map(([instanceId, config]) => ({
+          instanceId: ProviderInstanceId.make(instanceId),
+          config,
+        }));
       if (!Object.hasOwn(settings.providerInstances, source)) {
         instances.push({
-          driver: ProviderDriverKind.make(source),
-          config: settings.providers[source],
+          instanceId: ProviderInstanceId.make(source),
+          config: {
+            driver: ProviderDriverKind.make(source),
+            config: settings.providers[source],
+          },
         });
       }
 
-      for (const instance of instances) {
+      for (const { instanceId, config: instance } of instances) {
         const homeVariable = source === "claudeAgent" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
         const environmentHome =
           instance.environment?.findLast((variable) => variable.name === homeVariable)?.value ??
@@ -412,9 +622,22 @@ export const make = Effect.gen(function* () {
         const homeKey = `${source}\0${normalizeProjectPathForComparison(realHomePath)}`;
         if (scannedHomes.has(homeKey)) continue;
         scannedHomes.add(homeKey);
-        raw.push(...(yield* source === "claudeAgent" ? scanClaude(homePath) : scanCodex(homePath)));
+        raw.push(
+          ...(yield* source === "claudeAgent"
+            ? scanClaude(homePath, instanceId)
+            : scanCodex(homePath, instanceId)),
+        );
       }
     }
+
+    return raw;
+  });
+
+  let cachedCandidates: ReadonlyArray<RawCandidate> | null = null;
+
+  const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
+    const raw = yield* collectCandidates();
+    cachedCandidates = raw;
 
     // Merge by resolved path first so both sources agree on a key, then by
     // realpath so a symlinked home and its target collapse into one candidate.
@@ -522,7 +745,59 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  return AgentSessionScanner.of({ scan });
+  const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = Effect.fn(
+    "AgentSessionScanner.recentThreads",
+  )(function* (workspaceRoot) {
+    const root = path.resolve(expandHomePath(workspaceRoot));
+    const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+    const normalizedRoot = normalizeProjectPathForComparison(realRoot);
+    const cutoffMs = DateTime.toEpochMillis(yield* DateTime.now) - RECENT_THREAD_WINDOW_MS;
+    const threads: Array<AgentSessionThread> = [];
+    const importedSessions = new Set<string>();
+
+    const candidates = cachedCandidates ?? (yield* collectCandidates());
+    cachedCandidates = candidates;
+
+    for (const candidate of candidates) {
+      const expanded = expandHomePath(candidate.cwd.trim());
+      if (!path.isAbsolute(expanded)) continue;
+      const resolved = path.resolve(expanded);
+      const realCandidate = yield* fileSystem
+        .realPath(resolved)
+        .pipe(Effect.orElseSucceed(() => resolved));
+      if (normalizeProjectPathForComparison(realCandidate) !== normalizedRoot) continue;
+
+      for (const transcript of candidate.transcripts) {
+        if (transcript.mtimeMs === null || transcript.mtimeMs < cutoffMs) continue;
+        const stats = yield* statOption(transcript.filePath);
+        if (Option.isNone(stats) || stats.value.size > BigInt(MAX_IMPORTED_TRANSCRIPT_BYTES)) {
+          continue;
+        }
+        const contents = yield* fileSystem
+          .readFileString(transcript.filePath)
+          .pipe(Effect.map(Option.some), Effect.orElseSucceed(Option.none));
+        if (Option.isNone(contents)) continue;
+
+        const thread = parseAgentSessionTranscript({
+          contents: contents.value,
+          source: candidate.source,
+          providerInstanceId: candidate.providerInstanceId,
+          fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
+          lastActiveAtMs: transcript.mtimeMs,
+        });
+        if (thread === null) continue;
+        const sessionKey = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
+        if (importedSessions.has(sessionKey)) continue;
+        importedSessions.add(sessionKey);
+        threads.push(thread);
+      }
+    }
+
+    threads.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return threads;
+  });
+
+  return AgentSessionScanner.of({ scan, recentThreads });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make);

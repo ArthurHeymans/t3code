@@ -24,5 +24,8 @@ T3 Code finds directories that Claude Code or Codex has used. The default
 selection includes projects active within the last 30 days. Select **Choose**
 to include older projects or change the selection.
 
+Imported projects include Codex and Claude conversations active within the last
+30 days. You can continue those conversations in T3 Code.
+
 You can skip agent setup and project import. Select **Back** to return to a
 previous step.

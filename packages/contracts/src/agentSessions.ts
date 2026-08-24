@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 /** Coding agent home directories the scanner knows how to read. */
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex"]);
@@ -32,6 +32,18 @@ export const AgentSessionScanResult = Schema.Struct({
   scannedAt: IsoDateTime,
 });
 export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
+
+export const AgentSessionImportInput = Schema.Struct({
+  projectId: ProjectId,
+  workspaceRoot: TrimmedNonEmptyString,
+});
+export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
+
+export const AgentSessionImportResult = Schema.Struct({
+  importedCount: NonNegativeInt,
+  skippedCount: NonNegativeInt,
+});
+export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 
 export class AgentSessionScanError extends Schema.TaggedErrorClass<AgentSessionScanError>()(
   "AgentSessionScanError",
