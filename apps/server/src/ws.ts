@@ -43,6 +43,10 @@ import {
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2ThreadLaunchError,
+  PiSessionError,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
   type ProjectEntriesFailure,
@@ -97,6 +101,7 @@ import * as ThreadManagementService from "./orchestration-v2/ThreadManagementSer
 import { ProviderSessionManagerV2 } from "./orchestration-v2/ProviderSessionManager.ts";
 import type { ThreadLaunchService } from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import * as PiSessionTranscriptImporter from "./orchestration-v2/PiSessionTranscriptImporter.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -119,6 +124,7 @@ import {
   decideThreadResume,
   isThreadReplayRawPayloadSafe,
   threadReplayEncodedBytes,
+  threadResumeSnapshotAction,
   THREAD_RESUME_MAX_REPLAY_EVENTS,
 } from "./orchestration-v2/ThreadStream.ts";
 import { THREAD_HISTORY_SNAPSHOT_ROW_LIMIT } from "./orchestration-v2/threadHistoryPaging.ts";
@@ -139,6 +145,7 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
+import { listPiSessions, validatePiSessionPath } from "./provider/PiSessions.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -556,6 +563,8 @@ const makeWsRpcLayer = (
         | FileSystem.FileSystem
         | ServerConfig.ServerConfig
       >();
+      const piSessionTranscriptImporter =
+        yield* PiSessionTranscriptImporter.PiSessionTranscriptImporter;
       const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const canReplayPersistedRange = Effect.fnUntraced(function* (
@@ -628,6 +637,7 @@ const makeWsRpcLayer = (
             })),
           ),
       );
+      const path = yield* Path.Path;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
@@ -852,6 +862,7 @@ const makeWsRpcLayer = (
           readonly afterSequence?: number;
           readonly requestCompletionMarker?: boolean;
           readonly acceptBoundedSnapshot?: boolean;
+          readonly snapshotFallback?: "full" | "error";
         }) {
           yield* Effect.annotateCurrentSpan({
             "orchestration_v2.thread_id": input.threadId,
@@ -1024,6 +1035,12 @@ const makeWsRpcLayer = (
               replayEncodedBytes: threadReplayEncodedBytes(replay),
             });
             if (plan.mode === "snapshot") {
+              if (threadResumeSnapshotAction(plan, input.snapshotFallback) === "bounded-refetch") {
+                return yield* new OrchestrationV2GetThreadProjectionError({
+                  threadId: input.threadId,
+                  message: `Thread resume for ${input.threadId} requires a fresh bounded snapshot`,
+                });
+              }
               return yield* snapshotThenLive();
             }
             return Stream.concat(
@@ -2256,6 +2273,129 @@ const makeWsRpcLayer = (
               ),
             ),
             { "rpc.aggregate": "orchestration" },
+          ),
+        [WS_METHODS.piSessionsList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.piSessionsList,
+            Effect.tryPromise({
+              try: () => listPiSessions(input.limit === undefined ? {} : { limit: input.limit }),
+              catch: (cause) =>
+                new PiSessionError({ message: "Failed to list Pi sessions.", cause }),
+            }).pipe(Effect.map((sessions) => ({ sessions }))),
+            { "rpc.aggregate": "provider" },
+          ),
+        [WS_METHODS.piSessionsAdopt]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.piSessionsAdopt,
+            Effect.gen(function* () {
+              const summary = yield* Effect.tryPromise({
+                try: () => validatePiSessionPath(input.sessionPath),
+                catch: (cause) =>
+                  new PiSessionError({ message: "Failed to read the Pi session.", cause }),
+              });
+              if (summary === null) {
+                return yield* new PiSessionError({
+                  message: "The Pi session does not exist or is outside Pi's sessions directory.",
+                });
+              }
+              const project = yield* projectService
+                .getById(ProjectId.make(input.projectId))
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new PiSessionError({ message: "Failed to load the project.", cause }),
+                  ),
+                );
+              if (Option.isNone(project)) {
+                return yield* new PiSessionError({
+                  message: "The selected project no longer exists.",
+                });
+              }
+              if (path.resolve(project.value.workspaceRoot) !== path.resolve(summary.cwd)) {
+                return yield* new PiSessionError({
+                  message: "The Pi session belongs to a different project directory.",
+                });
+              }
+
+              const driver = ProviderDriverKind.make("pi");
+              const threadId = ThreadId.make(
+                [
+                  "thread",
+                  "provider",
+                  encodeURIComponent(driver),
+                  "native-thread",
+                  encodeURIComponent(summary.sessionPath),
+                ].join(":"),
+              );
+              const existing = yield* threadManagement.getThreadShell(threadId).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new PiSessionError({
+                      message: "Failed to check the imported thread.",
+                      cause,
+                    }),
+                ),
+              );
+              if (existing === null) {
+                const commandUuid = yield* crypto.randomUUIDv4.pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new PiSessionError({
+                        message: "Failed to allocate the import command.",
+                        cause,
+                      }),
+                  ),
+                );
+                const commandId = CommandId.make(
+                  `command:pi-session:${encodeURIComponent(summary.sessionId)}:${commandUuid}`,
+                );
+                const title =
+                  summary.name ??
+                  summary.firstUserText?.split("\n")[0]?.slice(0, 100) ??
+                  path.basename(summary.cwd);
+                yield* startup
+                  .enqueueCommand(
+                    threadManagement.dispatch({
+                      type: "thread.import",
+                      commandId,
+                      createdBy: "user",
+                      creationSource: "web",
+                      threadId,
+                      projectId: ProjectId.make(input.projectId),
+                      title,
+                      modelSelection: {
+                        instanceId: ProviderInstanceId.make(input.providerInstanceId),
+                        model: "default",
+                        options: [{ id: "thinking", value: "inherit" }],
+                      },
+                      runtimeMode: "full-access",
+                      interactionMode: "default",
+                      branch: null,
+                      worktreePath: null,
+                      nativeThreadId: summary.sessionPath,
+                    }),
+                  )
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new PiSessionError({ message: "Failed to import the Pi session.", cause }),
+                    ),
+                  );
+              }
+              yield* piSessionTranscriptImporter
+                .importTranscript({ threadId, sessionPath: summary.sessionPath })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new PiSessionError({
+                        message: "Failed to import the Pi session history.",
+                        cause,
+                      }),
+                  ),
+                );
+              return { threadId };
+            }),
+            { "rpc.aggregate": "provider" },
           ),
         [WS_METHODS.shellOpenInEditor]: (input) =>
           observeRpcEffect(WS_METHODS.shellOpenInEditor, externalLauncher.launchEditor(input), {

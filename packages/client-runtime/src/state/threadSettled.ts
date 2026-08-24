@@ -94,6 +94,168 @@ export function hasQueuedTurnStart(
  * "active" in the data model and is only suppressed from the inbox until
  * its wake time passes or the thread demands attention.
  */
+export type ChangeRequestStateLike = "open" | "closed" | "merged";
+
+/**
+ * The slice of a change request the settle rules need. `updatedAt` is the
+ * provider's last-activity timestamp; for a merged/closed request it bounds
+ * when the terminal state landed.
+ */
+export interface ChangeRequestSettleSource {
+  readonly state: ChangeRequestStateLike;
+  readonly updatedAt?: string | null | undefined;
+}
+
+/** What the settle rules need to know about the thread's own timeline. */
+export interface ThreadActivitySource extends QueuedThreadShell {
+  readonly createdAt: string;
+}
+
+/**
+ * Latest USER-initiated activity: messages and the turn requests they start,
+ * deliberately not the agent-side started/completed stamps. The settle-on-
+ * merge anchor uses this so a merge landing mid-turn still settles the
+ * thread when that turn finishes, while a user re-engaging after the merge
+ * blocks it for good. Falls back to creation time for untouched threads.
+ */
+function threadUserActivityAnchorAt(thread: ThreadActivitySource): string {
+  const messageAt = thread.latestUserMessageAt;
+  const requestedAt = (thread.latestRun ?? thread.latestTurn)?.requestedAt;
+  let anchor = thread.createdAt;
+  for (const candidate of [messageAt, requestedAt]) {
+    if (candidate != null && Date.parse(candidate) > Date.parse(anchor)) {
+      anchor = candidate;
+    }
+  }
+  return anchor;
+}
+
+/**
+ * Returns whether the change request settles the thread immediately. A
+ * terminal request settles the thread only while it postdates every user-
+ * initiated event in it: settling on a merge happens ONCE. A request last
+ * touched before the thread was created is inherited branch history (a new
+ * thread started at a worktree root whose PR already merged), and one older
+ * than the user's latest engagement was already adjudicated — re-engaging a
+ * thread whose PR merged is the user saying the conversation outlived the
+ * PR. Unknown timestamps keep the old always-settle behavior.
+ */
+export function changeRequestAutoSettles(
+  changeRequest: ChangeRequestSettleSource | null | undefined,
+  options: {
+    readonly autoSettleOnMerge?: boolean | undefined;
+    readonly thread?: ThreadActivitySource | null | undefined;
+  } = {},
+): boolean {
+  if (changeRequest == null) return false;
+  const terminal =
+    changeRequest.state === "closed" ||
+    (changeRequest.state === "merged" && options.autoSettleOnMerge !== false);
+  if (!terminal) return false;
+  if (changeRequest.updatedAt == null || options.thread == null) return true;
+  const updatedAtMs = Date.parse(changeRequest.updatedAt);
+  const anchorAtMs = Date.parse(threadUserActivityAnchorAt(options.thread));
+  // Malformed timestamps fall back to settling, matching servers that never
+  // report updatedAt.
+  if (Number.isNaN(updatedAtMs) || Number.isNaN(anchorAtMs)) return true;
+  return updatedAtMs >= anchorAtMs;
+}
+
+export function threadLastActivityAt(shell: SettlementThreadShell): string | null {
+  const latestRun = shell.latestRun ?? shell.latestTurn ?? null;
+  const candidates = [
+    shell.latestUserMessageAt,
+    latestRun?.requestedAt,
+    latestRun?.startedAt,
+    latestRun?.completedAt,
+  ];
+  let latest: string | null = null;
+  let latestTimestamp = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) continue;
+    const timestamp = Date.parse(candidate);
+    if (timestamp > latestTimestamp) {
+      latest = candidate;
+      latestTimestamp = timestamp;
+    }
+  }
+
+  return latest;
+}
+
+/**
+ * Client-side mirror of the server's settlement rules, used by clients that
+ * only hold a shell projection (for example the stdio bridge). Blocked or
+ * running work always wins; an explicit settled/active override, a terminal
+ * change request, and the auto-settle window are applied in that order.
+ */
+export function effectiveSettled(
+  shell: SettlementThreadShell,
+  options: {
+    readonly now: string;
+    readonly autoSettleAfterDays: number | null;
+    readonly autoSettleOnMerge?: boolean;
+    readonly changeRequest?: ChangeRequestSettleSource | null;
+  },
+): boolean {
+  // Blocked work must remain visible even when a user explicitly settled it.
+  if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
+  if (shell.session?.status === "starting" || shell.session?.status === "running") return false;
+  if (
+    shell.runtime !== null &&
+    shell.runtime !== undefined &&
+    ["preparing", "queued", "starting", "running", "waiting"].includes(shell.runtime.status)
+  ) {
+    return false;
+  }
+  if (hasQueuedTurnStart(shell, { now: options.now })) {
+    // The queued-turn blocker alone is forgivable: it is clock-derived, and
+    // list callers pass a coarser `now` than the settle action used. When
+    // the server already adjudicated the queued message by accepting a
+    // settle after it (settledAt stamps server accept time), trust that
+    // ruling — otherwise a settle near the grace boundary leaves the row
+    // pinned active until the caller's clock ticks over. A message NEWER
+    // than settledAt is genuinely new work and keeps the block until the
+    // server's auto-unsettle lands.
+    const serverAdjudicated =
+      shell.settledOverride === "settled" &&
+      shell.settledAt !== null &&
+      shell.latestUserMessageAt != null &&
+      Date.parse(shell.settledAt) >= Date.parse(shell.latestUserMessageAt);
+    if (!serverAdjudicated) return false;
+  }
+  if (shell.settledOverride === "settled") return true;
+  // "active" is the explicit keep-active pin: it suppresses auto-settle
+  // until real activity clears it server-side.
+  if (shell.settledOverride === "active") return false;
+  if (
+    changeRequestAutoSettles(options.changeRequest, {
+      autoSettleOnMerge: options.autoSettleOnMerge,
+      thread: shell,
+    })
+  ) {
+    return true;
+  }
+  // An open PR is unfinished business regardless of how long the thread has
+  // been quiet: review can take days, and hiding the thread would bury the
+  // work waiting on it. A configured merge, a close, or an explicit user
+  // settle resolves it.
+  if (options.changeRequest?.state === "open") return false;
+  if (options.autoSettleAfterDays === null) return false;
+
+  const lastActivityAt = threadLastActivityAt(shell);
+  if (lastActivityAt === null) return false;
+
+  // threadLastActivityAt only returns candidates whose Date.parse beat
+  // -Infinity, so this parse is a real number; a malformed `now` yields NaN,
+  // the comparison is false, and the thread stays active (never a surprise
+  // auto-settle on bad input).
+  return (
+    Date.parse(lastActivityAt) < Date.parse(options.now) - options.autoSettleAfterDays * DAY_MS
+  );
+}
+
 export interface ThreadSnoozeShell extends QueuedThreadShell {
   readonly snoozedUntil?: string | null;
   readonly snoozedAt?: string | null;
