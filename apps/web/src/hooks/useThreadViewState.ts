@@ -17,10 +17,10 @@ function timestampCovers(timestamp: string | undefined, target: string): boolean
   return Number.isFinite(timestampMs) && Number.isFinite(targetMs) && timestampMs >= targetMs;
 }
 
-function clearPendingWhenShellCatchesUp(
+function clearPendingWhenShellMatches(
   threadRef: ScopedThreadRef,
   pending: PendingThreadViewState,
-  sequence: number,
+  matches: (snapshotSequence: number) => boolean,
   clearPending: (threadKey: string, pending: PendingThreadViewState) => void,
 ): void {
   const threadKey = scopedThreadKey(threadRef);
@@ -35,7 +35,7 @@ function clearPendingWhenShellCatchesUp(
       return;
     }
     const snapshot = appAtomRegistry.get(shellStateAtom).snapshot;
-    if (Option.isNone(snapshot) || snapshot.value.snapshotSequence < sequence) return;
+    if (Option.isNone(snapshot) || !matches(snapshot.value.snapshotSequence)) return;
     completed = true;
     unsubscribe?.();
     clearPending(threadKey, pending);
@@ -49,6 +49,28 @@ function clearPendingWhenShellCatchesUp(
     return;
   }
   finishIfCaughtUp();
+}
+
+function keepPendingLocalUntilServerChanges(
+  threadRef: ScopedThreadRef,
+  pending: PendingThreadViewState,
+  serverViewedAt: string | undefined,
+  keepLocal: (threadKey: string, pending: PendingThreadViewState) => void,
+  clearPending: (threadKey: string, pending: PendingThreadViewState) => void,
+): void {
+  const threadKey = scopedThreadKey(threadRef);
+  if (useUiStateStore.getState().threadViewStatePendingById[threadKey] !== pending) return;
+
+  keepLocal(threadKey, pending);
+  const localPending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
+  if (localPending?.localOnly !== true) return;
+
+  clearPendingWhenShellMatches(
+    threadRef,
+    localPending,
+    () => readThreadShell(threadRef)?.viewedAt !== serverViewedAt,
+    clearPending,
+  );
 }
 
 /** Keeps the local compatibility marker and the server view marker in sync. */
@@ -88,10 +110,21 @@ export function useThreadViewState() {
         input: { threadId: threadRef.threadId, viewedThrough },
       }).then((result) => {
         if (result._tag === "Failure") {
-          keepLocal(threadKey, pending);
+          keepPendingLocalUntilServerChanges(
+            threadRef,
+            pending,
+            thread?.viewedAt,
+            keepLocal,
+            clearPending,
+          );
           return;
         }
-        clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
+        clearPendingWhenShellMatches(
+          threadRef,
+          pending,
+          (snapshotSequence) => snapshotSequence >= result.value.sequence,
+          clearPending,
+        );
       });
     },
     [clearPending, keepLocal, markLocalViewed, setPending, viewThread],
@@ -108,6 +141,7 @@ export function useThreadViewState() {
         markLocalUnread(threadKey, latestTurnCompletedAt);
         return;
       }
+      const serverViewedAt = readThreadShell(threadRef)?.viewedAt;
       const pending = { kind: "unread", targetAt: latestTurnCompletedAt } as const;
       setPending(threadKey, pending);
       markLocalUnread(threadKey, latestTurnCompletedAt);
@@ -116,10 +150,21 @@ export function useThreadViewState() {
         input: { threadId: threadRef.threadId },
       }).then((result) => {
         if (result._tag === "Failure") {
-          keepLocal(threadKey, pending);
+          keepPendingLocalUntilServerChanges(
+            threadRef,
+            pending,
+            serverViewedAt,
+            keepLocal,
+            clearPending,
+          );
           return;
         }
-        clearPendingWhenShellCatchesUp(threadRef, pending, result.value.sequence, clearPending);
+        clearPendingWhenShellMatches(
+          threadRef,
+          pending,
+          (snapshotSequence) => snapshotSequence >= result.value.sequence,
+          clearPending,
+        );
       });
     },
     [clearPending, keepLocal, markLocalUnread, markUnreadOnServer, setPending],

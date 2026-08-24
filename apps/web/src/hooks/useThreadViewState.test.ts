@@ -210,7 +210,7 @@ describe("useThreadViewState", () => {
       localOnly: true,
     });
     expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
-    expect(testState.listeners).toHaveLength(0);
+    expect(testState.listeners).toHaveLength(1);
   });
 
   it("keeps a local unread marker when the server rejects the unread command", async () => {
@@ -225,6 +225,33 @@ describe("useThreadViewState", () => {
       localOnly: true,
     });
     expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe("2026-01-01T00:00:59.999Z");
+    expect(testState.listeners).toHaveLength(1);
+  });
+
+  it("replaces a rejected local view when another device changes the server marker", async () => {
+    testState.viewThread.mockResolvedValue({ _tag: "Failure" });
+
+    renderHook().markViewed(threadRef, completedAt);
+    await flushCommands();
+
+    advanceShell(1, "2026-01-01T00:00:00.000Z");
+    expect(testState.uiState.threadViewStatePendingById[threadKey]?.localOnly).toBe(true);
+
+    advanceShell(2, "2026-01-01T00:00:59.999Z");
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
+    expect(testState.listeners).toHaveLength(0);
+  });
+
+  it("replaces a rejected local unread marker when another device views the thread", async () => {
+    testState.markUnreadOnServer.mockResolvedValue({ _tag: "Failure" });
+
+    renderHook().markUnread(threadRef, completedAt);
+    await flushCommands();
+
+    advanceShell(1, completedAt);
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
     expect(testState.listeners).toHaveLength(0);
   });
 
