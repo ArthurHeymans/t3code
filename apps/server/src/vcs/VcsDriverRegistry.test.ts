@@ -37,9 +37,11 @@ describe("VcsDriverRegistry", () => {
 
     return Effect.gen(function* () {
       const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
-      const driver = yield* registry.get("git");
+      const gitDriver = yield* registry.get("git");
+      const jjDriver = yield* registry.get("jj");
 
-      assert.strictEqual(driver.capabilities.kind, "git");
+      assert.strictEqual(gitDriver.capabilities.kind, "git");
+      assert.strictEqual(jjDriver.capabilities.kind, "jj");
     }).pipe(Effect.provide(layer));
   });
 
@@ -89,6 +91,42 @@ describe("VcsDriverRegistry", () => {
           "rev-parse --show-toplevel",
           "rev-parse --git-common-dir",
         ],
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("prefers jj auto-detection for colocated repositories", () => {
+    const calls: VcsProcess.VcsProcessInput[] = [];
+    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+      Layer.provide(NodeServices.layer),
+      Layer.provide(
+        Layer.mock(VcsProjectConfig.VcsProjectConfig)({
+          resolveKind: (input) => Effect.succeed(input.requestedKind ?? "auto"),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(VcsProcess.VcsProcess)({
+          run: (input) =>
+            Effect.sync(() => {
+              calls.push(input);
+              if (input.command === "jj" && input.args.join(" ") === "--no-pager root") {
+                return processOutput("/repo\n");
+              }
+              return processOutput("true\n");
+            }),
+        }),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+      const handle = yield* registry.resolve({ cwd: "/repo" });
+
+      assert.equal(handle.kind, "jj");
+      assert.equal(handle.repository.rootPath, "/repo");
+      assert.deepStrictEqual(
+        calls.map((call) => [call.command, ...call.args]),
+        [["jj", "--no-pager", "root"]],
       );
     }).pipe(Effect.provide(layer));
   });

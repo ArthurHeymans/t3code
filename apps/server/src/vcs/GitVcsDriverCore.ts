@@ -1816,6 +1816,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const status: GitVcsDriver.GitVcsDriver["Service"]["status"] = (input) =>
     statusDetails(input.cwd).pipe(
       Effect.map((details) => ({
+        kind: "git",
         isRepo: details.isRepo,
         hasPrimaryRemote: details.hasOriginRemote,
         isDefaultRef: details.isDefaultBranch,

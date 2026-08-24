@@ -112,6 +112,12 @@ jobs:
           cache: true
           run-install: true
 
+      - name: Setup Jujutsu
+        uses: ./.github/actions/setup-jj
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
       - id: release_meta
         name: Resolve release version
         shell: bash
