@@ -1,4 +1,4 @@
-import { ORCHESTRATION_V2_WS_METHODS } from "@t3tools/contracts";
+import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
 import {
@@ -16,6 +16,16 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       dispatchCommand: createEnvironmentRpcCommand(runtime, {
         label: "environment-data:orchestration-v2:dispatch-command",
         tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      }),
+      listPiSessions: createEnvironmentRpcQueryAtomFamily(runtime, {
+        label: "environment-data:orchestration-v2:pi-sessions-list",
+        tag: WS_METHODS.piSessionsList,
+        staleTimeMs: 10_000,
+        idleTtlMs: 30_000,
+      }),
+      adoptPiSession: createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:orchestration-v2:pi-session-adopt",
+        tag: WS_METHODS.piSessionsAdopt,
       }),
       threadProjection: createEnvironmentRpcQueryAtomFamily(runtime, {
         label: "environment-data:orchestration-v2:thread-projection",

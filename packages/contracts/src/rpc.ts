@@ -251,6 +251,13 @@ import {
   PreviewAutomationStreamEvent,
 } from "./previewAutomation.ts";
 import {
+  PiSessionAdoptInput,
+  PiSessionAdoptResult,
+  PiSessionError,
+  PiSessionsListInput,
+  PiSessionsListResult,
+} from "./piSession.ts";
+import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
   ServerConfig,
@@ -331,6 +338,10 @@ export const WS_METHODS = {
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
   projectsMutate: "projects.mutate",
+
+  // Pi session methods
+  piSessionsList: "piSessions.list",
+  piSessionsAdopt: "piSessions.adopt",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -1095,6 +1106,18 @@ const WsProjectsMutateRpc = Rpc.make(WS_METHODS.projectsMutate, {
   error: Schema.Union([ProjectMutationError, EnvironmentAuthorizationError]),
 });
 
+export const WsPiSessionsListRpc = Rpc.make(WS_METHODS.piSessionsList, {
+  payload: PiSessionsListInput,
+  success: PiSessionsListResult,
+  error: Schema.Union([PiSessionError, EnvironmentAuthorizationError]),
+});
+
+export const WsPiSessionsAdoptRpc = Rpc.make(WS_METHODS.piSessionsAdopt, {
+  payload: PiSessionAdoptInput,
+  success: PiSessionAdoptResult,
+  error: Schema.Union([PiSessionError, EnvironmentAuthorizationError]),
+});
+
 const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
   error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
@@ -1701,6 +1724,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
   WsProjectsMutateRpc,
+  WsPiSessionsListRpc,
+  WsPiSessionsAdoptRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAgentSessionsScanRpc,

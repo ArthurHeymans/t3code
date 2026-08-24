@@ -31,6 +31,7 @@ import {
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
   RunId,
@@ -276,6 +277,7 @@ const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLin
 function commandThreadId(command: OrchestrationV2Command): ThreadId {
   switch (command.type) {
     case "thread.create":
+    case "thread.import":
     case "thread.archive":
     case "thread.unarchive":
     case "thread.delete":
@@ -1850,7 +1852,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
 
   const dispatchThreadCreate = Effect.fn("orchestrationV2.dispatch.threadCreate")(function* (
-    command: Extract<OrchestrationV2Command, { readonly type: "thread.create" }>,
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.create" | "thread.import" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
   ) {
     yield* Effect.annotateCurrentSpan({
@@ -1899,7 +1901,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: thread,
     });
-    if (command.importedNativeThread !== undefined) {
+    if (command.type === "thread.create" && command.importedNativeThread !== undefined) {
       yield* emitEvent({
         type: "provider-thread.updated",
         threadId: command.threadId,
@@ -1929,6 +1931,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           createdAt: now,
           updatedAt: now,
         },
+      });
+    }
+
+    if (command.type === "thread.import") {
+      const driver = ProviderDriverKind.make("pi");
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: idAllocator.derive.providerThread({ driver, nativeThreadId: command.nativeThreadId }),
+        driver,
+        providerInstanceId: command.modelSelection.instanceId,
+        providerSessionId: null,
+        appThreadId: command.threadId,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver,
+          nativeId: command.nativeThreadId,
+          strength: "strong",
+        },
+        nativeConversationHeadRef: null,
+        status: "not_loaded",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      yield* emitEvent({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        providerInstanceId: command.modelSelection.instanceId,
+        occurredAt: now,
+        payload: providerThread,
       });
     }
   });
@@ -7760,7 +7795,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : parentProjection.runs.find((candidate) => candidate.id === task.runId);
       const parentNode = parentProjection.nodes.find((candidate) => candidate.id === task.id);
       const parentTurnItem = parentProjection.turnItems.find(
-        (candidate) => candidate.type === "subagent" && candidate.subagentId === task.id,
+        (candidate): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }> =>
+          candidate.type === "subagent" && candidate.subagentId === task.id,
       );
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
@@ -7853,7 +7889,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
       yield* writeSystemEvents([
         {
-          type: "subagent.updated",
+          type: "subagent.updated" as const,
           threadId: parentThreadId,
           ...(task.runId === null ? {} : { runId: task.runId }),
           nodeId: task.id,
@@ -7929,7 +7965,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   result: result.text,
                   completedAt: now,
                   updatedAt: now,
-                },
+                } satisfies OrchestrationV2TurnItem,
               },
             ]),
         ...(resultHandoff === null
@@ -7945,7 +7981,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               },
             ]),
         {
-          type: "context-transfer.created",
+          type: "context-transfer.created" as const,
           threadId: parentThreadId,
           ...(parentRun === undefined ? {} : { runId: parentRun.id }),
           providerInstanceId: childRun.providerInstanceId,
@@ -8224,6 +8260,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       | undefined;
     switch (command.type) {
       case "thread.create":
+      case "thread.import":
         yield* dispatchThreadCreate(command, events);
         break;
       case "thread.visit":

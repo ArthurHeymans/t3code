@@ -15,6 +15,7 @@ import {
   isThreadReplayRawPayloadSafe,
   threadReplayEncodedBytes,
   THREAD_RESUME_MAX_RAW_PAYLOAD_BYTES,
+  threadResumeSnapshotAction,
   THREAD_RESUME_MAX_REPLAY_ENCODED_BYTES,
   THREAD_RESUME_MAX_REPLAY_EVENTS,
 } from "./ThreadStream.ts";
@@ -135,26 +136,29 @@ describe("decideThreadResume", () => {
     });
   });
 
-  it("falls back to a snapshot when the event count exceeds the bound", () => {
-    expect(
-      decideThreadResume({
-        afterSequence: 10,
-        highWater: 20_000,
-        replayEventCount: THREAD_RESUME_MAX_REPLAY_EVENTS + 1,
-        replayEncodedBytes: 1,
-      }),
-    ).toEqual({ mode: "snapshot" });
+  it("asks bounded clients to refetch when the event count exceeds the bound", () => {
+    const plan = decideThreadResume({
+      afterSequence: 10,
+      highWater: 20_000,
+      replayEventCount: THREAD_RESUME_MAX_REPLAY_EVENTS + 1,
+      replayEncodedBytes: 1,
+    });
+
+    expect(plan).toEqual({ mode: "snapshot" });
+    expect(threadResumeSnapshotAction(plan, "error")).toBe("bounded-refetch");
+    expect(threadResumeSnapshotAction(plan, "full")).toBe("full-snapshot");
   });
 
-  it("falls back to a snapshot when encoded replay bytes exceed the bound", () => {
-    expect(
-      decideThreadResume({
-        afterSequence: 10,
-        highWater: 11,
-        replayEventCount: 1,
-        replayEncodedBytes: THREAD_RESUME_MAX_REPLAY_ENCODED_BYTES + 1,
-      }),
-    ).toEqual({ mode: "snapshot" });
+  it("asks bounded clients to refetch when encoded replay bytes exceed the bound", () => {
+    const plan = decideThreadResume({
+      afterSequence: 10,
+      highWater: 11,
+      replayEventCount: 1,
+      replayEncodedBytes: THREAD_RESUME_MAX_REPLAY_ENCODED_BYTES + 1,
+    });
+
+    expect(plan).toEqual({ mode: "snapshot" });
+    expect(threadResumeSnapshotAction(plan, "error")).toBe("bounded-refetch");
   });
 
   it("rejects pathological raw payloads before decoding them", () => {
