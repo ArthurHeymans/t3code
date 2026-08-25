@@ -14,7 +14,7 @@ export default Effect.gen(function* () {
     `;
   }
 
-  // Upgrading must not make every historical completion appear unread.
+  // Existing completed threads must remain read after the server upgrade.
   yield* sql`
     UPDATE projection_threads
     SET viewed_at = COALESCE(viewed_at, updated_at, created_at)

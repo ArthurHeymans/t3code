@@ -55,7 +55,7 @@ import Migration0039 from "./Migrations/039_ProjectionProjectsDefaultThreadEnvMo
 import Migration0040 from "./Migrations/040_ProjectionProjectFaviconPath.ts";
 import Migration0041 from "./Migrations/041_AuthSessionClientConnection.ts";
 import Migration0042 from "./Migrations/042_ProjectionThreadLinkedPullRequest.ts";
-import Migration0043 from "./Migrations/042_ProjectionThreadsViewedAt.ts";
+import Migration0043 from "./Migrations/043_ProjectionThreadsViewedAt.ts";
 
 /**
  * Migration loader with all migrations defined inline.

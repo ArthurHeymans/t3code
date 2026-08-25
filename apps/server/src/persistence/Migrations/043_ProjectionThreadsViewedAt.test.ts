@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("042_ProjectionThreadsViewedAt", (it) => {
+layer("043_ProjectionThreadsViewedAt", (it) => {
   it.effect("adds viewed_at and marks historical rows viewed", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 41 });
+      yield* runMigrations({ toMigrationInclusive: 42 });
       yield* sql`
         INSERT INTO projection_threads (
           thread_id,
@@ -34,7 +34,7 @@ layer("042_ProjectionThreadsViewedAt", (it) => {
         )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 42 });
+      yield* runMigrations({ toMigrationInclusive: 43 });
 
       const rows = yield* sql<{ readonly viewedAt: string | null }>`
         SELECT viewed_at AS "viewedAt"
@@ -43,7 +43,7 @@ layer("042_ProjectionThreadsViewedAt", (it) => {
       `;
       assert.equal(rows[0]?.viewedAt, "2026-01-02T00:00:00.000Z");
 
-      const olderServerMigrations = yield* runMigrations({ toMigrationInclusive: 41 });
+      const olderServerMigrations = yield* runMigrations({ toMigrationInclusive: 42 });
       assert.deepEqual(olderServerMigrations, []);
     }),
   );
