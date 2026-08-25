@@ -70,6 +70,7 @@ vi.mock("react", async (importOriginal) => {
   return {
     ...actual,
     useCallback: reactHookHarness.useCallback,
+    useEffect: (effect: () => void) => effect(),
     useMemo: reactHookHarness.useMemo,
   };
 });
@@ -262,6 +263,29 @@ describe("useThreadViewState", () => {
 
     expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
     expect(testState.listeners).toHaveLength(0);
+  });
+
+  it("permanently clears a restored local marker after the server value changes", () => {
+    const originalViewedAt = "2026-01-01T00:00:00.000Z";
+    testState.uiState.threadViewStatePendingById[threadKey] = {
+      kind: "unread",
+      targetAt: completedAt,
+      localOnly: true,
+      serverViewedAt: originalViewedAt,
+    };
+
+    renderHook();
+
+    expect(testState.listeners).toHaveLength(1);
+
+    advanceShell(1, completedAt);
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
+    expect(testState.listeners).toHaveLength(0);
+
+    advanceShell(2, originalViewedAt);
+
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
   });
 
   it("retries a local-only view when the same completion is acknowledged again", async () => {
