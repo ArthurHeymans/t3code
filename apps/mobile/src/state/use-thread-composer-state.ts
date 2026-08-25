@@ -26,6 +26,7 @@ import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
 import {
   convertPastedImagesToAttachments,
   pasteComposerClipboard,
+  pickComposerFiles,
   pickComposerImages,
 } from "../lib/composerImages";
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
@@ -304,6 +305,32 @@ export function useThreadComposerState() {
     }
   }, [composerDrafts, selectedThreadShell]);
 
+  const onPickDraftFiles = useCallback(async () => {
+    if (!selectedThreadShell) {
+      return;
+    }
+    const maxBytes =
+      selectedEnvironmentRuntime?.serverConfig?.environment.capabilities.fileAttachments
+        ?.maxUploadBytes;
+    if (maxBytes === undefined) {
+      Alert.alert("Could not attach file", "This server does not support file attachments.");
+      return;
+    }
+
+    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    // pickComposerFiles clamps the advertised limit to the contract maximum.
+    const result = await pickComposerFiles({
+      existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      maxBytes,
+    });
+    if (result.files.length > 0) {
+      appendComposerDraftAttachments(threadKey, result.files);
+    }
+    if (result.error) {
+      Alert.alert("Could not attach file", result.error);
+    }
+  }, [composerDrafts, selectedEnvironmentRuntime?.serverConfig, selectedThreadShell]);
+
   const onPasteIntoDraft = useCallback(async () => {
     if (!selectedThreadShell) {
       return;
@@ -404,6 +431,7 @@ export function useThreadComposerState() {
     interactionMode,
     onChangeDraftMessage,
     onPickDraftImages,
+    onPickDraftFiles,
     onPasteIntoDraft,
     onNativePasteImages,
     onRemoveDraftImage,

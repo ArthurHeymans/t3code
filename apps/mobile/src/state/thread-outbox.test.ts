@@ -16,6 +16,7 @@ import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
+  resolveThreadOutboxDispatchStep,
   resolveThreadOutboxFailureAction,
   resolveQueuedThreadSettings,
   shouldRetryThreadOutboxDelivery,
@@ -76,6 +77,29 @@ describe("thread outbox", () => {
         environmentId: "environment-1",
       }),
     ).toThrow();
+  });
+
+  it("persists generic attachment paths without embedding their contents", () => {
+    const message = {
+      ...queuedMessage({
+        messageId: "message-file",
+        createdAt: "2026-06-08T10:00:01.000Z",
+      }),
+      attachments: [
+        {
+          id: "file-1",
+          type: "file" as const,
+          name: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 42,
+          fileUri: "file:///documents/report.pdf",
+          uploadedAttachmentId: "pending-report-pdf",
+          uploadEnvironmentId: EnvironmentId.make("environment-1"),
+        },
+      ],
+    } satisfies QueuedThreadMessage;
+
+    expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(message))).toEqual(message);
   });
 
   it("persists the exact selector snapshot while remaining compatible with v1 messages", () => {
@@ -455,6 +479,154 @@ describe("thread outbox", () => {
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
     expect(stored.size).toBe(0);
     registry.dispose();
+  });
+
+  it("rejects a stale revision before its payload reaches durable storage", async () => {
+    const registry = AtomRegistry.make();
+    const writes: string[] = [];
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [],
+        write: async (message) => {
+          writes.push(message.text);
+        },
+        remove: async () => undefined,
+      },
+    });
+    const original = queuedMessage({
+      messageId: "message-edit-race",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const edited = { ...original, text: "keep my changes" };
+
+    await manager.enqueue(original);
+    // Revision captured before slow work (an attachment upload) starts.
+    const revision = manager.revisionOf(original.messageId);
+    await manager.update(edited);
+
+    await expect(manager.update({ ...original, text: "stale upload" }, revision)).resolves.toBe(
+      false,
+    );
+    // The losing writer was rejected before persisting: no stale payload can
+    // sit on disk waiting to resurrect on the next load.
+    expect(writes).toEqual([original.text, "keep my changes"]);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [edited],
+    });
+    registry.dispose();
+  });
+
+  it("does not publish a stale attachment update after a replacement appears during its write", async () => {
+    const registry = AtomRegistry.make();
+    let resumeWrite: () => void = () => {};
+    let signalWriteStarted: () => void = () => {};
+    const writeStarted = new Promise<void>((resolve) => {
+      signalWriteStarted = resolve;
+    });
+    const writeBarrier = new Promise<void>((resolve) => {
+      resumeWrite = resolve;
+    });
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [],
+        write: async (message) => {
+          if (message.text === "stale upload") {
+            signalWriteStarted();
+            await writeBarrier;
+          }
+        },
+        remove: async () => undefined,
+      },
+    });
+    const original = queuedMessage({
+      messageId: "message-write-race",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const replacement = { ...original, text: "newer edit" };
+
+    await manager.enqueue(original);
+    const update = manager.update(
+      { ...original, text: "stale upload" },
+      manager.revisionOf(original.messageId),
+    );
+    await writeStarted;
+    const enqueue = manager.enqueue(replacement);
+    resumeWrite();
+
+    await expect(update).resolves.toBe(false);
+    await enqueue;
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [replacement],
+    });
+    registry.dispose();
+  });
+
+  it("removes an already-created pending task before the file-capability gate runs", () => {
+    // The creation's startTurn already made the thread, so the resolver wants
+    // the queued message removed. A missing server config (or missing file
+    // support) must not turn that into a restore, which would duplicate the
+    // task as a draft.
+    const fileAttachments = [{ name: "report.pdf", sizeBytes: 42 }];
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "remove",
+        fileAttachments,
+        serverConfig: null,
+      }),
+    ).toEqual({ step: "remove" });
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "remove",
+        fileAttachments,
+        serverConfig: { maxFileUploadBytes: undefined },
+      }),
+    ).toEqual({ step: "remove" });
+  });
+
+  it("retries instead of parking a file message while the server config loads", () => {
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [{ name: "report.pdf", sizeBytes: 42 }],
+        serverConfig: null,
+      }),
+    ).toEqual({ step: "retry" });
+  });
+
+  it("gates a sending file message on the server's file support and limit", () => {
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [{ name: "report.pdf", sizeBytes: 42 }],
+        serverConfig: { maxFileUploadBytes: undefined },
+      }),
+    ).toEqual({ step: "restore", reason: "This server does not support file attachments." });
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [{ name: "big.zip", sizeBytes: 2 * 1024 * 1024 }],
+        serverConfig: { maxFileUploadBytes: 1024 * 1024 },
+      }),
+    ).toEqual({ step: "restore", reason: "'big.zip' exceeds the 1 MB attachment limit." });
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [{ name: "report.pdf", sizeBytes: 42 }],
+        serverConfig: { maxFileUploadBytes: 1024 * 1024 },
+      }),
+    ).toEqual({ step: "send" });
+  });
+
+  it("sends a message without file attachments before the server config loads", () => {
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [],
+        serverConfig: null,
+      }),
+    ).toEqual({ step: "send" });
   });
 
   it("only removes a missing-thread message after shell synchronization is live", () => {

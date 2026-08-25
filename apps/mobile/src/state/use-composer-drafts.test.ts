@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { vi } from "vite-plus/test";
 
 const composerDraftFileMocks = vi.hoisted(() => {
@@ -53,13 +59,22 @@ const composerDraftFileMocks = vi.hoisted(() => {
   };
 });
 
+const composerAttachmentCleanupMocks = vi.hoisted(() => ({
+  remove: vi.fn(async () => undefined),
+}));
+
 vi.mock("expo-file-system", () => ({
   Directory: composerDraftFileMocks.Directory,
   File: composerDraftFileMocks.File,
   Paths: { document: "/documents" },
 }));
 
+vi.mock("../lib/composerImages", () => ({
+  removePersistedComposerAttachmentFile: composerAttachmentCleanupMocks.remove,
+}));
+
 import { appAtomRegistry } from "./atom-registry";
+import { threadOutboxManager } from "./thread-outbox";
 import {
   clearComposerDraftContentState,
   ComposerDraftPersistenceError,
@@ -71,6 +86,7 @@ import {
   flushComposerDrafts,
   getComposerDraftSnapshot,
   mergeComposerDraftContentState,
+  releaseUnusedComposerAttachmentFiles,
   removeComposerDraftsForEnvironment,
   restoreComposerDraftSnapshotState,
   setComposerDraftText,
@@ -83,9 +99,146 @@ const DRAFT: ComposerDraft = {
 
 afterEach(() => {
   appAtomRegistry.set(composerDraftsAtom, {});
+  appAtomRegistry.set(threadOutboxManager.queuedMessagesByThreadKeyAtom, {});
+  composerAttachmentCleanupMocks.remove.mockClear();
 });
 
 describe("mobile composer drafts", () => {
+  it("hydrates generic file attachments from their saved local paths", () => {
+    const file = {
+      id: "file-1",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/report.pdf",
+    };
+
+    expect(
+      decodePersistedComposerDrafts({
+        schemaVersion: 1,
+        drafts: {
+          "environment-1:thread-1": { text: "Review this file", attachments: [file] },
+        },
+      }),
+    ).toEqual({
+      "environment-1:thread-1": { text: "Review this file", attachments: [file] },
+    });
+  });
+
+  it("keeps shared attachment files until every draft releases them", async () => {
+    const file = {
+      id: "file-1",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    };
+    appAtomRegistry.set(composerDraftsAtom, {
+      source: { text: "First draft", attachments: [file] },
+      copied: { text: "Second draft", attachments: [file] },
+    });
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+
+    appAtomRegistry.set(composerDraftsAtom, {
+      copied: { text: "Second draft", attachments: [file] },
+    });
+    await releaseUnusedComposerAttachmentFiles([file]);
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+
+    appAtomRegistry.set(composerDraftsAtom, {});
+    await releaseUnusedComposerAttachmentFiles([file]);
+    expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(file.fileUri);
+  });
+
+  it("keeps local attachment files while an outbox message still needs them", async () => {
+    const file = {
+      id: "file-queued",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    };
+    appAtomRegistry.set(threadOutboxManager.queuedMessagesByThreadKeyAtom, {
+      "environment-1:thread-1": [
+        {
+          environmentId: EnvironmentId.make("environment-1"),
+          threadId: ThreadId.make("thread-1"),
+          messageId: MessageId.make("message-1"),
+          commandId: CommandId.make("command-1"),
+          text: "Review the report",
+          attachments: [file],
+          createdAt: "2026-08-24T12:00:00.000Z",
+        },
+      ],
+    });
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+  });
+
+  it("loads persisted outbox messages before deciding an attachment file is unused", async () => {
+    const file = {
+      id: "file-persisted",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    };
+    const load = vi.spyOn(threadOutboxManager, "load").mockImplementation(async () => {
+      appAtomRegistry.set(threadOutboxManager.queuedMessagesByThreadKeyAtom, {
+        "environment-1:thread-1": [
+          {
+            environmentId: EnvironmentId.make("environment-1"),
+            threadId: ThreadId.make("thread-1"),
+            messageId: MessageId.make("message-persisted"),
+            commandId: CommandId.make("command-persisted"),
+            text: "Review the report",
+            attachments: [file],
+            createdAt: "2026-08-24T12:00:00.000Z",
+          },
+        ],
+      });
+    });
+
+    try {
+      await releaseUnusedComposerAttachmentFiles([file]);
+
+      expect(load).toHaveBeenCalledOnce();
+      expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+    } finally {
+      load.mockRestore();
+    }
+  });
+
+  it("does not delete attachment files when the draft removal cannot be saved", async () => {
+    const file = {
+      id: "file-unsaved",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    };
+    setComposerDraftText("environment-1:thread-1", "Unsaved draft");
+    composerDraftFileMocks.setWriteError(new Error("storage unavailable"));
+
+    try {
+      await expect(releaseUnusedComposerAttachmentFiles([file])).rejects.toBeInstanceOf(
+        ComposerDraftPersistenceError,
+      );
+      expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+    } finally {
+      composerDraftFileMocks.setWriteError(null);
+    }
+  });
+
   it("hydrates selector state even when the message content is empty", () => {
     expect(
       decodePersistedComposerDrafts({

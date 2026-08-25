@@ -48,6 +48,13 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     });
   let loadPromise: Promise<void> | null = null;
   let mutationQueue: Promise<void> = Promise.resolve();
+  // Monotonic per-message write counter. Every accepted write (enqueue publish
+  // or update) bumps it, so a writer that captured a revision before slow work
+  // (an attachment upload) is rejected before its stale payload reaches disk.
+  const revisions = new Map<MessageId, number>();
+  const bumpRevision = (messageId: MessageId): void => {
+    revisions.set(messageId, (revisions.get(messageId) ?? 0) + 1);
+  };
 
   const serialize = <A>(mutation: () => Promise<A>): Promise<A> => {
     const result = mutationQueue.then(mutation, mutation);
@@ -93,6 +100,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // the message back out if it fails (durability only matters for crash
   // recovery, not for the in-session queue).
   const enqueue = (message: QueuedThreadMessage): Promise<void> => {
+    bumpRevision(message.messageId);
     setMessages([
       ...currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
       message,
@@ -126,12 +134,20 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // Rewrites an already-queued message. A no-op when the message has been
   // removed in the meantime (e.g. deleted or delivered), so a trailing editor
   // flush can never resurrect it. Returns whether the message was updated.
-  const update = (message: QueuedThreadMessage): Promise<boolean> =>
+  //
+  // `expectedRevision` makes the update a compare-and-set: pass the revision
+  // read before starting slow work, and the update is rejected before the
+  // stale payload is persisted when any other write was accepted since. An
+  // enqueue can still publish synchronously while the durable write below is
+  // in flight, so the revision is re-checked after the write too; the newer
+  // enqueue's serialized write then lands last and owns the disk state.
+  const update = (message: QueuedThreadMessage, expectedRevision?: number): Promise<boolean> =>
     serialize(async () => {
-      const exists = currentMessages().some(
-        (candidate) => candidate.messageId === message.messageId,
-      );
-      if (!exists) {
+      const staleOrMissing = (): boolean =>
+        !currentMessages().some((candidate) => candidate.messageId === message.messageId) ||
+        (expectedRevision !== undefined &&
+          (revisions.get(message.messageId) ?? 0) !== expectedRevision);
+      if (staleOrMissing()) {
         return false;
       }
       try {
@@ -145,6 +161,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           cause,
         });
       }
+      if (staleOrMissing()) {
+        return false;
+      }
+      bumpRevision(message.messageId);
       setMessages([
         ...currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
         message,
@@ -168,6 +188,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       setMessages(
         currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
       );
+      revisions.delete(message.messageId);
     });
 
   const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
@@ -221,6 +242,8 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     load,
     enqueue,
     confirmQueued,
+    /** Current write revision for a queued message; input to update's CAS. */
+    revisionOf: (messageId: MessageId): number => revisions.get(messageId) ?? 0,
     update,
     remove,
     clearEnvironment,
