@@ -75,7 +75,7 @@ import {
   ThreadInspectorContentStack,
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
-import { shouldAcknowledgeThreadView } from "./threadViewState";
+import { resolveAppliedThreadViewBoundary, resolveThreadViewCommand } from "./threadViewState";
 
 interface ThreadInspectorSelection {
   readonly routeThreadIdentity: string | null;
@@ -291,6 +291,12 @@ function ThreadRouteContent(
   const selectedThreadCompletedAt = selectedThread?.latestTurn?.completedAt ?? null;
   const selectedThreadViewedAtRef = useRef(selectedThread?.viewedAt);
   selectedThreadViewedAtRef.current = selectedThread?.viewedAt;
+  const requestedThreadViewBoundariesRef = useRef(new Set<string>());
+  const appliedThreadViewBoundary = resolveAppliedThreadViewBoundary({
+    completedAt: selectedThreadCompletedAt,
+    viewedAt: selectedThread?.viewedAt,
+    requestedBoundaries: requestedThreadViewBoundariesRef.current,
+  });
   const supportsThreadViewState = serverConfig?.environment.capabilities.threadViewState === true;
   const [appState, setAppState] = useState(() => AppState.currentState);
   useEffect(() => {
@@ -301,32 +307,39 @@ function ThreadRouteContent(
   }, []);
   useFocusEffect(
     useCallback(() => {
-      if (
-        selectedThreadEnvironmentId === null ||
-        selectedThreadId === null ||
-        selectedThreadCompletedAt === null ||
-        !shouldAcknowledgeThreadView({
-          appState,
-          connectionState: routeConnectionState,
-          completedAt: selectedThreadCompletedAt,
-          viewedAt: selectedThreadViewedAtRef.current,
-          supported: supportsThreadViewState,
-        })
-      ) {
+      if (selectedThreadEnvironmentId === null || selectedThreadId === null) {
         return;
       }
+
+      const command = resolveThreadViewCommand({
+        appState,
+        connectionState: routeConnectionState,
+        completedAt: selectedThreadCompletedAt,
+        viewedAt: appliedThreadViewBoundary ?? selectedThreadViewedAtRef.current,
+        supported: supportsThreadViewState,
+      });
+      if (command === undefined) {
+        if (
+          selectedThreadCompletedAt !== null &&
+          selectedThreadViewedAtRef.current !== undefined &&
+          Date.parse(selectedThreadViewedAtRef.current) >= Date.parse(selectedThreadCompletedAt)
+        ) {
+          requestedThreadViewBoundariesRef.current.clear();
+        }
+        return;
+      }
+
+      requestedThreadViewBoundariesRef.current.add(command.viewedThrough);
       void viewThread({
         environmentId: selectedThreadEnvironmentId,
         input: {
           threadId: selectedThreadId,
-          viewedThrough: selectedThreadCompletedAt,
-          ...(selectedThreadViewedAtRef.current !== undefined
-            ? { expectedViewedAt: selectedThreadViewedAtRef.current }
-            : {}),
+          ...command,
         },
       });
     }, [
       appState,
+      appliedThreadViewBoundary,
       routeConnectionState,
       selectedThreadCompletedAt,
       selectedThreadEnvironmentId,
