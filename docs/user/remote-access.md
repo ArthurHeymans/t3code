@@ -229,6 +229,10 @@ works for a server that was wiped or is no longer reachable. Device-local connec
 controls remain in **Settings** → **Connections** on web and desktop or **Settings** →
 **Environments** on mobile.
 
+If a linked environment stays offline for several minutes, T3 Connect removes its unused tunnel.
+The environment stays linked to your account and keeps the same address. When the server starts
+again, T3 Connect creates a replacement tunnel automatically. You do not need to pair it again.
+
 ## Security Notes
 
 - Treat pairing URLs and pairing tokens like passwords.

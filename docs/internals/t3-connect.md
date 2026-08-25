@@ -125,6 +125,20 @@ connector, and attempts to revoke the relay-side environment record. It retains 
 authorization so `t3 connect link` can re-enable exposure without another browser flow. `t3 connect
 logout` performs the same cleanup and removes the stored CLI authorization.
 
+### Managed tunnel lifecycle
+
+Every linked environment stores a relay-issued environment credential. When a managed environment
+starts or its connector exits, the server uses that credential to request a tunnel from the relay.
+This also covers environments linked through web or mobile settings, which do not have a stored CLI
+credential. The relay keeps the existing hostname and DNS record, so a replacement tunnel does not
+change the public endpoint.
+
+After a host completes this recovery request, the relay records that the host can recreate its own
+tunnel. The existing five-minute maintenance job removes tunnels from those hosts when Cloudflare
+reports that they have been down for at least five minutes. Tunnels that never connected are removed
+when they are at least five minutes old. The job leaves older hosts alone until they complete a
+recovery request, and it only removes tunnels that belong to its own deployment stage.
+
 The background service has an independent lifecycle. Connect setup may offer to install it, but
 logout leaves it running; manage it with `t3 service status`, `install`, `update`, and `uninstall`.
 
