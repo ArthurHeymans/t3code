@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { EnvironmentId } from "@t3tools/contracts";
 
 import { removeLocalStorageItem } from "./hooks/useLocalStorage";
 
@@ -160,6 +161,27 @@ describe("promptStashStore", () => {
     expect(entry?.attachments).toHaveLength(1);
     expect(entry?.droppedImageNames).toEqual(["big.png"]);
     expect(entry?.pendingImageCount).toBe(0);
+  });
+
+  it("preserves uploaded file references without storing file contents", () => {
+    const store = usePromptStashStore.getState();
+    const file = {
+      id: "file-1",
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      attachmentId: "pending-report-pdf",
+      environmentId: EnvironmentId.make("environment-1"),
+    };
+
+    store.stashEntry({ ...makeEntry({ id: "with-file" }), files: [file] });
+    store.finalizeEntryImages("with-file", {
+      attachments: [],
+      droppedImageNames: [],
+      unreadableImageNames: [],
+    });
+
+    expect(usePromptStashStore.getState().entries[0]?.files).toEqual([file]);
   });
 
   it("finalizeEntryImages reports false when the entry was already taken", () => {

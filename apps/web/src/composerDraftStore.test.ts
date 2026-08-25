@@ -11,6 +11,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   ThreadId,
   type ModelSelection,
   type ProviderOptionSelection,
@@ -65,7 +66,9 @@ import {
   markPromotedDraftThreadByRef,
   markPromotedDraftThreads,
   markPromotedDraftThreadsByRef,
+  type ComposerFileAttachment,
   type ComposerImageAttachment,
+  composerFileNeedsReattach,
   useComposerDraftStore,
   DraftId,
 } from "./composerDraftStore";
@@ -100,6 +103,18 @@ function makeImage(input: {
     mimeType,
     sizeBytes: file.size,
     previewUrl: input.previewUrl,
+    file,
+  };
+}
+
+function makeFile(id: string): ComposerFileAttachment {
+  const file = new File(["report"], "report.pdf", { type: "application/pdf" });
+  return {
+    type: "file",
+    id,
+    name: file.name,
+    mimeType: file.type,
+    sizeBytes: file.size,
     file,
   };
 }
@@ -289,6 +304,175 @@ describe("composerDraftStore clearComposerContent", () => {
   });
 });
 
+describe("composerDraftStore file attachments", () => {
+  const threadId = ThreadId.make("thread-files");
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+
+  beforeEach(() => {
+    resetComposerDraftStore();
+  });
+
+  it("persists uploaded file references without including file contents", () => {
+    const store = useComposerDraftStore.getState();
+    store.addFiles(threadRef, [makeFile("file-1")]);
+    store.setFileUpload(threadRef, "file-1", TEST_ENVIRONMENT_ID, "pending-report-pdf");
+
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        partialize: (state: ReturnType<typeof useComposerDraftStore.getState>) => unknown;
+        merge: (
+          persistedState: unknown,
+          currentState: ReturnType<typeof useComposerDraftStore.getState>,
+        ) => ReturnType<typeof useComposerDraftStore.getState>;
+      };
+    };
+    const options = persistApi.getOptions();
+    const persisted = options.partialize(useComposerDraftStore.getState()) as {
+      draftsByThreadKey: Record<string, { files?: Array<Record<string, unknown>> }>;
+    };
+
+    expect(persisted.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.files).toEqual(
+      [
+        {
+          id: "file-1",
+          name: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 6,
+          attachmentId: "pending-report-pdf",
+          environmentId: TEST_ENVIRONMENT_ID,
+        },
+      ],
+    );
+
+    const hydrated = options.merge(persisted, useComposerDraftStore.getState());
+    expect(hydrated.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.files).toEqual([
+      {
+        type: "file",
+        id: "file-1",
+        name: "report.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 6,
+        file: null,
+        uploadedAttachmentId: "pending-report-pdf",
+        uploadEnvironmentId: TEST_ENVIRONMENT_ID,
+      },
+    ]);
+  });
+
+  it("persists a pending file as a needs-reattach marker instead of dropping it", () => {
+    const store = useComposerDraftStore.getState();
+    // No setFileUpload: the upload never finished, so there is no attachment
+    // id and the File handle cannot serialize.
+    store.addFiles(threadRef, [makeFile("file-pending")]);
+
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        partialize: (state: ReturnType<typeof useComposerDraftStore.getState>) => unknown;
+        merge: (
+          persistedState: unknown,
+          currentState: ReturnType<typeof useComposerDraftStore.getState>,
+        ) => ReturnType<typeof useComposerDraftStore.getState>;
+      };
+    };
+    const options = persistApi.getOptions();
+    const persisted = options.partialize(useComposerDraftStore.getState()) as {
+      draftsByThreadKey: Record<string, { files?: Array<Record<string, unknown>> }>;
+    };
+
+    expect(persisted.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.files).toEqual(
+      [
+        {
+          id: "file-pending",
+          name: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 6,
+        },
+      ],
+    );
+
+    const hydrated = options.merge(persisted, useComposerDraftStore.getState());
+    const hydratedFiles =
+      hydrated.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.files;
+    expect(hydratedFiles).toEqual([
+      {
+        type: "file",
+        id: "file-pending",
+        name: "report.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 6,
+        file: null,
+      },
+    ]);
+    expect(hydratedFiles?.every(composerFileNeedsReattach)).toBe(true);
+  });
+
+  it("removes generic files when the composer is cleared", () => {
+    const store = useComposerDraftStore.getState();
+    store.addFiles(threadRef, [makeFile("file-clear")]);
+
+    store.clearComposerContent(threadRef);
+
+    expect(store.getComposerDraft(threadRef)).toBeNull();
+  });
+
+  it("removes generic files when a prompt is moved into the stash", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "Review the report");
+    store.addFiles(threadRef, [makeFile("file-stash")]);
+
+    store.clearComposerPromptAndImages(threadRef);
+
+    expect(store.getComposerDraft(threadRef)).toBeNull();
+  });
+
+  it("enforces the combined file and image limit across separate updates", () => {
+    const store = useComposerDraftStore.getState();
+    const images = Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS - 1 }, (_, index) =>
+      makeImage({
+        id: `image-${index}`,
+        name: `image-${index}.png`,
+        previewUrl: `blob:image-${index}`,
+      }),
+    );
+    store.addImages(threadRef, images);
+    store.addFiles(threadRef, [
+      makeFile("file-accepted"),
+      { ...makeFile("file-overflow"), name: "other.pdf" },
+    ]);
+    store.addImages(threadRef, [
+      makeImage({ id: "image-overflow", name: "overflow.png", previewUrl: "blob:overflow" }),
+    ]);
+
+    const draft = store.getComposerDraft(threadRef);
+    expect(draft?.images).toHaveLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS - 1);
+    expect(draft?.files.map((file) => file.id)).toEqual(["file-accepted"]);
+  });
+
+  it("keeps the remaining file slot available after a duplicate is skipped", () => {
+    const store = useComposerDraftStore.getState();
+    store.addImages(
+      threadRef,
+      Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS - 2 }, (_, index) =>
+        makeImage({
+          id: `image-${index}`,
+          name: `image-${index}.png`,
+          previewUrl: `blob:image-${index}`,
+        }),
+      ),
+    );
+    store.addFiles(threadRef, [makeFile("file-original")]);
+    store.addFiles(threadRef, [
+      makeFile("file-duplicate"),
+      { ...makeFile("file-unique"), name: "unique.pdf" },
+    ]);
+
+    expect(store.getComposerDraft(threadRef)?.files.map((file) => file.id)).toEqual([
+      "file-original",
+      "file-unique",
+    ]);
+  });
+});
+
 describe("composerDraftStore moveComposerPromptAndImages", () => {
   const sourceDraftId = DraftId.make("draft-move-source");
   const destinationDraftId = DraftId.make("draft-move-destination");
@@ -333,6 +517,81 @@ describe("composerDraftStore moveComposerPromptAndImages", () => {
     expect(source?.terminalContexts.map((context) => context.id)).toEqual(["ctx-stay"]);
     expect(source?.prompt).toBe(INLINE_TERMINAL_CONTEXT_PLACEHOLDER);
     expect(draftByKey(destinationDraftId)?.prompt).toBe(" explain this error");
+  });
+
+  it("keeps hydrated file references on their original environment", () => {
+    const sourceRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("thread-file-source"));
+    const destinationRef = scopeThreadRef(
+      OTHER_TEST_ENVIRONMENT_ID,
+      ThreadId.make("thread-file-destination"),
+    );
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(sourceRef, "review the report");
+    store.addFiles(sourceRef, [
+      {
+        ...makeFile("file-hydrated"),
+        file: null,
+        uploadedAttachmentId: "pending-report-pdf",
+        uploadEnvironmentId: TEST_ENVIRONMENT_ID,
+      },
+    ]);
+
+    store.moveComposerPromptAndImages(sourceRef, destinationRef);
+
+    expect(store.getComposerDraft(sourceRef)?.files.map((file) => file.id)).toEqual([
+      "file-hydrated",
+    ]);
+    expect(store.getComposerDraft(destinationRef)?.files).toEqual([]);
+    expect(store.getComposerDraft(destinationRef)?.prompt).toBe("review the report");
+  });
+
+  it("moves files across environments when the original browser file remains available", () => {
+    const sourceRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("thread-file-source"));
+    const destinationRef = scopeThreadRef(
+      OTHER_TEST_ENVIRONMENT_ID,
+      ThreadId.make("thread-file-destination"),
+    );
+    const store = useComposerDraftStore.getState();
+    store.addFiles(sourceRef, [makeFile("file-local")]);
+
+    store.moveComposerPromptAndImages(sourceRef, destinationRef);
+
+    expect(store.getComposerDraft(sourceRef)).toBeNull();
+    expect(store.getComposerDraft(destinationRef)?.files.map((file) => file.id)).toEqual([
+      "file-local",
+    ]);
+  });
+
+  it("keeps overflow attachments on the source when the destination is nearly full", () => {
+    const store = useComposerDraftStore.getState();
+    store.addImages(
+      destinationDraftId,
+      Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS - 1 }, (_, index) =>
+        makeImage({
+          id: `destination-${index}`,
+          name: `destination-${index}.png`,
+          previewUrl: `blob:destination-${index}`,
+        }),
+      ),
+    );
+    store.addImages(sourceDraftId, [
+      makeImage({ id: "source-first", name: "first.png", previewUrl: "blob:first" }),
+      makeImage({ id: "source-second", name: "second.png", previewUrl: "blob:second" }),
+    ]);
+    store.addFiles(sourceDraftId, [makeFile("source-file")]);
+
+    store.moveComposerPromptAndImages(sourceDraftId, destinationDraftId);
+
+    expect(store.getComposerDraft(destinationDraftId)?.images).toHaveLength(
+      PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+    );
+    expect(store.getComposerDraft(destinationDraftId)?.files).toEqual([]);
+    expect(store.getComposerDraft(sourceDraftId)?.images.map((image) => image.id)).toEqual([
+      "source-second",
+    ]);
+    expect(store.getComposerDraft(sourceDraftId)?.files.map((file) => file.id)).toEqual([
+      "source-file",
+    ]);
   });
 
   it("is a no-op when source and destination are the same target", () => {

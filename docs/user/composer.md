@@ -4,8 +4,17 @@ Messages can contain up to 120,000 characters. If a draft is longer, T3 Code kee
 composer and shows how many characters need to be removed. Shorten the draft or split it into
 multiple messages, then send again in the same thread.
 
-On servers that support direct uploads, images upload as soon as you add them. The send button
-becomes available after every upload finishes. Failed uploads can be retried or removed.
+On servers that support direct uploads, you can attach images, text files, PDFs, ZIP archives, and
+other files. Each file can be up to 50 MB, and each message can contain up to eight attachments.
+Images keep their existing 10 MB limit. Files upload directly to the environment, where your agent
+can read, copy, or edit them by their file path.
+
+On web and desktop, attachments upload as soon as you add them. The send button becomes available
+after every upload finishes. Failed uploads can be retried or removed. On mobile, use the attachment
+button or share a file with T3 Code from another app.
+
+If you reload before a file finishes uploading, the draft keeps the file's name and shows **Attach
+again** next to it. Attach the file again or remove it, then send.
 
 On web and desktop, HEIC and HEIF photos are automatically converted to JPEG when you drag them into
 the composer or paste them into a message.
