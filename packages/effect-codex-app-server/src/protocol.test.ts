@@ -442,6 +442,35 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  it.effect("rejects outgoing messages after an approval response cannot be encoded", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const terminated = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onRequest: () => Effect.succeed({ invalid: 1n }),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(
+        input,
+        encodeJsonl({ id: 7, method: "item/tool/requestUserInput", params: {} }),
+      );
+
+      const failure = yield* Deferred.await(terminated);
+      assert.instanceOf(failure, CodexError.CodexAppServerProtocolParseError);
+      const requestFailure = yield* transport.request("thread/read", {}).pipe(
+        Effect.match({
+          onFailure: (error) => error,
+          onSuccess: () => assert.fail("Expected a terminated protocol request to fail"),
+        }),
+      );
+      const notificationFailure = yield* transport.notify("initialized").pipe(Effect.flip);
+      assert.strictEqual(requestFailure, failure);
+      assert.strictEqual(notificationFailure, failure);
+    }),
+  );
+
   it.effect("surfaces JSON encoding failures as protocol parse errors", () =>
     Effect.gen(function* () {
       const { stdio } = yield* makeInMemoryStdio();

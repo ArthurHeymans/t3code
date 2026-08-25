@@ -9,6 +9,8 @@ import type * as EffectAcpProtocol from "effect-acp/protocol";
 import type { EventNdjsonLogger } from "../Layers/EventNdjsonLogger.ts";
 import type * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 
+const transientProtocolUpdates = new Set(["agent_message_chunk", "agent_thought_chunk"]);
+
 function structuralMethod(value: string): string {
   return value.length <= 128 && /^[A-Za-z][A-Za-z0-9._:/-]*$/.test(value) ? value : "unknown";
 }
@@ -62,6 +64,35 @@ function formatProtocolLogPayload(event: EffectAcpProtocol.AcpProtocolLogEvent) 
     stage: event.stage,
     payload: summarizePayload(event.payload),
   };
+}
+
+function isTransientProtocolMessage(message: unknown): boolean {
+  if (typeof message !== "object" || message === null) return false;
+  const method = Reflect.get(message, "tag") ?? Reflect.get(message, "method");
+  if (method !== "session/update") return false;
+
+  const payload = Reflect.get(message, "payload") ?? Reflect.get(message, "params");
+  if (typeof payload !== "object" || payload === null) return false;
+  const update = Reflect.get(payload, "update");
+  if (typeof update !== "object" || update === null) return false;
+  const updateType = Reflect.get(update, "sessionUpdate");
+  return typeof updateType === "string" && transientProtocolUpdates.has(updateType);
+}
+
+function isTransientProtocolLog(event: EffectAcpProtocol.AcpProtocolLogEvent): boolean {
+  if (event.direction !== "incoming") return false;
+
+  const payload = event.payload;
+  if (event.stage === "raw" && typeof payload === "string") {
+    return (
+      payload.includes('"session/update"') &&
+      (payload.includes('"agent_message_chunk"') || payload.includes('"agent_thought_chunk"'))
+    );
+  }
+
+  if (event.stage !== "decoded") return false;
+  const messages = Array.isArray(payload) ? payload : [payload];
+  return messages.length > 0 && messages.every(isTransientProtocolMessage);
 }
 
 export const makeAcpNativeLoggerFactory = Effect.fn("makeAcpNativeLoggerFactory")(function* () {
@@ -118,10 +149,12 @@ export const makeAcpNativeLoggerFactory = Effect.fn("makeAcpNativeLoggerFactory"
               logIncoming: true,
               logOutgoing: true,
               logger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
-                writeNativeAcpLog({
-                  kind: "protocol",
-                  payload: formatProtocolLogPayload(event),
-                }),
+                isTransientProtocolLog(event)
+                  ? Effect.void
+                  : writeNativeAcpLog({
+                      kind: "protocol",
+                      payload: formatProtocolLogPayload(event),
+                    }),
             } satisfies NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["protocolLogging"]>,
           }
         : {}),

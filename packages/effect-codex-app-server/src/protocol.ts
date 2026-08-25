@@ -2,6 +2,7 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
@@ -165,6 +166,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const nextRequestId = yield* Ref.make(1);
     const remainder = yield* Ref.make("");
     const terminationHandled = yield* Ref.make(false);
+    const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const activeRequestHandlers = yield* Ref.make(0);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -198,6 +200,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         return [
           Effect.gen(function* () {
             const error = yield* classify();
+            yield* Ref.set(terminationFailure, Option.some(error));
             yield* Scope.close(requestHandlerScope, Exit.void);
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
@@ -211,6 +214,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
 
     const offerOutgoing = (message: Record<string, unknown>) =>
       Effect.gen(function* () {
+        const failure = yield* Ref.get(terminationFailure);
+        if (Option.isSome(failure)) return yield* failure.value;
+
         yield* logProtocol({
           direction: "outgoing",
           stage: "decoded",
@@ -222,7 +228,14 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           stage: "raw",
           payload: encoded,
         });
-        yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
+        const accepted = yield* Queue.offer(outgoing, encoded);
+        if (!accepted) {
+          const closed = yield* Ref.get(terminationFailure);
+          return yield* Option.getOrElse(
+            closed,
+            () => new CodexError.CodexAppServerInputStreamEndedError({}),
+          );
+        }
       });
 
     const removePending = (requestId: string) =>
