@@ -28,6 +28,7 @@ nodeServicesIt("ACP native logging", (it) => {
         nativeEventLogger,
         provider: ProviderDriverKind.make("cursor"),
         threadId: ThreadId.make("thread-1"),
+        verboseProtocolLogging: true,
       });
       const secret = "secret-token-value";
       const requestLogger = logger.requestLogger;
@@ -64,6 +65,33 @@ nodeServicesIt("ACP native logging", (it) => {
       assert.include(serialized, '"reasonCount":1');
       assert.include(serialized, '"valueType":"string"');
       assert.include(serialized, '"messageTag":"Request"');
+    }),
+  );
+
+  it.effect("keeps request diagnostics without enabling full protocol logging", () =>
+    Effect.gen(function* () {
+      const records: Array<unknown> = [];
+      const makeLogger = yield* makeAcpNativeLoggerFactory();
+      const logger = makeLogger({
+        nativeEventLogger: {
+          filePath: "/tmp/provider-native.ndjson",
+          write: (event) => Effect.sync(() => void records.push(event)),
+          close: () => Effect.void,
+        },
+        provider: ProviderDriverKind.make("grok"),
+        threadId: ThreadId.make("thread-1"),
+      });
+
+      assert.isUndefined(logger.protocolLogging);
+      const requestLogger = logger.requestLogger;
+      assert.exists(requestLogger);
+      if (!requestLogger) return;
+      yield* requestLogger({
+        method: "session/prompt",
+        payload: {},
+        status: "started",
+      });
+      assert.lengthOf(records, 1);
     }),
   );
 

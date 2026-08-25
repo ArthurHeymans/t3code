@@ -142,7 +142,8 @@ The server adjusts native sampling without restarting the sidecar:
 
 - suspended, locked, low-power, or serious/critical thermal state: 15 seconds;
 - battery: 5 seconds;
-- normal AC: 1 second;
+- normal AC: 5 seconds in the background and 1 second while live diagnostics is
+  open;
 - unknown or stale power: 5 seconds in the background and 1 second while live
   diagnostics is open.
 

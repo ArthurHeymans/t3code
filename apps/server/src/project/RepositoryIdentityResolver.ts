@@ -139,6 +139,18 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
   options: RepositoryIdentityResolverOptions = {},
 ) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  const cacheCapacity = options.cacheCapacity ?? DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY;
+
+  const repositoryRootCache = yield* Cache.makeWith<string, string>(
+    (cwd) =>
+      resolveRepositoryIdentityCacheKey(cwd).pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+      ),
+    {
+      capacity: cacheCapacity,
+      timeToLive: () => options.positiveCacheTtl ?? DEFAULT_POSITIVE_CACHE_TTL,
+    },
+  );
 
   const repositoryIdentityCache = yield* Cache.makeWith<string, RepositoryIdentity | null>(
     (cacheKey) =>
@@ -146,7 +158,7 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
         Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
       ),
     {
-      capacity: options.cacheCapacity ?? DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY,
+      capacity: cacheCapacity,
       timeToLive: Exit.match({
         onSuccess: (value) =>
           value === null
@@ -160,9 +172,7 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
   const resolve: RepositoryIdentityResolver["Service"]["resolve"] = Effect.fn(
     "RepositoryIdentityResolver.resolve",
   )(function* (cwd) {
-    const cacheKey = yield* resolveRepositoryIdentityCacheKey(cwd).pipe(
-      Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
-    );
+    const cacheKey = yield* Cache.get(repositoryRootCache, cwd);
     return yield* Cache.get(repositoryIdentityCache, cacheKey);
   });
 

@@ -13,6 +13,7 @@ import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
 const isJsonRpcId = Schema.is(JsonRpcId);
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
+const MAX_BUFFERED_RAW_MESSAGES = 32;
 
 export interface CodexAppServerProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
@@ -152,9 +153,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
   function* (
     options: CodexAppServerPatchedProtocolOptions,
   ): Effect.fn.Return<CodexAppServerPatchedProtocol, never, Scope.Scope> {
+    const protocolScope = yield* Scope.Scope;
     const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
-    const incomingNotifications = yield* Queue.unbounded<CodexAppServerIncomingNotification>();
-    const incomingRequests = yield* Queue.unbounded<CodexAppServerIncomingRequest>();
+    const incomingNotifications =
+      yield* Queue.sliding<CodexAppServerIncomingNotification>(MAX_BUFFERED_RAW_MESSAGES);
+    const incomingRequests =
+      yield* Queue.sliding<CodexAppServerIncomingRequest>(MAX_BUFFERED_RAW_MESSAGES);
     const pending = yield* Ref.make(new Map<string, CodexAppServerPendingRequest>());
     const nextRequestId = yield* Ref.make(1);
     const remainder = yield* Ref.make("");
@@ -285,6 +289,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                     ),
                   onSuccess: (result) => respond(request.id, result),
                 }),
+                Effect.catch((error) => handleTermination(() => Effect.succeed(error))),
+                Effect.forkIn(protocolScope, { startImmediately: true }),
+                Effect.asVoid,
               )
             : Effect.void,
         ),
