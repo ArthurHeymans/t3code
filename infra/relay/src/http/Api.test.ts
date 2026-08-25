@@ -403,6 +403,7 @@ describe("relay managed tunnel recovery", () => {
       dnsRecordId: "dns-1",
       readyAt: "2026-07-28T00:00:00.000Z",
       updatedAt: "replacement-generation",
+      generation: 3,
     } satisfies ManagedEndpointProvider.ManagedEndpointDeprovisionTarget;
 
     return Effect.gen(function* () {
@@ -493,6 +494,7 @@ describe("relay environment unlink", () => {
       dnsRecordId: "dns-1",
       readyAt: "2026-07-28T00:00:00.000Z",
       updatedAt: "generation-before-unlink",
+      generation: 1,
     } satisfies ManagedEndpointProvider.ManagedEndpointDeprovisionTarget;
 
     return Effect.gen(function* () {
@@ -637,6 +639,7 @@ describe("relay environment unlink", () => {
       dnsRecordId: "dns-1",
       readyAt: "2026-07-28T00:00:00.000Z",
       updatedAt: "original-generation",
+      generation: 1,
     } satisfies ManagedEndpointProvider.ManagedEndpointDeprovisionTarget;
 
     return Effect.gen(function* () {
@@ -646,7 +649,7 @@ describe("relay environment unlink", () => {
           environmentId: "environment-1",
         }),
       ).toBe(true);
-      expect(targets).toEqual([target, undefined]);
+      expect(targets).toEqual([target, target]);
     }).pipe(
       Effect.provide(
         relayUnlinkTestLayer({
