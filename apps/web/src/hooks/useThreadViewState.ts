@@ -128,11 +128,15 @@ export function useThreadViewState() {
     (threadRef: ScopedThreadRef, viewedThrough: string, serverSupportsViewState?: boolean) => {
       if (!Number.isFinite(Date.parse(viewedThrough))) return;
       const threadKey = scopedThreadKey(threadRef);
-      if (!(serverSupportsViewState ?? readEnvironmentSupportsViewState(threadRef.environmentId))) {
+      const thread = readThreadShell(threadRef);
+      const supportsViewState =
+        serverSupportsViewState ??
+        readEnvironmentSupportsViewState(threadRef.environmentId) ??
+        thread?.viewedAt !== undefined;
+      if (!supportsViewState) {
         markLocalViewed(threadKey, viewedThrough);
         return;
       }
-      const thread = readThreadShell(threadRef);
       const previousPending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
       if (
         previousPending?.kind !== "unread" &&

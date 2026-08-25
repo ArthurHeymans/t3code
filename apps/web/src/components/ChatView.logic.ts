@@ -45,6 +45,40 @@ export function createVisibleThreadAcknowledger(input: {
   };
 }
 
+/** Retry a local view after capability discovery without overwriting an explicit unread action. */
+export function shouldAcknowledgeVisibleThreadCompletion(input: {
+  readonly previousAcknowledgement: {
+    readonly threadKey: string;
+    readonly completedAt: string;
+    readonly serverSupportsViewState: boolean;
+  } | null;
+  readonly threadKey: string;
+  readonly completedAt: string;
+  readonly serverSupportsViewState: boolean;
+  readonly localViewedAt: string | undefined;
+  readonly pendingUnread: boolean;
+}): boolean {
+  const previous = input.previousAcknowledgement;
+  if (
+    previous === null ||
+    previous.threadKey !== input.threadKey ||
+    previous.completedAt !== input.completedAt
+  ) {
+    return true;
+  }
+
+  if (
+    previous.serverSupportsViewState ||
+    !input.serverSupportsViewState ||
+    input.pendingUnread ||
+    input.localViewedAt === undefined
+  ) {
+    return false;
+  }
+
+  return Date.parse(input.localViewedAt) >= Date.parse(input.completedAt);
+}
+
 export function shouldDockDraftHeroForSubmission(input: {
   isDraftHeroState: boolean;
   activeThreadKey: string | null;

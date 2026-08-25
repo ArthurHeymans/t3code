@@ -241,12 +241,14 @@ export function readEnvironmentSupportsSnooze(environmentId: EnvironmentId): boo
   );
 }
 
-/** Whether the environment's server persists thread view state. */
-export function readEnvironmentSupportsViewState(environmentId: EnvironmentId): boolean {
-  return (
-    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
-      .threadViewState === true
-  );
+/** Whether the server persists thread view state, or undefined until its config loads. */
+export function readEnvironmentSupportsViewState(
+  environmentId: EnvironmentId,
+): boolean | undefined {
+  const serverConfig = appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId);
+  return serverConfig === undefined
+    ? undefined
+    : serverConfig.environment.capabilities.threadViewState === true;
 }
 
 /** Whether the environment's server understands thread.pin/unpin.

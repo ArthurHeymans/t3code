@@ -56,7 +56,7 @@ const testState = vi.hoisted(() => {
     shellAtom,
     listeners,
     uiState,
-    supported: true,
+    supported: true as boolean | undefined,
     shell: { viewedAt: "2026-01-01T00:00:00.000Z" } as { viewedAt?: string } | null,
     snapshotSequence: 0,
     viewThread: vi.fn(),
@@ -382,6 +382,42 @@ describe("useThreadViewState", () => {
     testState.supported = true;
     markViewed(threadRef, completedAt, true);
     expect(testState.viewThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("syncs a view before config loads when the thread already has a server marker", () => {
+    testState.supported = undefined;
+
+    renderHook().markViewed(threadRef, completedAt);
+
+    expect(testState.viewThread).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        viewedThrough: completedAt,
+        expectedViewedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    expect(testState.uiState.threadViewStatePendingById[threadKey]?.kind).toBe("viewed");
+  });
+
+  it("does not send a view before config loads when the thread has no server marker", () => {
+    testState.supported = undefined;
+    testState.shell = {};
+
+    renderHook().markViewed(threadRef, completedAt);
+
+    expect(testState.viewThread).not.toHaveBeenCalled();
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
+    expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
+  });
+
+  it("does not send a view when server config explicitly disables view state", () => {
+    testState.supported = false;
+
+    renderHook().markViewed(threadRef, completedAt);
+
+    expect(testState.viewThread).not.toHaveBeenCalled();
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
   });
 
   it("does not send invalid view or completion timestamps", () => {

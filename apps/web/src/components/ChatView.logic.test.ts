@@ -35,6 +35,7 @@ import {
   scheduleEnvironmentReconnectWarning,
   startNewThreadForProject,
   shouldDockDraftHeroForSubmission,
+  shouldAcknowledgeVisibleThreadCompletion,
   shouldReleaseTimelineAnchorForToolActivity,
   shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -75,6 +76,50 @@ describe("createVisibleThreadAcknowledger", () => {
     acknowledgeVisibleThread();
 
     expect(acknowledge).toHaveBeenCalledOnce();
+  });
+});
+
+describe("shouldAcknowledgeVisibleThreadCompletion", () => {
+  const threadKey = `${environmentId}:${threadId}`;
+  const completedAt = "2026-01-01T00:01:00.000Z";
+  const previousAcknowledgement = {
+    threadKey,
+    completedAt,
+    serverSupportsViewState: false,
+  };
+  const input = {
+    previousAcknowledgement,
+    threadKey,
+    completedAt,
+    serverSupportsViewState: true,
+    localViewedAt: completedAt,
+    pendingUnread: false,
+  };
+
+  it("syncs an earlier local view when server capability becomes available", () => {
+    expect(shouldAcknowledgeVisibleThreadCompletion(input)).toBe(true);
+  });
+
+  it("preserves a pending unread action when the visibility effect restarts", () => {
+    expect(shouldAcknowledgeVisibleThreadCompletion({ ...input, pendingUnread: true })).toBe(false);
+  });
+
+  it("preserves a local unread action when server capability becomes available", () => {
+    expect(
+      shouldAcknowledgeVisibleThreadCompletion({
+        ...input,
+        localViewedAt: "2026-01-01T00:00:59.999Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not repeat an acknowledgement after server support is already known", () => {
+    expect(
+      shouldAcknowledgeVisibleThreadCompletion({
+        ...input,
+        previousAcknowledgement: { ...previousAcknowledgement, serverSupportsViewState: true },
+      }),
+    ).toBe(false);
   });
 });
 
