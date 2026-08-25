@@ -464,7 +464,7 @@ fn process_refresh_kind() -> ProcessRefreshKind {
         .with_memory()
         .with_cpu()
         .with_disk_usage()
-        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::Always)
         .without_tasks()
 }
 
@@ -1142,10 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn caches_commands_without_enumerating_linux_tasks() {
+    fn refreshes_commands_without_enumerating_linux_tasks() {
         let refresh_kind = process_refresh_kind();
 
-        assert_eq!(refresh_kind.cmd(), UpdateKind::OnlyIfNotSet);
+        assert_eq!(refresh_kind.cmd(), UpdateKind::Always);
         assert!(!refresh_kind.tasks());
         assert!(refresh_kind.cpu());
         assert!(refresh_kind.memory());

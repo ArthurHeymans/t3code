@@ -307,6 +307,14 @@ describe("EventNdjsonLogger", () => {
           threadId,
         );
         yield* native.write(
+          { method: "thread/realtime/outputAudio/delta", payload: circularDelta },
+          threadId,
+        );
+        yield* native.write(
+          { method: "thread/realtime/transcript/delta", payload: circularDelta },
+          threadId,
+        );
+        yield* native.write(
           {
             event: {
               method: "claude/stream_event/content_block_delta/text_delta",

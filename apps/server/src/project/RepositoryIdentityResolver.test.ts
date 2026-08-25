@@ -75,6 +75,50 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
     }).pipe(Effect.provide(resolverLayer));
   });
 
+  it.effect("retries Git root discovery after a failed lookup", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    let rootAttempts = 0;
+    const processRunner = Layer.succeed(ProcessRunner.ProcessRunner, {
+      run: (input) =>
+        Effect.sync(() => {
+          calls.push(input.args);
+          const rootLookup = input.args.includes("rev-parse");
+          const failed = rootLookup && rootAttempts++ === 0;
+          return {
+            stdout: rootLookup
+              ? failed
+                ? ""
+                : "/repo\n"
+              : "origin\tgit@github.com:T3Tools/t3code.git (fetch)\n",
+            stderr: failed ? "temporary Git failure" : "",
+            code: ChildProcessSpawner.ExitCode(failed ? 1 : 0),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutInvalidUtf8: false,
+            stderrInvalidUtf8: false,
+          };
+        }),
+    });
+    const resolverLayer = Layer.effect(
+      RepositoryIdentityResolver.RepositoryIdentityResolver,
+      RepositoryIdentityResolver.make(),
+    ).pipe(Layer.provide(processRunner));
+
+    return Effect.gen(function* () {
+      const resolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
+      expect(yield* resolver.resolve("/repo/packages/web")).toBeNull();
+
+      const recovered = yield* resolver.resolve("/repo/packages/web");
+      expect(recovered?.rootPath).toBe("/repo");
+      expect(calls).toEqual([
+        ["-C", "/repo/packages/web", "rev-parse", "--show-toplevel"],
+        ["-C", "/repo/packages/web", "rev-parse", "--show-toplevel"],
+        ["-C", "/repo", "remote", "-v"],
+      ]);
+    }).pipe(Effect.provide(resolverLayer));
+  });
+
   it.effect("normalizes equivalent GitHub remotes into a stable repository identity", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

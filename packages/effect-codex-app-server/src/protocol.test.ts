@@ -366,6 +366,82 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  it.effect("rejects incoming requests after the active handler limit is reached", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const handlersStarted = yield* Deferred.make<void>();
+      const releaseHandlers = yield* Deferred.make<void>();
+      let activeHandlers = 0;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onRequest: () =>
+          Effect.sync(() => ++activeHandlers).pipe(
+            Effect.flatMap((count) =>
+              count === 32
+                ? Deferred.succeed(handlersStarted, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            ),
+            Effect.andThen(Deferred.await(releaseHandlers)),
+            Effect.as({ decision: "accept" }),
+          ),
+      });
+
+      const requests = Array.from({ length: 33 }, (_, index) =>
+        encodeUnknownJsonString({
+          id: index + 1,
+          method: "item/tool/requestUserInput",
+          params: {},
+        }),
+      );
+      yield* Queue.offer(input, encoder.encode(`${requests.join("\n")}\n`));
+      yield* Deferred.await(handlersStarted);
+
+      assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+        id: 33,
+        error: {
+          code: -32001,
+          message: "Too many Codex requests are already active.",
+        },
+      });
+      assert.equal(activeHandlers, 32);
+
+      yield* Deferred.succeed(releaseHandlers, undefined);
+      yield* Effect.forEach(Array.from({ length: 32 }), () => Queue.take(output), {
+        discard: true,
+      });
+    }),
+  );
+
+  it.effect("interrupts pending request handlers when the protocol terminates", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const approvalStarted = yield* Deferred.make<void>();
+      const approvalInterrupted = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onRequest: () =>
+          Deferred.succeed(approvalStarted, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() =>
+              Deferred.succeed(approvalInterrupted, undefined).pipe(Effect.asVoid),
+            ),
+          ),
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(
+        input,
+        encodeJsonl({ id: 7, method: "item/tool/requestUserInput", params: {} }),
+      );
+      yield* Deferred.await(approvalStarted);
+      yield* Queue.end(input);
+
+      yield* Deferred.await(approvalInterrupted);
+      yield* Deferred.await(terminated);
+    }),
+  );
+
   it.effect("surfaces JSON encoding failures as protocol parse errors", () =>
     Effect.gen(function* () {
       const { stdio } = yield* makeInMemoryStdio();
