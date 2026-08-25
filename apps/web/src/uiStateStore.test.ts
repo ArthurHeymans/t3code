@@ -23,6 +23,7 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     projectExpandedById: {},
     projectOrder: [],
     threadLastVisitedAtById: {},
+    threadViewStatePendingById: {},
     threadChangedFilesExpandedById: {},
     defaultAdvertisedEndpointKey: null,
     ...overrides,
@@ -76,9 +77,22 @@ describe("uiStateStore pure functions", () => {
           kind: "viewed",
           targetAt: "2026-02-25T12:35:00.000Z",
           localOnly: true,
+          serverViewedAt: "2026-02-25T12:30:00.000Z",
         },
       }),
     ).toBe("2026-02-25T12:35:00.000Z");
+    expect(
+      resolveThreadViewedAt({
+        ...input,
+        serverViewedAt: "2026-02-25T12:40:00.000Z",
+        pending: {
+          kind: "viewed",
+          targetAt: "2026-02-25T12:35:00.000Z",
+          localOnly: true,
+          serverViewedAt: "2026-02-25T12:30:00.000Z",
+        },
+      }),
+    ).toBe("2026-02-25T12:40:00.000Z");
   });
 
   it("resolves project expansion from logical, physical, and legacy preference keys", () => {
@@ -186,6 +200,24 @@ describe("parsePersistedState", () => {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
         invalid: "not-a-date",
       },
+      threadViewStatePendingById: {
+        "environment:thread-1": {
+          kind: "viewed",
+          targetAt: "2026-02-25T12:35:00.000Z",
+          localOnly: true,
+          serverViewedAt: "2026-02-25T12:30:00.000Z",
+        },
+        syncing: {
+          kind: "unread",
+          targetAt: "2026-02-25T12:35:00.000Z",
+        },
+        invalid: {
+          kind: "viewed",
+          targetAt: "not-a-date",
+          localOnly: true,
+          serverViewedAt: null,
+        },
+      },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpansionVersion: 1,
       threadChangedFilesExpandedById: {
@@ -203,6 +235,14 @@ describe("parsePersistedState", () => {
       projectOrder: ["physical-b", "physical-a"],
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
+      },
+      threadViewStatePendingById: {
+        "environment:thread-1": {
+          kind: "viewed",
+          targetAt: "2026-02-25T12:35:00.000Z",
+          localOnly: true,
+          serverViewedAt: "2026-02-25T12:30:00.000Z",
+        },
       },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
@@ -349,4 +389,44 @@ describe("uiStateStore persistence", () => {
     ) as PersistedUiState;
     expect(resolveProjectExpanded(persisted.projectExpandedById ?? {}, ["unknown"])).toBe(true);
   });
+
+  it.each(["viewed", "unread"] as const)(
+    "restores rejected %s changes after a reload without persisting in-flight changes",
+    (kind) => {
+      const threadKey = "environment:thread-1";
+      const serverViewedAt = "2026-02-25T12:30:00.000Z";
+      const localViewedAt = "2026-02-25T12:35:00.000Z";
+      const pending = { kind, targetAt: localViewedAt, localOnly: true, serverViewedAt };
+      const state = makeUiState({
+        threadLastVisitedAtById: { [threadKey]: localViewedAt },
+        threadViewStatePendingById: {
+          [threadKey]: pending,
+          syncing: { kind: "viewed", targetAt: localViewedAt },
+        },
+      });
+
+      persistState(state);
+
+      const persisted = JSON.parse(
+        localStorageStub.getItem(PERSISTED_STATE_KEY) ?? "{}",
+      ) as PersistedUiState;
+      const restored = parsePersistedState(persisted);
+
+      expect(restored.threadViewStatePendingById).toEqual({ [threadKey]: pending });
+      expect(
+        resolveThreadViewedAt({
+          serverViewedAt,
+          localViewedAt: restored.threadLastVisitedAtById[threadKey],
+          pending: restored.threadViewStatePendingById[threadKey],
+        }),
+      ).toBe(localViewedAt);
+      expect(
+        resolveThreadViewedAt({
+          serverViewedAt: "2026-02-25T12:40:00.000Z",
+          localViewedAt: restored.threadLastVisitedAtById[threadKey],
+          pending: restored.threadViewStatePendingById[threadKey],
+        }),
+      ).toBe("2026-02-25T12:40:00.000Z");
+    },
+  );
 });

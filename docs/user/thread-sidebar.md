@@ -24,12 +24,12 @@ their pinned threads keep the default newest-first order below the ones you have
 Open a completed thread to clear its **Done** indicator on your connected devices. On web and
 desktop, open the thread's context menu and choose **Mark unread** to restore the indicator.
 
-Older servers keep read and unread changes on the current device. Update the server to sync those
-changes across your devices.
+On web and desktop, older servers keep read and unread changes on the current device. Update the
+server to sync those changes across your devices.
 
 When you first update a server that did not store read state, existing threads are marked as read.
-Connections without permission to update threads keep read and unread changes on the current
-device.
+On web and desktop, connections without permission to update threads keep read and unread changes
+on the current device.
 
 ## Environment artwork
 

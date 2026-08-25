@@ -55,13 +55,17 @@ function keepPendingLocalUntilServerChanges(
   threadRef: ScopedThreadRef,
   pending: PendingThreadViewState,
   serverViewedAt: string | undefined,
-  keepLocal: (threadKey: string, pending: PendingThreadViewState) => void,
+  keepLocal: (
+    threadKey: string,
+    pending: PendingThreadViewState,
+    serverViewedAt: string | undefined,
+  ) => void,
   clearPending: (threadKey: string, pending: PendingThreadViewState) => void,
 ): void {
   const threadKey = scopedThreadKey(threadRef);
   if (useUiStateStore.getState().threadViewStatePendingById[threadKey] !== pending) return;
 
-  keepLocal(threadKey, pending);
+  keepLocal(threadKey, pending, serverViewedAt);
   const localPending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
   if (localPending?.localOnly !== true) return;
 

@@ -21,6 +21,7 @@ export interface PersistedUiState {
   projectExpandedById?: Record<string, boolean>;
   projectOrder?: string[];
   threadLastVisitedAtById?: Record<string, string>;
+  threadViewStatePendingById?: Record<string, PendingThreadViewState>;
   collapsedProjectCwds?: string[];
   expandedProjectCwds?: string[];
   projectOrderCwds?: string[];
@@ -36,6 +37,7 @@ export interface UiProjectState {
 
 export interface UiThreadState {
   threadLastVisitedAtById: Record<string, string>;
+  threadViewStatePendingById: Record<string, PendingThreadViewState>;
   threadChangedFilesExpandedById: Record<string, Record<string, boolean>>;
 }
 
@@ -49,12 +51,14 @@ export interface PendingThreadViewState {
   kind: "viewed" | "unread";
   targetAt: string;
   localOnly?: boolean;
+  serverViewedAt?: string | null;
 }
 
 const initialState: UiState = {
   projectExpandedById: {},
   projectOrder: [],
   threadLastVisitedAtById: {},
+  threadViewStatePendingById: {},
   threadChangedFilesExpandedById: {},
   defaultAdvertisedEndpointKey: null,
 };
@@ -104,6 +108,35 @@ function sanitizeTimestampRecord(value: unknown): Record<string, string> {
   );
 }
 
+function sanitizeLocalThreadViewState(value: unknown): Record<string, PendingThreadViewState> {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  const localThreadViewState: Record<string, PendingThreadViewState> = {};
+  for (const [threadId, pending] of Object.entries(value)) {
+    if (!threadId || !pending || typeof pending !== "object") {
+      continue;
+    }
+
+    const { kind, targetAt, localOnly, serverViewedAt } = pending as Record<string, unknown>;
+    if (
+      (kind !== "viewed" && kind !== "unread") ||
+      typeof targetAt !== "string" ||
+      !Number.isFinite(Date.parse(targetAt)) ||
+      localOnly !== true ||
+      (serverViewedAt !== null &&
+        (typeof serverViewedAt !== "string" || !Number.isFinite(Date.parse(serverViewedAt))))
+    ) {
+      continue;
+    }
+
+    localThreadViewState[threadId] = { kind, targetAt, localOnly: true, serverViewedAt };
+  }
+
+  return localThreadViewState;
+}
+
 export function parsePersistedState(parsed: PersistedUiState): UiState {
   const projectExpandedById =
     parsed.projectExpandedById === undefined
@@ -132,6 +165,7 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
     projectExpandedById,
     projectOrder,
     threadLastVisitedAtById: sanitizeTimestampRecord(parsed.threadLastVisitedAtById),
+    threadViewStatePendingById: sanitizeLocalThreadViewState(parsed.threadViewStatePendingById),
     threadChangedFilesExpandedById:
       parsed.threadChangedFilesExpansionVersion === THREAD_CHANGED_FILES_EXPANSION_VERSION
         ? sanitizePersistedThreadChangedFilesExpanded(parsed.threadChangedFilesExpandedById)
@@ -204,12 +238,18 @@ export function persistState(state: UiState): void {
         ([key]) => key !== LEGACY_PROJECT_EXPANSION_DEFAULT_KEY,
       ),
     );
+    const threadViewStatePendingById = sanitizeLocalThreadViewState(
+      state.threadViewStatePendingById,
+    );
     window.localStorage.setItem(
       PERSISTED_STATE_KEY,
       JSON.stringify({
         projectExpandedById,
         projectOrder: state.projectOrder,
         threadLastVisitedAtById: state.threadLastVisitedAtById,
+        ...(Object.keys(threadViewStatePendingById).length > 0
+          ? { threadViewStatePendingById }
+          : {}),
         defaultAdvertisedEndpointKey: state.defaultAdvertisedEndpointKey,
         threadChangedFilesExpansionVersion: THREAD_CHANGED_FILES_EXPANSION_VERSION,
         threadChangedFilesExpandedById: state.threadChangedFilesExpandedById,
@@ -281,6 +321,14 @@ export function resolveThreadViewedAt(input: {
   localViewedAt: string | undefined;
   pending: PendingThreadViewState | undefined;
 }): string | undefined {
+  if (
+    input.pending?.localOnly === true &&
+    input.pending.serverViewedAt !== undefined &&
+    input.pending.serverViewedAt !== (input.serverViewedAt ?? null)
+  ) {
+    return input.serverViewedAt;
+  }
+
   return input.pending === undefined
     ? (input.serverViewedAt ?? input.localViewedAt)
     : (input.localViewedAt ?? input.serverViewedAt);
@@ -398,11 +446,14 @@ export function reorderProjects(
 }
 
 interface UiStateStore extends UiState {
-  threadViewStatePendingById: Record<string, PendingThreadViewState>;
   markThreadVisited: (threadId: string, visitedAt: string) => void;
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
   setThreadViewStatePending: (threadId: string, pending: PendingThreadViewState) => void;
-  keepThreadViewStateLocal: (threadId: string, pending: PendingThreadViewState) => void;
+  keepThreadViewStateLocal: (
+    threadId: string,
+    pending: PendingThreadViewState,
+    serverViewedAt: string | undefined,
+  ) => void;
   clearThreadViewStatePending: (threadId: string, pending: PendingThreadViewState) => void;
   setThreadChangedFilesExpanded: (threadId: string, turnId: string, expanded: boolean) => void;
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
@@ -416,7 +467,6 @@ interface UiStateStore extends UiState {
 
 export const useUiStateStore = create<UiStateStore>((set) => ({
   ...readPersistedState(),
-  threadViewStatePendingById: {},
   markThreadVisited: (threadId, visitedAt) =>
     set((state) => markThreadVisited(state, threadId, visitedAt)),
   markThreadUnread: (threadId, latestTurnCompletedAt) =>
@@ -428,13 +478,13 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
         [threadId]: pending,
       },
     })),
-  keepThreadViewStateLocal: (threadId, pending) =>
+  keepThreadViewStateLocal: (threadId, pending, serverViewedAt) =>
     set((state) => {
       if (state.threadViewStatePendingById[threadId] !== pending) return state;
       return {
         threadViewStatePendingById: {
           ...state.threadViewStatePendingById,
-          [threadId]: { ...pending, localOnly: true },
+          [threadId]: { ...pending, localOnly: true, serverViewedAt: serverViewedAt ?? null },
         },
       };
     }),

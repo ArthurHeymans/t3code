@@ -8,6 +8,7 @@ type PendingState = {
   readonly kind: "viewed" | "unread";
   readonly targetAt: string;
   readonly localOnly?: boolean;
+  readonly serverViewedAt?: string | null;
 };
 type ShellListener = () => void;
 
@@ -31,11 +32,17 @@ const testState = vi.hoisted(() => {
     setThreadViewStatePending: vi.fn((threadKey: string, pending: PendingState) => {
       uiState.threadViewStatePendingById[threadKey] = pending;
     }),
-    keepThreadViewStateLocal: vi.fn((threadKey: string, pending: PendingState) => {
-      if (uiState.threadViewStatePendingById[threadKey] === pending) {
-        uiState.threadViewStatePendingById[threadKey] = { ...pending, localOnly: true };
-      }
-    }),
+    keepThreadViewStateLocal: vi.fn(
+      (threadKey: string, pending: PendingState, serverViewedAt: string | undefined) => {
+        if (uiState.threadViewStatePendingById[threadKey] === pending) {
+          uiState.threadViewStatePendingById[threadKey] = {
+            ...pending,
+            localOnly: true,
+            serverViewedAt: serverViewedAt ?? null,
+          };
+        }
+      },
+    ),
     clearThreadViewStatePending: vi.fn((threadKey: string, pending: PendingState) => {
       if (uiState.threadViewStatePendingById[threadKey] === pending) {
         delete uiState.threadViewStatePendingById[threadKey];
@@ -208,6 +215,7 @@ describe("useThreadViewState", () => {
       kind: "viewed",
       targetAt: completedAt,
       localOnly: true,
+      serverViewedAt: "2026-01-01T00:00:00.000Z",
     });
     expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
     expect(testState.listeners).toHaveLength(1);
@@ -223,6 +231,7 @@ describe("useThreadViewState", () => {
       kind: "unread",
       targetAt: completedAt,
       localOnly: true,
+      serverViewedAt: "2026-01-01T00:00:00.000Z",
     });
     expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe("2026-01-01T00:00:59.999Z");
     expect(testState.listeners).toHaveLength(1);
