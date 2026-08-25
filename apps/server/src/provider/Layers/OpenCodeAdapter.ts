@@ -1456,6 +1456,8 @@ export function makeOpenCodeAdapter(
       }
 
       const text = input.input?.trim();
+      // OpenCode ingests any attachment natively: images and generic files
+      // both become file parts with their real mime type.
       const fileParts = toOpenCodeFileParts({
         attachments: input.attachments,
         resolveAttachmentPath: (attachment) =>

@@ -50,15 +50,51 @@ const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
-export function assetResponseHeaders(filePath: string): Record<string, string> {
+// Types a browser may render as a document if a proxy strips the disposition
+// header. Downloads of these fall back to octet-stream.
+const DOWNLOAD_MIME_TYPE_PATTERN = /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/;
+const isSafeDownloadMimeType = (mimeType: string): boolean =>
+  DOWNLOAD_MIME_TYPE_PATTERN.test(mimeType) &&
+  !/(?:^text\/html$|svg|xml)/i.test(mimeType.trim().toLowerCase());
+
+/** RFC 6266 disposition with an ASCII fallback name plus a UTF-8 `filename*`. */
+export function downloadContentDisposition(fileName?: string): string {
+  if (fileName === undefined) {
+    return "attachment";
+  }
+  const sanitized = fileName.replace(/[\u0000-\u001f"\\]/g, "_");
+  const asciiFallback = sanitized.replace(/[^\u0020-\u007e]/g, "_");
+  const needsExtended = asciiFallback !== sanitized;
+  return `attachment; filename="${asciiFallback}"${
+    needsExtended ? `; filename*=UTF-8''${encodeURIComponent(sanitized)}` : ""
+  }`;
+}
+
+export function assetResponseHeaders(
+  filePath: string,
+  options?: {
+    readonly download?: boolean;
+    readonly fileName?: string;
+    readonly mimeType?: string;
+  },
+): Record<string, string> {
   const lowerPath = filePath.toLowerCase();
   return {
     "Cache-Control": "private, max-age=3600",
     "X-Content-Type-Options": "nosniff",
-    ...(lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
-      ? { "Content-Type": "text/html; charset=utf-8" }
-      : {}),
-    ...(lowerPath.endsWith(".svg")
+    ...(options?.download
+      ? {
+          "Content-Disposition": downloadContentDisposition(options.fileName),
+          "Content-Security-Policy": "default-src 'none'; sandbox",
+          "Content-Type":
+            options.mimeType !== undefined && isSafeDownloadMimeType(options.mimeType)
+              ? options.mimeType
+              : "application/octet-stream",
+        }
+      : lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
+        ? { "Content-Type": "text/html; charset=utf-8" }
+        : {}),
+    ...(!options?.download && lowerPath.endsWith(".svg")
       ? { "Content-Security-Policy": SVG_CONTENT_SECURITY_POLICY }
       : {}),
   };
@@ -228,7 +264,16 @@ export const assetRouteLayer = HttpRouter.add(
     }
     return yield* HttpServerResponse.file(asset.path, {
       status: 200,
-      headers: assetResponseHeaders(asset.path),
+      headers: assetResponseHeaders(
+        asset.path,
+        asset.download
+          ? {
+              download: true,
+              ...(asset.fileName !== undefined ? { fileName: asset.fileName } : {}),
+              ...(asset.mimeType !== undefined ? { mimeType: asset.mimeType } : {}),
+            }
+          : undefined,
+      ),
     }).pipe(
       Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
     );
@@ -265,15 +310,7 @@ export const attachmentUploadRouteLayer = HttpRouter.add(
       });
     }
 
-    const body = yield* request.arrayBuffer.pipe(
-      Effect.provideService(HttpServerRequest.MaxBodySize, FileSystem.Size(claims.sizeBytes)),
-      Effect.orElseSucceed(() => null),
-    );
-    if (body === null) {
-      return HttpServerResponse.text("Failed to read the upload body.", { status: 400 });
-    }
-
-    const stored = yield* storeAttachmentUpload(claims, new Uint8Array(body));
+    const stored = yield* storeAttachmentUpload(claims, request.stream);
     return stored.ok
       ? HttpServerResponse.empty({ status: 204 })
       : HttpServerResponse.text(stored.detail, { status: stored.status });
