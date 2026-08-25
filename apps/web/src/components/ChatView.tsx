@@ -1809,8 +1809,13 @@ function ChatViewContent(props: ChatViewProps) {
     }
     const threadRef = scopeThreadRef(serverThread.environmentId, serverThread.id);
     const threadKey = scopedThreadKey(threadRef);
+    const shouldRetryView = () => {
+      const pending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
+      return pending?.kind === "viewed" && pending.localOnly === true;
+    };
     const acknowledgeVisibleThread = createVisibleThreadAcknowledger({
       isVisible: () => document.visibilityState === "visible" && document.hasFocus(),
+      shouldRetry: shouldRetryView,
       acknowledge: () => {
         const { threadLastVisitedAtById, threadViewStatePendingById } = useUiStateStore.getState();
         if (
@@ -1821,6 +1826,7 @@ function ChatViewContent(props: ChatViewProps) {
             serverSupportsViewState: supportsThreadViewState,
             localViewedAt: threadLastVisitedAtById[threadKey],
             pendingUnread: threadViewStatePendingById[threadKey]?.kind === "unread",
+            retryLocalOnlyView: shouldRetryView(),
           })
         ) {
           return;

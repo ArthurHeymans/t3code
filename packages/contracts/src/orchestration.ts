@@ -751,6 +751,8 @@ const ThreadMarkUnreadCommand = Schema.Struct({
   type: Schema.Literal("thread.mark-unread"),
   commandId: CommandId,
   threadId: ThreadId,
+  expectedViewedAt: Schema.optional(IsoDateTime),
+  expectedCompletedAt: Schema.optional(IsoDateTime),
 });
 
 const ThreadSnoozeCommand = Schema.Struct({

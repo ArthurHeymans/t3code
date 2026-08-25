@@ -258,6 +258,138 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
     }),
   );
 
+  it.effect("accepts an unread action when its view and completion guards match", () =>
+    Effect.gen(function* () {
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-guards-match"),
+          threadId: ThreadId.make("thread-1"),
+          expectedViewedAt: thread.viewedAt,
+          expectedCompletedAt: COMPLETED_AT,
+        },
+        readModel,
+      });
+      const markedUnread = Array.isArray(event) ? event[0] : event;
+
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
+        expect(markedUnread.payload.viewedAt).toBe("2026-01-01T00:00:59.999Z");
+      }
+    }),
+  );
+
+  it.effect("does not let a delayed unread action undo a later view of the same completion", () =>
+    Effect.gen(function* () {
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-after-view"),
+          threadId: ThreadId.make("thread-1"),
+          expectedViewedAt: thread.viewedAt,
+          expectedCompletedAt: COMPLETED_AT,
+        },
+        readModel: {
+          ...readModel,
+          threads: [{ ...thread, viewedAt: COMPLETED_AT }],
+        },
+      });
+      const markedUnread = Array.isArray(event) ? event[0] : event;
+
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
+        expect(markedUnread.payload.viewedAt).toBe(COMPLETED_AT);
+      }
+    }),
+  );
+
+  it.effect("does not let a delayed unread action undo a newer view", () =>
+    Effect.gen(function* () {
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const newerCompletedAt = "2026-01-01T00:02:00.000Z";
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-stale"),
+          threadId: ThreadId.make("thread-1"),
+          expectedViewedAt: thread.viewedAt,
+          expectedCompletedAt: COMPLETED_AT,
+        },
+        readModel: {
+          ...readModel,
+          threads: [
+            {
+              ...thread,
+              viewedAt: newerCompletedAt,
+              latestTurn: { ...thread.latestTurn!, completedAt: newerCompletedAt },
+            },
+          ],
+        },
+      });
+      const markedUnread = Array.isArray(event) ? event[0] : event;
+
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
+        expect(markedUnread.payload.viewedAt).toBe(newerCompletedAt);
+      }
+    }),
+  );
+
+  it.effect("does not apply an unread action to a different completion", () =>
+    Effect.gen(function* () {
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const newerCompletedAt = "2026-01-01T00:02:00.000Z";
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-wrong-completion"),
+          threadId: ThreadId.make("thread-1"),
+          expectedCompletedAt: COMPLETED_AT,
+        },
+        readModel: {
+          ...readModel,
+          threads: [
+            {
+              ...thread,
+              latestTurn: { ...thread.latestTurn!, completedAt: newerCompletedAt },
+            },
+          ],
+        },
+      });
+      const markedUnread = Array.isArray(event) ? event[0] : event;
+
+      expect(markedUnread?.type).toBe("thread.meta-updated");
+      if (markedUnread?.type === "thread.meta-updated") {
+        expect(markedUnread.payload.viewedAt).toBe(thread.viewedAt);
+      }
+    }),
+  );
+
+  it.effect("rejects an invalid expected completion for an unread action", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.mark-unread",
+          commandId: CommandId.make("cmd-mark-unread-invalid-expected"),
+          threadId: ThreadId.make("thread-1"),
+          expectedCompletedAt: "not-a-timestamp",
+        },
+        readModel: makeReadModel(),
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.mark-unread",
+      });
+    }),
+  );
+
   it.effect("preserves the existing view boundary while the latest turn is running", () =>
     Effect.gen(function* () {
       const readModel = makeReadModel();

@@ -186,21 +186,33 @@ export function useThreadViewState() {
   const markUnread = useCallback(
     (threadRef: ScopedThreadRef, latestTurnCompletedAt: string | null | undefined) => {
       const threadKey = scopedThreadKey(threadRef);
+      const thread = readThreadShell(threadRef);
+      const supportsViewState =
+        readEnvironmentSupportsViewState(threadRef.environmentId) ?? thread?.viewedAt !== undefined;
       if (
         latestTurnCompletedAt == null ||
         !Number.isFinite(Date.parse(latestTurnCompletedAt)) ||
-        !readEnvironmentSupportsViewState(threadRef.environmentId)
+        !supportsViewState
       ) {
         markLocalUnread(threadKey, latestTurnCompletedAt);
         return;
       }
-      const serverViewedAt = readThreadShell(threadRef)?.viewedAt;
+      const serverViewedAt = thread?.viewedAt;
+      const previousPending = useUiStateStore.getState().threadViewStatePendingById[threadKey];
+      const expectedViewedAt =
+        previousPending?.kind === "viewed" && previousPending.localOnly !== true
+          ? undefined
+          : serverViewedAt;
       const pending = { kind: "unread", targetAt: latestTurnCompletedAt } as const;
       setPending(threadKey, pending);
       markLocalUnread(threadKey, latestTurnCompletedAt);
       void markUnreadOnServer({
         environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId },
+        input: {
+          threadId: threadRef.threadId,
+          expectedCompletedAt: latestTurnCompletedAt,
+          ...(expectedViewedAt !== undefined ? { expectedViewedAt } : {}),
+        },
       }).then((result) => {
         if (result._tag === "Failure") {
           keepPendingLocalUntilServerChanges(

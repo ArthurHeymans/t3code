@@ -77,6 +77,25 @@ describe("createVisibleThreadAcknowledger", () => {
 
     expect(acknowledge).toHaveBeenCalledOnce();
   });
+
+  it("retries a failed acknowledgement when the thread becomes visible again", () => {
+    const acknowledge = vi.fn();
+    let shouldRetry = false;
+    const acknowledgeVisibleThread = createVisibleThreadAcknowledger({
+      isVisible: () => true,
+      acknowledge,
+      shouldRetry: () => shouldRetry,
+    });
+
+    acknowledgeVisibleThread();
+    acknowledgeVisibleThread();
+    expect(acknowledge).toHaveBeenCalledOnce();
+
+    shouldRetry = true;
+    acknowledgeVisibleThread();
+
+    expect(acknowledge).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("shouldAcknowledgeVisibleThreadCompletion", () => {
@@ -94,6 +113,7 @@ describe("shouldAcknowledgeVisibleThreadCompletion", () => {
     serverSupportsViewState: true,
     localViewedAt: completedAt,
     pendingUnread: false,
+    retryLocalOnlyView: false,
   };
 
   it("syncs an earlier local view when server capability becomes available", () => {
@@ -120,6 +140,16 @@ describe("shouldAcknowledgeVisibleThreadCompletion", () => {
         previousAcknowledgement: { ...previousAcknowledgement, serverSupportsViewState: true },
       }),
     ).toBe(false);
+  });
+
+  it("retries a failed server acknowledgement while preserving the local read marker", () => {
+    expect(
+      shouldAcknowledgeVisibleThreadCompletion({
+        ...input,
+        previousAcknowledgement: { ...previousAcknowledgement, serverSupportsViewState: true },
+        retryLocalOnlyView: true,
+      }),
+    ).toBe(true);
   });
 });
 

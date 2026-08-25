@@ -93,6 +93,18 @@ describe("uiStateStore pure functions", () => {
         },
       }),
     ).toBe("2026-02-25T12:40:00.000Z");
+    expect(
+      resolveThreadViewedAt({
+        ...input,
+        serverViewedAt: undefined,
+        pending: {
+          kind: "viewed",
+          targetAt: "2026-02-25T12:35:00.000Z",
+          localOnly: true,
+          serverViewedAt: "2026-02-25T12:30:00.000Z",
+        },
+      }),
+    ).toBe("2026-02-25T12:35:00.000Z");
   });
 
   it("resolves project expansion from logical, physical, and legacy preference keys", () => {

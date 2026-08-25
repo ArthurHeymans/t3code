@@ -188,6 +188,8 @@ describe("environment commands", () => {
       yield* markThreadUnread({
         commandId: CommandId.make("mark-unread-command"),
         threadId: ThreadId.make("thread-1"),
+        expectedViewedAt: "2026-01-01T00:00:00.000Z",
+        expectedCompletedAt: "2026-01-01T00:01:00.000Z",
       }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
 
       expect(dispatched).toEqual([
@@ -202,6 +204,8 @@ describe("environment commands", () => {
           type: "thread.mark-unread",
           commandId: "mark-unread-command",
           threadId: "thread-1",
+          expectedViewedAt: "2026-01-01T00:00:00.000Z",
+          expectedCompletedAt: "2026-01-01T00:01:00.000Z",
         },
       ]);
     }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),

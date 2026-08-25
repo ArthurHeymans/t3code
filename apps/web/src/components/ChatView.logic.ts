@@ -36,10 +36,11 @@ export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.
 export function createVisibleThreadAcknowledger(input: {
   readonly isVisible: () => boolean;
   readonly acknowledge: () => void;
+  readonly shouldRetry?: () => boolean;
 }): () => void {
   let acknowledged = false;
   return () => {
-    if (acknowledged || !input.isVisible()) return;
+    if (!input.isVisible() || (acknowledged && input.shouldRetry?.() !== true)) return;
     acknowledged = true;
     input.acknowledge();
   };
@@ -57,6 +58,7 @@ export function shouldAcknowledgeVisibleThreadCompletion(input: {
   readonly serverSupportsViewState: boolean;
   readonly localViewedAt: string | undefined;
   readonly pendingUnread: boolean;
+  readonly retryLocalOnlyView: boolean;
 }): boolean {
   const previous = input.previousAcknowledgement;
   if (
@@ -68,10 +70,10 @@ export function shouldAcknowledgeVisibleThreadCompletion(input: {
   }
 
   if (
-    previous.serverSupportsViewState ||
     !input.serverSupportsViewState ||
     input.pendingUnread ||
-    input.localViewedAt === undefined
+    input.localViewedAt === undefined ||
+    (previous.serverSupportsViewState && !input.retryLocalOnlyView)
   ) {
     return false;
   }

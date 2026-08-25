@@ -323,8 +323,9 @@ export function resolveThreadViewedAt(input: {
 }): string | undefined {
   if (
     input.pending?.localOnly === true &&
+    input.serverViewedAt !== undefined &&
     input.pending.serverViewedAt !== undefined &&
-    input.pending.serverViewedAt !== (input.serverViewedAt ?? null)
+    input.pending.serverViewedAt !== input.serverViewedAt
   ) {
     return input.serverViewedAt;
   }

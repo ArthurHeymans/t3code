@@ -203,6 +203,21 @@ describe("useThreadViewState", () => {
     expect(testState.listeners).toHaveLength(0);
   });
 
+  it("queues an unread action after a view without expecting the old server marker", () => {
+    const { markUnread, markViewed } = renderHook();
+
+    markViewed(threadRef, completedAt);
+    markUnread(threadRef, completedAt);
+
+    expect(testState.markUnreadOnServer).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        expectedCompletedAt: completedAt,
+      },
+    });
+  });
+
   it("does not bind a queued view to an unread marker from an earlier completion", () => {
     testState.shell = { viewedAt: completedAt };
     const newerCompletedAt = "2026-01-01T00:02:00.000Z";
@@ -418,6 +433,41 @@ describe("useThreadViewState", () => {
 
     expect(testState.viewThread).not.toHaveBeenCalled();
     expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe(completedAt);
+  });
+
+  it("syncs an unread action before config loads when the thread has a server marker", () => {
+    testState.supported = undefined;
+
+    renderHook().markUnread(threadRef, completedAt);
+
+    expect(testState.markUnreadOnServer).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        expectedCompletedAt: completedAt,
+        expectedViewedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    expect(testState.uiState.threadViewStatePendingById[threadKey]?.kind).toBe("unread");
+  });
+
+  it("does not send an unread action before config loads without a server marker", () => {
+    testState.supported = undefined;
+    testState.shell = {};
+
+    renderHook().markUnread(threadRef, completedAt);
+
+    expect(testState.markUnreadOnServer).not.toHaveBeenCalled();
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe("2026-01-01T00:00:59.999Z");
+  });
+
+  it("does not send an unread action when server config explicitly disables view state", () => {
+    testState.supported = false;
+
+    renderHook().markUnread(threadRef, completedAt);
+
+    expect(testState.markUnreadOnServer).not.toHaveBeenCalled();
+    expect(testState.uiState.threadLastVisitedAtById[threadKey]).toBe("2026-01-01T00:00:59.999Z");
   });
 
   it("does not send invalid view or completion timestamps", () => {

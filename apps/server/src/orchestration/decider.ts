@@ -635,15 +635,47 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      const expectedViewedAt =
+        command.expectedViewedAt === undefined
+          ? undefined
+          : DateTime.make(command.expectedViewedAt);
+      if (expectedViewedAt !== undefined && Option.isNone(expectedViewedAt)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} expected view boundary ${command.expectedViewedAt} is not a valid timestamp`,
+        });
+      }
+      const expectedCompletedAt =
+        command.expectedCompletedAt === undefined
+          ? undefined
+          : DateTime.make(command.expectedCompletedAt);
+      if (expectedCompletedAt !== undefined && Option.isNone(expectedCompletedAt)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} expected completion ${command.expectedCompletedAt} is not a valid timestamp`,
+        });
+      }
       const occurredAt = yield* nowIso;
       const latestCompletedAt = thread.latestTurn?.completedAt;
+      const previousViewedAt = thread.viewedAt ?? thread.createdAt;
+      const viewBoundaryChanged =
+        expectedViewedAt !== undefined &&
+        DateTime.Order(expectedViewedAt.value, DateTime.makeUnsafe(previousViewedAt)) !== 0;
+      const completionChanged =
+        expectedCompletedAt !== undefined &&
+        (latestCompletedAt == null ||
+          !DateTime.make(latestCompletedAt).pipe(
+            Option.exists(
+              (completedAt) => DateTime.Order(expectedCompletedAt.value, completedAt) === 0,
+            ),
+          ));
       const viewedAt =
-        latestCompletedAt == null
-          ? (thread.viewedAt ?? thread.createdAt)
+        latestCompletedAt == null || viewBoundaryChanged || completionChanged
+          ? previousViewedAt
           : DateTime.make(latestCompletedAt).pipe(
               Option.map(DateTime.subtractDuration("1 millis")),
               Option.map(DateTime.formatIso),
-              Option.getOrElse(() => thread.viewedAt ?? thread.createdAt),
+              Option.getOrElse(() => previousViewedAt),
             );
       return {
         ...(yield* withEventBase({
