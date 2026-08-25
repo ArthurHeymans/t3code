@@ -320,6 +320,9 @@ function ThreadRouteContent(
         input: {
           threadId: selectedThreadId,
           viewedThrough: selectedThreadCompletedAt,
+          ...(selectedThreadViewedAtRef.current !== undefined
+            ? { expectedViewedAt: selectedThreadViewedAtRef.current }
+            : {}),
         },
       });
     }, [

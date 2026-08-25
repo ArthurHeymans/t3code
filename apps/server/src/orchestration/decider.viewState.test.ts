@@ -143,6 +143,62 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
     }),
   );
 
+  it.effect("does not let a delayed view undo a later mark-unread action", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z"));
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const markedUnreadAt = "2026-01-01T00:00:59.999Z";
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-after-unread"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: COMPLETED_AT,
+          expectedViewedAt: thread.viewedAt,
+        },
+        readModel: {
+          ...readModel,
+          threads: [{ ...thread, viewedAt: markedUnreadAt }],
+        },
+      });
+      const viewed = Array.isArray(event) ? event[0] : event;
+
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
+        expect(viewed.payload.viewedAt).toBe(markedUnreadAt);
+      }
+    }),
+  );
+
+  it.effect("accepts a fresh view after the client observes the unread marker", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-01-02T00:00:00.000Z"));
+      const readModel = makeReadModel();
+      const thread = readModel.threads[0]!;
+      const markedUnreadAt = "2026-01-01T00:00:59.999Z";
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-fresh-after-unread"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: COMPLETED_AT,
+          expectedViewedAt: markedUnreadAt,
+        },
+        readModel: {
+          ...readModel,
+          threads: [{ ...thread, viewedAt: markedUnreadAt }],
+        },
+      });
+      const viewed = Array.isArray(event) ? event[0] : event;
+
+      expect(viewed?.type).toBe("thread.meta-updated");
+      if (viewed?.type === "thread.meta-updated") {
+        expect(viewed.payload.viewedAt).toBe(COMPLETED_AT);
+      }
+    }),
+  );
+
   it.effect("rejects an invalid viewed boundary instead of marking the thread read", () =>
     Effect.gen(function* () {
       const error = yield* decideOrchestrationCommand({
@@ -151,6 +207,26 @@ it.layer(NodeServices.layer)("thread view-state decider", (it) => {
           commandId: CommandId.make("cmd-view-invalid"),
           threadId: ThreadId.make("thread-1"),
           viewedThrough: "not-a-timestamp",
+        },
+        readModel: makeReadModel(),
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.view",
+      });
+    }),
+  );
+
+  it.effect("rejects an invalid expected view boundary", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.view",
+          commandId: CommandId.make("cmd-view-invalid-expected"),
+          threadId: ThreadId.make("thread-1"),
+          viewedThrough: VIEWED_THROUGH,
+          expectedViewedAt: "not-a-timestamp",
         },
         readModel: makeReadModel(),
       }).pipe(Effect.flip);

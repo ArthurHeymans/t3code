@@ -187,7 +187,14 @@ describe("useThreadViewState", () => {
     markViewed(threadRef, completedAt);
 
     expect(testState.markUnreadOnServer).toHaveBeenCalledTimes(1);
-    expect(testState.viewThread).toHaveBeenCalledTimes(1);
+    expect(testState.viewThread).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        viewedThrough: completedAt,
+        expectedViewedAt: "2026-01-01T00:00:59.999Z",
+      },
+    });
     expect(testState.uiState.threadViewStatePendingById[threadKey]?.kind).toBe("viewed");
 
     await flushCommands();
@@ -212,6 +219,14 @@ describe("useThreadViewState", () => {
     renderHook().markViewed(threadRef, completedAt);
     await flushCommands();
 
+    expect(testState.viewThread).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        viewedThrough: completedAt,
+        expectedViewedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
     expect(testState.uiState.threadViewStatePendingById[threadKey]).toEqual({
       kind: "viewed",
       targetAt: completedAt,

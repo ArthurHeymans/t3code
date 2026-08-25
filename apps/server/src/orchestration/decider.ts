@@ -587,17 +587,30 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           detail: `thread ${command.threadId} view boundary ${command.viewedThrough} is not a valid timestamp`,
         });
       }
+      const expectedViewedAt =
+        command.expectedViewedAt === undefined
+          ? undefined
+          : DateTime.make(command.expectedViewedAt);
+      if (expectedViewedAt !== undefined && Option.isNone(expectedViewedAt)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} expected view boundary ${command.expectedViewedAt} is not a valid timestamp`,
+        });
+      }
       const occurredAt = yield* nowIso;
       const cappedViewedAt =
         DateTime.Order(viewedThrough.value, DateTime.makeUnsafe(occurredAt)) <= 0
           ? DateTime.formatIso(viewedThrough.value)
           : occurredAt;
-      const viewedAt = DateTime.make(thread.viewedAt ?? thread.createdAt).pipe(
+      const previousViewedAt = thread.viewedAt ?? thread.createdAt;
+      const viewedAt = DateTime.make(previousViewedAt).pipe(
         Option.filter(
           (previousViewedAt) =>
-            DateTime.Order(previousViewedAt, DateTime.makeUnsafe(cappedViewedAt)) >= 0,
+            DateTime.Order(previousViewedAt, DateTime.makeUnsafe(cappedViewedAt)) >= 0 ||
+            (expectedViewedAt !== undefined &&
+              DateTime.Order(expectedViewedAt.value, previousViewedAt) !== 0),
         ),
-        Option.as(thread.viewedAt ?? thread.createdAt),
+        Option.as(previousViewedAt),
         Option.getOrElse(() => cappedViewedAt),
       );
       return {

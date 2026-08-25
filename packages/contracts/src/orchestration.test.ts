@@ -454,6 +454,13 @@ it.effect("decodes thread view-state commands", () =>
       threadId: "thread-1",
       viewedThrough: "2026-01-01T00:00:00.000Z",
     });
+    const conditionalView = yield* decodeOrchestrationCommand({
+      type: "thread.view",
+      commandId: "cmd-view-2",
+      threadId: "thread-1",
+      viewedThrough: "2026-01-01T00:01:00.000Z",
+      expectedViewedAt: "2026-01-01T00:00:00.000Z",
+    });
     const markUnread = yield* decodeOrchestrationCommand({
       type: "thread.mark-unread",
       commandId: "cmd-mark-unread-1",
@@ -461,6 +468,10 @@ it.effect("decodes thread view-state commands", () =>
     });
 
     assert.strictEqual(view.type, "thread.view");
+    assert.strictEqual(conditionalView.type, "thread.view");
+    if (conditionalView.type === "thread.view") {
+      assert.strictEqual(conditionalView.expectedViewedAt, "2026-01-01T00:00:00.000Z");
+    }
     assert.strictEqual(markUnread.type, "thread.mark-unread");
   }),
 );

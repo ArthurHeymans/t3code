@@ -143,12 +143,20 @@ export function useThreadViewState() {
       ) {
         return;
       }
+      const expectedViewedAt =
+        previousPending?.kind === "unread" && previousPending.localOnly !== true
+          ? useUiStateStore.getState().threadLastVisitedAtById[threadKey]
+          : thread?.viewedAt;
       const pending = { kind: "viewed", targetAt: viewedThrough } as const;
       setPending(threadKey, pending);
       markLocalViewed(threadKey, viewedThrough);
       void viewThread({
         environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId, viewedThrough },
+        input: {
+          threadId: threadRef.threadId,
+          viewedThrough,
+          ...(expectedViewedAt !== undefined ? { expectedViewedAt } : {}),
+        },
       }).then((result) => {
         if (result._tag === "Failure") {
           keepPendingLocalUntilServerChanges(

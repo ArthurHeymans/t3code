@@ -183,6 +183,7 @@ describe("environment commands", () => {
         commandId: CommandId.make("view-command"),
         threadId: ThreadId.make("thread-1"),
         viewedThrough: "2026-01-01T00:00:00.000Z",
+        expectedViewedAt: "2025-12-31T23:59:00.000Z",
       }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
       yield* markThreadUnread({
         commandId: CommandId.make("mark-unread-command"),
@@ -195,6 +196,7 @@ describe("environment commands", () => {
           commandId: "view-command",
           threadId: "thread-1",
           viewedThrough: "2026-01-01T00:00:00.000Z",
+          expectedViewedAt: "2025-12-31T23:59:00.000Z",
         },
         {
           type: "thread.mark-unread",
