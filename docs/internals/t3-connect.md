@@ -127,16 +127,18 @@ logout` performs the same cleanup and removes the stored CLI authorization.
 
 ### Managed tunnel lifecycle
 
-Every linked environment stores a relay-issued environment credential. At startup, the server uses
-that credential to register recovery support for its existing tunnel. Registration only updates the
-relay database and does not call Cloudflare. Healthy CLI links reuse the stored tunnel instead of
-provisioning it again.
+Every linked environment stores a relay-issued environment credential. When setup installs a tunnel
+and when the server starts, the server uses that credential to register recovery support for the
+existing tunnel. Registration only updates the relay database and does not call Cloudflare.
+Healthy CLI links reuse the stored tunnel instead of provisioning it again.
 
 If the connector exits or repeatedly reports that Cloudflare rejected its tunnel, the server uses
 the same environment credential to request a replacement. This also recovers a tunnel deleted
 while a laptop was asleep, even when the connector keeps running. Environments linked through web
 or mobile settings do not need a stored CLI credential. The relay keeps the existing hostname and
-DNS record, so a replacement tunnel does not change the public endpoint.
+DNS record, so a replacement tunnel does not change the public endpoint. Each registration and
+recovery request includes a short-lived host signature that binds the cloud user and the current
+tunnel or local T3 server address.
 
 After a host registers recovery support, the existing five-minute maintenance job removes its
 tunnel when Cloudflare reports that the tunnel has been down for at least five minutes. Tunnels

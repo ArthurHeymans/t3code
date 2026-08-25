@@ -1,7 +1,9 @@
+import * as NodeCrypto from "node:crypto";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -16,6 +18,7 @@ import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import { EnvironmentId } from "@t3tools/contracts";
 import { RelayEnvironmentAuth } from "@t3tools/contracts/relay";
+import { RELAY_MANAGED_TUNNEL_RECOVERY_TYP, signRelayJwt } from "@t3tools/shared/relayJwt";
 
 import {
   RELAY_REQUEST_DEADLINE_MS,
@@ -29,6 +32,7 @@ import {
   traceRelayHttpRequestWith,
   unlinkEnvironmentRecord,
   verifyRelayClientBearerToken,
+  verifyEnvironmentTunnelRecoveryProof,
   withoutCapturedParentSpan,
 } from "./Api.ts";
 import * as RelayConfiguration from "../Config.ts";
@@ -172,6 +176,7 @@ function relayUnlinkTestLayer(input?: {
   readonly prepareDeprovision?: ManagedEndpointProvider.ManagedEndpointProvider["Service"]["prepareDeprovision"];
   readonly deprovision?: ManagedEndpointProvider.ManagedEndpointProvider["Service"]["deprovision"];
   readonly provision?: ManagedEndpointProvider.ManagedEndpointProvider["Service"]["provision"];
+  readonly release?: ManagedEndpointProvider.ManagedEndpointProvider["Service"]["release"];
 }) {
   return Layer.mergeAll(
     Layer.succeed(
@@ -206,7 +211,7 @@ function relayUnlinkTestLayer(input?: {
         provision: input?.provision ?? (() => Effect.die("unused provision")),
         prepareDeprovision: input?.prepareDeprovision ?? (() => Effect.succeed(null)),
         deprovision: input?.deprovision ?? (() => Effect.succeed(true)),
-        release: () => Effect.die("unused release"),
+        release: input?.release ?? (() => Effect.die("unused release")),
       }),
     ),
   );
@@ -225,6 +230,68 @@ const linkedEnvironmentRecord = {
 } as const;
 
 describe("relay managed tunnel recovery", () => {
+  it.effect("binds recovery requests to the host, cloud user, and T3 service origin", () =>
+    Effect.gen(function* () {
+      const keyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+        privateKeyEncoding: { format: "pem", type: "pkcs8" },
+        publicKeyEncoding: { format: "pem", type: "spki" },
+      });
+      const now = yield* DateTime.now;
+      const issuedAt = Math.floor(now.epochMilliseconds / 1_000);
+      const proof = yield* signRelayJwt({
+        privateKey: keyPair.privateKey,
+        typ: RELAY_MANAGED_TUNNEL_RECOVERY_TYP,
+        payload: {
+          iss: "t3-env:environment-1",
+          aud: "https://relay.example.test",
+          sub: "environment-1",
+          jti: "recovery-proof",
+          iat: issuedAt,
+          exp: issuedAt + 60,
+          action: "recover",
+          environmentId: "environment-1",
+          cloudUserId: "user-1",
+          origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
+        },
+      });
+      const request = {
+        action: "recover" as const,
+        proof,
+        userId: "user-1",
+        environmentId: "environment-1",
+        environmentPublicKey: keyPair.publicKey,
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
+      };
+
+      yield* verifyEnvironmentTunnelRecoveryProof(request);
+
+      const wrongOwner = yield* Effect.flip(
+        verifyEnvironmentTunnelRecoveryProof({ ...request, userId: "user-2" }),
+      );
+      expect(wrongOwner).toMatchObject({ _tag: "Unauthorized" });
+
+      const wrongOrigin = yield* Effect.flip(
+        verifyEnvironmentTunnelRecoveryProof({
+          ...request,
+          origin: { localHttpHost: "127.0.0.1", localHttpPort: 5432 },
+        }),
+      );
+      expect(wrongOrigin).toMatchObject({ _tag: "Unauthorized" });
+
+      const wrongAction = yield* Effect.flip(
+        verifyEnvironmentTunnelRecoveryProof({
+          action: "register",
+          proof,
+          userId: "user-1",
+          environmentId: "environment-1",
+          environmentPublicKey: keyPair.publicKey,
+          tunnelId: "existing-tunnel",
+        }),
+      );
+      expect(wrongAction).toMatchObject({ _tag: "Unauthorized" });
+    }).pipe(Effect.provideService(RelayConfiguration.RelayConfiguration, relaySettings)),
+  );
+
   it.effect("registers recovery for an existing tunnel without provisioning it", () => {
     let recoveryEnabledFor: {
       readonly userId: string;
@@ -451,17 +518,6 @@ describe("relay managed tunnel recovery", () => {
   it.effect("rejects a recovered tunnel that changes the linked endpoint", () => {
     let recoveryEnabled = false;
     const cleaned: Array<string> = [];
-    const target = {
-      userId: "user-1",
-      environmentId: "environment-1",
-      hostname: "different.example.test",
-      tunnelId: "replacement-tunnel",
-      tunnelName: "environment-1-tunnel",
-      dnsRecordId: "dns-1",
-      readyAt: "2026-07-28T00:00:00.000Z",
-      updatedAt: "replacement-generation",
-      generation: 3,
-    } satisfies ManagedEndpointProvider.ManagedEndpointDeprovisionTarget;
 
     return Effect.gen(function* () {
       const error = yield* Effect.flip(
@@ -493,11 +549,12 @@ describe("relay managed tunnel recovery", () => {
                   tunnelId: "replacement-tunnel",
                 },
               }),
-            prepareDeprovision: () => Effect.succeed(target),
-            deprovision: ({ target: captured }) =>
+            prepareDeprovision: () => Effect.die("must keep the active allocation"),
+            deprovision: () => Effect.die("must keep the active link DNS"),
+            release: ({ expectedTunnelId }) =>
               Effect.sync(() => {
-                if (captured?.tunnelId) {
-                  cleaned.push(captured.tunnelId);
+                if (expectedTunnelId) {
+                  cleaned.push(expectedTunnelId);
                 }
                 return true;
               }),
