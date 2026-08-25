@@ -145,7 +145,7 @@ export function useThreadViewState() {
       }
       const expectedViewedAt =
         previousPending?.kind === "unread" && previousPending.localOnly !== true
-          ? useUiStateStore.getState().threadLastVisitedAtById[threadKey]
+          ? undefined
           : thread?.viewedAt;
       const pending = { kind: "viewed", targetAt: viewedThrough } as const;
       setPending(threadKey, pending);

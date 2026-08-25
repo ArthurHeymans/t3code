@@ -192,7 +192,6 @@ describe("useThreadViewState", () => {
       input: {
         threadId: threadRef.threadId,
         viewedThrough: completedAt,
-        expectedViewedAt: "2026-01-01T00:00:59.999Z",
       },
     });
     expect(testState.uiState.threadViewStatePendingById[threadKey]?.kind).toBe("viewed");
@@ -202,6 +201,23 @@ describe("useThreadViewState", () => {
     advanceShell(2, completedAt);
     expect(testState.uiState.threadViewStatePendingById[threadKey]).toBeUndefined();
     expect(testState.listeners).toHaveLength(0);
+  });
+
+  it("does not bind a queued view to an unread marker from an earlier completion", () => {
+    testState.shell = { viewedAt: completedAt };
+    const newerCompletedAt = "2026-01-01T00:02:00.000Z";
+    const { markUnread, markViewed } = renderHook();
+
+    markUnread(threadRef, completedAt);
+    markViewed(threadRef, newerCompletedAt);
+
+    expect(testState.viewThread).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        viewedThrough: newerCompletedAt,
+      },
+    });
   });
 
   it("uses the shell event sequence when another device changes the final state", async () => {
