@@ -231,7 +231,8 @@ controls remain in **Settings** → **Connections** on web and desktop or **Sett
 
 If a linked environment stays offline for several minutes, T3 Connect removes its unused tunnel.
 The environment stays linked to your account and keeps the same address. When the server starts
-again, T3 Connect creates a replacement tunnel automatically. You do not need to pair it again.
+again or the computer wakes, T3 Connect creates a replacement tunnel automatically. You do not
+need to pair it again.
 
 ## Security Notes
 

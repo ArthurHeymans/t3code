@@ -127,17 +127,22 @@ logout` performs the same cleanup and removes the stored CLI authorization.
 
 ### Managed tunnel lifecycle
 
-Every linked environment stores a relay-issued environment credential. When a managed environment
-starts or its connector exits, the server uses that credential to request a tunnel from the relay.
-This also covers environments linked through web or mobile settings, which do not have a stored CLI
-credential. The relay keeps the existing hostname and DNS record, so a replacement tunnel does not
-change the public endpoint.
+Every linked environment stores a relay-issued environment credential. At startup, the server uses
+that credential to register recovery support for its existing tunnel. Registration only updates the
+relay database and does not call Cloudflare. Healthy CLI links reuse the stored tunnel instead of
+provisioning it again.
 
-After a host completes this recovery request, the relay records that the host can recreate its own
-tunnel. The existing five-minute maintenance job removes tunnels from those hosts when Cloudflare
-reports that they have been down for at least five minutes. Tunnels that never connected are removed
-when they are at least five minutes old. The job leaves older hosts alone until they complete a
-recovery request, and it only removes tunnels that belong to its own deployment stage.
+If the connector exits or repeatedly reports that Cloudflare rejected its tunnel, the server uses
+the same environment credential to request a replacement. This also recovers a tunnel deleted
+while a laptop was asleep, even when the connector keeps running. Environments linked through web
+or mobile settings do not need a stored CLI credential. The relay keeps the existing hostname and
+DNS record, so a replacement tunnel does not change the public endpoint.
+
+After a host registers recovery support, the existing five-minute maintenance job removes its
+tunnel when Cloudflare reports that the tunnel has been down for at least five minutes. Tunnels
+that never connected are removed when they are at least five minutes old. The job leaves older
+hosts alone until they register recovery support, and it only removes tunnels that belong to its
+own deployment stage.
 
 The background service has an independent lifecycle. Connect setup may offer to install it, but
 logout leaves it running; manage it with `t3 service status`, `install`, `update`, and `uninstall`.
