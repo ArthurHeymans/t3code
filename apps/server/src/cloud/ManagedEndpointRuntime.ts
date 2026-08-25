@@ -61,6 +61,7 @@ export class CloudManagedEndpointRuntime extends Context.Service<
     ) => Effect.Effect<CloudManagedEndpointRuntimeStatus>;
     readonly recoveryRequests: Stream.Stream<RelayManagedEndpointRuntimeConfig>;
     readonly requestRecovery: (config: RelayManagedEndpointRuntimeConfig) => Effect.Effect<void>;
+    readonly withLinkStateLock: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   }
 >()("t3/cloud/ManagedEndpointRuntime/CloudManagedEndpointRuntime") {}
 
@@ -109,6 +110,7 @@ export const make = Effect.gen(function* () {
   const desiredConfigRef = yield* Ref.make<RelayManagedEndpointRuntimeConfig | null>(null);
   const recoveryRequests = yield* PubSub.sliding<RelayManagedEndpointRuntimeConfig>(1);
   const reconcileSemaphore = yield* Semaphore.make(1);
+  const linkStateSemaphore = yield* Semaphore.make(1);
   let reconcileConfig: CloudManagedEndpointRuntime["Service"]["applyConfig"];
 
   const stopActive = Effect.gen(function* () {
@@ -312,6 +314,7 @@ export const make = Effect.gen(function* () {
     applyConfig,
     recoveryRequests: Stream.fromPubSub(recoveryRequests),
     requestRecovery: (config) => PubSub.publish(recoveryRequests, config).pipe(Effect.asVoid),
+    withLinkStateLock: linkStateSemaphore.withPermits(1),
   });
 
   const initialConfig = yield* readRuntimeConfig.pipe(

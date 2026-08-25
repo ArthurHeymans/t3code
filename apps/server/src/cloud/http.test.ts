@@ -219,6 +219,7 @@ describe("reconcileDesiredCloudLink", () => {
           applyConfig: unusedSecretStoreOperation,
           recoveryRequests: Stream.empty,
           requestRecovery: () => Effect.void,
+          withLinkStateLock: (effect) => effect,
         } satisfies ManagedEndpointRuntime.CloudManagedEndpointRuntime["Service"]),
       ),
       Effect.provideService(
@@ -325,6 +326,7 @@ describe("releaseManagedTunnelOnShutdown", () => {
               }),
             recoveryRequests: Stream.empty,
             requestRecovery: () => Effect.void,
+            withLinkStateLock: (effect) => effect,
           }),
         ),
         Effect.provideService(
