@@ -1041,6 +1041,116 @@ describe("parseAgentSessionTranscript", () => {
     ]);
   });
 
+  it("removes injected Codex environment records before choosing the thread title", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message:
+              "<environment_context>\n<cwd>/tmp/project</cwd>\n<shell>zsh</shell>\n</environment_context>",
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message:
+              "# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nPrivate project rules\n</INSTRUCTIONS>",
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "Do something here so it looks like a real project.",
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Created the project." }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Do something here so it looks like a real project.");
+    expect(thread?.messages.map((message) => message.text)).toEqual([
+      "Do something here so it looks like a real project.",
+      "Created the project.",
+    ]);
+  });
+
+  it("removes injected Codex context from fallback response messages", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "<environment_context>\n<cwd>/tmp/project</cwd>\n</environment_context>",
+              },
+            ],
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Initialize Git and add a README." }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Initialize Git and add a README.");
+    expect(thread?.messages.map((message) => message.text)).toEqual([
+      "Initialize Git and add a README.",
+    ]);
+  });
+
+  it("preserves a real prompt that follows injected context in the same Codex message", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message:
+              "<environment_context>\n<cwd>/tmp/project</cwd>\n</environment_context>\n\nCreate a useful project.",
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Create a useful project.");
+    expect(thread?.messages.map((message) => message.text)).toEqual(["Create a useful project."]);
+  });
+
   it("skips sessions without a visible user message", () => {
     const thread = AgentSessionScanner.parseAgentSessionTranscript({
       contents: JSON.stringify({

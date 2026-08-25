@@ -171,6 +171,18 @@ function normalizeTimestamp(value: string | undefined, fallback: string): string
   return Option.isSome(parsed) ? DateTime.formatIso(parsed.value) : fallback;
 }
 
+/** Codex records injected workspace context as user input even though it is not conversation text. */
+function visibleCodexUserText(value: string): string {
+  return value
+    .replaceAll(/<environment_context>[\s\S]*?<\/environment_context>/gu, "")
+    .replaceAll(/<user_instructions>[\s\S]*?<\/user_instructions>/gu, "")
+    .replaceAll(
+      /# AGENTS\.md instructions for[^\r\n]*\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/gu,
+      "",
+    )
+    .trim();
+}
+
 /** Keep visible user and assistant text while ignoring tools, reasoning, and malformed records. */
 export function parseAgentSessionTranscript(input: {
   readonly contents: string;
@@ -220,7 +232,7 @@ export function parseAgentSessionTranscript(input: {
       continue;
     }
     if (record.type === "event_msg" && record.payload?.type === "user_message") {
-      const text = record.payload.message?.trim() ?? "";
+      const text = visibleCodexUserText(record.payload.message ?? "");
       if (text.length === 0) continue;
       hasExplicitCodexUserMessages = true;
       messages.push({
@@ -239,7 +251,9 @@ export function parseAgentSessionTranscript(input: {
       continue;
     }
 
-    const text = extractText(record.payload.content);
+    const extractedText = extractText(record.payload.content);
+    const text =
+      record.payload.role === "user" ? visibleCodexUserText(extractedText) : extractedText;
     if (text.length === 0) continue;
     messages.push({
       role: record.payload.role,
