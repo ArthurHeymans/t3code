@@ -42,7 +42,12 @@ export function toSafeThreadAttachmentSegment(threadId: string): string | null {
 
 export function attachmentFileExtension(fileName: string): string {
   const extension = NodePath.extname(fileName).toLowerCase();
-  return /^\.[a-z0-9]{1,10}$/.test(extension) ? extension : ".bin";
+  // ".part" is reserved for in-flight uploads; a stored "archive.part" would
+  // look stale to sweepStalePendingAttachments and get deleted.
+  if (extension === ".part" || !/^\.[a-z0-9]{1,10}$/.test(extension)) {
+    return ".bin";
+  }
+  return extension;
 }
 
 function attachmentIdExtensionSuffix(extension: string | undefined): string {

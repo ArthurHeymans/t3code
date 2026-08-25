@@ -210,11 +210,15 @@ export type ChatFileAttachment = typeof ChatFileAttachment.Type;
  * to introduce a type without making older readers fail to decode the whole
  * message. Decoders keep the shared base fields; consumers skip these or render
  * them as unsupported. Mirrors how `OrchestrationThreadActivity` keeps `kind`
- * open. Union order matters: known members decode first, so this only catches
- * genuinely unknown types.
+ * open. The known discriminators are excluded so a malformed image or file
+ * attachment fails its own schema instead of sliding through here with its
+ * size and mime constraints unchecked.
  */
 export const ChatUnknownAttachment = Schema.Struct({
-  type: TrimmedNonEmptyString.check(Schema.isMaxLength(50)),
+  type: TrimmedNonEmptyString.check(
+    Schema.isMaxLength(50),
+    Schema.isPattern(/^(?!(?:image|file)$)/),
+  ),
   id: ChatAttachmentId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
   mimeType: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),

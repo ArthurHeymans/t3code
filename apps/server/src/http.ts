@@ -62,7 +62,8 @@ export function downloadContentDisposition(fileName?: string): string {
   if (fileName === undefined) {
     return "attachment";
   }
-  const sanitized = fileName.replace(/[\u0000-\u001f"\\]/g, "_");
+  // toWellFormed: encodeURIComponent throws URIError on unpaired surrogates.
+  const sanitized = fileName.toWellFormed().replace(/[\u0000-\u001f"\\]/g, "_");
   const asciiFallback = sanitized.replace(/[^\u0020-\u007e]/g, "_");
   const needsExtended = asciiFallback !== sanitized;
   return `attachment; filename="${asciiFallback}"${

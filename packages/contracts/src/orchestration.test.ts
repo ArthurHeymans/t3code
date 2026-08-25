@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
 import {
@@ -28,6 +29,7 @@ import {
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
   isProviderSendTurnSupportedImageMimeType,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -334,6 +336,40 @@ it.effect("tolerates attachment types from newer builds when decoding messages",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(payload.attachments?.[0]!.type, "somethingnew");
+  }),
+);
+
+// The tolerant member must not catch malformed known attachments: a file over
+// the size cap or an image with a bad mime has to fail its own schema, not
+// slide through the open one with those constraints unchecked.
+it.effect("rejects malformed known attachment types instead of tolerating them", () =>
+  Effect.gen(function* () {
+    const base = {
+      id: "thread-1-00000000-0000-4000-8000-000000000003-pdf",
+      name: "report.pdf",
+      mimeType: "application/pdf",
+    };
+    const decode = (attachment: unknown) =>
+      decodeOrchestrationMessage({
+        id: "message-1",
+        role: "user",
+        text: "look at this",
+        attachments: [attachment],
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+    const oversizedFile = yield* Effect.exit(
+      decode({ ...base, type: "file", sizeBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES + 1 }),
+    );
+    assert.strictEqual(Exit.isFailure(oversizedFile), true);
+
+    const badMimeImage = yield* Effect.exit(
+      decode({ ...base, type: "image", mimeType: "application/pdf", sizeBytes: 12 }),
+    );
+    assert.strictEqual(Exit.isFailure(badMimeImage), true);
   }),
 );
 

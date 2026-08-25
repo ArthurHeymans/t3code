@@ -103,4 +103,10 @@ describe("downloadContentDisposition", () => {
       `attachment; filename="r_p_rt.pdf"; filename*=UTF-8''r%C3%A9p%C3%B6rt.pdf`,
     );
   });
+
+  it("does not throw on unpaired surrogates in the filename", () => {
+    expect(downloadContentDisposition("bad\ud800name.pdf")).toBe(
+      `attachment; filename="bad_name.pdf"; filename*=UTF-8''bad%EF%BF%BDname.pdf`,
+    );
+  });
 });
