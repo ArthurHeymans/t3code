@@ -2,6 +2,7 @@ import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
 import * as Config from "effect/Config";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -278,8 +279,10 @@ export const ApiLive = Api.make(
                 ),
               ),
             ),
-            Effect.catch((cause) =>
-              Effect.logWarning("Failed to prune expired relay state", { cause }),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Failed to prune expired relay state", { cause }),
             ),
           ),
           ManagedEndpointReaper.ManagedEndpointReaper.pipe(
@@ -289,8 +292,10 @@ export const ApiLive = Api.make(
                 ? Effect.logInfo("Finished managed tunnel cleanup", result)
                 : Effect.void,
             ),
-            Effect.catch((cause) =>
-              Effect.logWarning("Failed to clean up inactive managed tunnels", { cause }),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Failed to clean up inactive managed tunnels", { cause }),
             ),
           ),
         ],

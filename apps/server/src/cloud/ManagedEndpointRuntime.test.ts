@@ -84,18 +84,21 @@ describe("CloudManagedEndpointRuntime", () => {
     expect(
       ManagedEndpointRuntime.isRetryableManagedEndpointRuntimeStatus({
         status: "failed",
+        failure: "not-installed",
         reason: "The relay client is not installed.",
       }),
     ).toBe(true);
     expect(
       ManagedEndpointRuntime.isRetryableManagedEndpointRuntimeStatus({
         status: "failed",
+        failure: "spawn-failed",
         reason: "spawn failed",
       }),
     ).toBe(true);
     expect(
       ManagedEndpointRuntime.isRetryableManagedEndpointRuntimeStatus({
         status: "failed",
+        failure: "unsupported-platform",
         reason: "Relay client is unsupported on linux-arm.",
       }),
     ).toBe(false);
@@ -442,6 +445,7 @@ describe("CloudManagedEndpointRuntime", () => {
       expect(status).toEqual({
         status: "failed",
         providerKind: "cloudflare_tunnel",
+        failure: "not-installed",
         reason: "The relay client is not installed.",
       });
       expect(spawn).not.toHaveBeenCalled();
