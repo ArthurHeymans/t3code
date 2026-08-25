@@ -537,13 +537,29 @@ const relayClientRequest = <A>(
     HttpClientRequest.bearerToken(input.token),
     HttpClientRequest.bodyJson(input.payload),
     Effect.flatMap(dependencies.httpClient.execute),
-    Effect.flatMap(HttpClientResponse.filterStatusOk),
+    Effect.flatMap((response) =>
+      Effect.gen(function* () {
+        if (response.status === 401 || response.status === 403) {
+          return yield* new EnvironmentHttpUnauthorizedError({
+            message: "T3 Connect rejected the stored environment credential.",
+          });
+        }
+        if (response.status === 409) {
+          return yield* new EnvironmentHttpConflictError({
+            message: "T3 Connect rejected the current environment link.",
+          });
+        }
+        return yield* HttpClientResponse.filterStatusOk(response);
+      }),
+    ),
     Effect.flatMap(HttpClientResponse.schemaBodyJson(input.schema)),
-    Effect.mapError(
-      (cause) =>
-        new EnvironmentHttpInternalServerError({
-          message: `T3 Connect relay request failed: ${String(cause)}`,
-        }),
+    Effect.mapError((cause) =>
+      cause._tag === "EnvironmentHttpUnauthorizedError" ||
+      cause._tag === "EnvironmentHttpConflictError"
+        ? cause
+        : new EnvironmentHttpInternalServerError({
+            message: `T3 Connect relay request failed: ${String(cause)}`,
+          }),
     ),
     withRelayClientTracing,
   );

@@ -624,6 +624,8 @@ export const makeServerLayer = Layer.unwrap(
                 Effect.retry({
                   while: (error) =>
                     error._tag !== "EnvironmentHttpBadRequestError" &&
+                    error._tag !== "EnvironmentHttpUnauthorizedError" &&
+                    error._tag !== "EnvironmentHttpConflictError" &&
                     (error._tag !== "EnvironmentCloudEndpointUnavailableError" ||
                       CloudManagedEndpointRuntime.isRetryableManagedEndpointRuntimeStatus(
                         error.endpointRuntimeStatus,
