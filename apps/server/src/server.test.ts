@@ -2607,14 +2607,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
         null,
       ]);
-      assert.deepEqual(requestedRecoveryConfigs, [
-        {
-          providerKind: "cloudflare_tunnel",
-          connectorToken: "connector-token",
-          tunnelId: "tunnel-id",
-          tunnelName: "tunnel-name",
-        },
-      ]);
+      assert.deepEqual(requestedRecoveryConfigs, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
