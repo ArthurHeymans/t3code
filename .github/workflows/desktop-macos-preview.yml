@@ -7,8 +7,11 @@ on:
 permissions:
   contents: read
 
+# Build events and cleanup events use separate groups: a push must cancel a
+# stale in-flight build, but must never cancel a cleanup run mid-delete. The
+# publish job re-checks PR state before uploading to cover the reverse race.
 concurrency:
-  group: desktop-macos-preview-${{ github.event.pull_request.number }}
+  group: desktop-macos-preview-${{ github.event.pull_request.number }}-${{ contains(fromJSON('["closed", "unlabeled"]'), github.event.action) && 'cleanup' || 'build' }}
   cancel-in-progress: true
 
 jobs:
@@ -141,6 +144,17 @@ jobs:
 
           tag="desktop-preview"
 
+          # The build ran for many minutes. If the PR closed or lost the label
+          # meanwhile, cleanup already ran in its own concurrency group, so
+          # publishing now would resurrect a deleted download.
+          pr_state="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,labels \
+            --jq '.state + " " + (.labels | map(.name) | contains(["preview:mac"]) | tostring)')"
+          if [[ "$pr_state" != "OPEN true" ]]; then
+            echo "PR closed or preview label removed while building. Skipping publish."
+            exit 0
+          fi
+
           dmg_path="$(find release -type f -name '*.dmg' -print -quit)"
           if [[ -z "$dmg_path" ]]; then
             echo "No DMG found in the downloaded artifact." >&2
@@ -171,6 +185,7 @@ jobs:
           echo "download_url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
 
       - name: Comment download link
+        if: steps.upload.outputs.download_url != ''
         uses: actions/github-script@v8
         env:
           DOWNLOAD_URL: ${{ steps.upload.outputs.download_url }}
