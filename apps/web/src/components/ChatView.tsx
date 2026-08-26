@@ -18,6 +18,7 @@ import {
   type TurnId,
   type KeybindingCommand,
   OrchestrationThreadActivity,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   ProviderInteractionMode,
   ProviderDriverKind,
   RuntimeMode,
@@ -5459,7 +5460,10 @@ function ChatViewContent(props: ChatViewProps) {
     } = sendCtx;
     const composerImages =
       directAnnotation?.image &&
-      !sendContextImages.some((image) => image.id === directAnnotation.image?.id)
+      !sendContextImages.some((image) => image.id === directAnnotation.image?.id) &&
+      // A full composer (e.g. 8 files) cannot take the annotation screenshot;
+      // over the cap the server rejects the whole turn.
+      sendContextImages.length + composerFiles.length < PROVIDER_SEND_TURN_MAX_ATTACHMENTS
         ? [...sendContextImages, directAnnotation.image]
         : sendContextImages;
     const composerPreviewAnnotations =

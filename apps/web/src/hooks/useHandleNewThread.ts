@@ -155,11 +155,15 @@ export function useNewThreadHandler() {
           composerDraftHasUserContent(getComposerDraft(carryContentSourceDraftId))
         ) {
           moveComposerPromptAndImages(carryContentSourceDraftId, destinationDraftId);
-          const remainingFiles = getComposerDraft(carryContentSourceDraftId)?.files ?? [];
-          if (remainingFiles.length > 0) {
+          // The move caps at the destination's free slots and skips
+          // duplicates, so images and files can both stay behind.
+          const remainingDraft = getComposerDraft(carryContentSourceDraftId);
+          const remainingCount =
+            (remainingDraft?.files.length ?? 0) + (remainingDraft?.images.length ?? 0);
+          if (remainingCount > 0) {
             toastManager.add({
               type: "warning",
-              title: `${remainingFiles.length} file${remainingFiles.length === 1 ? " stayed" : "s stayed"} in the original draft`,
+              title: `${remainingCount} attachment${remainingCount === 1 ? " stayed" : "s stayed"} in the original draft`,
               description: "Return to the original draft or attach the files again.",
             });
           }

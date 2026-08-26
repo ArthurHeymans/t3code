@@ -774,20 +774,31 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const nonPersistedComposerImageIds = composerDraft.nonPersistedImageIds;
   const uploadsByImageId = useAttachmentUploadStore((state) => state.uploadsByImageId);
   const needsReattachFileCount = composerFiles.filter(composerFileNeedsReattach).length;
+  // On a server without file support there is no paperclip, so "attach again"
+  // is advice the UI cannot back up; removing is the only recovery there.
+  const canReattachFiles = maxFileAttachmentBytes !== null;
   const attachmentBlockReason = supportsAttachmentUploads
     ? needsReattachFileCount > 0
       ? needsReattachFileCount === 1
-        ? "Attach the interrupted file again or remove it"
-        : "Attach the interrupted files again or remove them"
+        ? canReattachFiles
+          ? "Attach the interrupted file again or remove it"
+          : "Remove the interrupted file to send"
+        : canReattachFiles
+          ? "Attach the interrupted files again or remove them"
+          : "Remove the interrupted files to send"
       : attachmentUploadBlockReason({
           imageIds: [...composerImages, ...composerFiles].map((attachment) => attachment.id),
           uploadsByImageId,
           environmentId,
         })
-    : // Retained files cannot upload while the capability is gone; sending
-      // would clear the draft, fail server-side, and bounce back.
+    : // Retained files cannot upload while uploads are unavailable; sending
+      // would clear the draft, fail server-side, and bounce back. Until the
+      // capability answer arrives the wording stays neutral: the server may
+      // well support files.
       composerFiles.length > 0
-      ? "This server does not accept file attachments right now. Remove the files to send."
+      ? attachmentUploadsCapabilityKnown
+        ? "This server does not accept file attachments right now. Remove the files to send."
+        : "Waiting for the server before file attachments can send"
       : null;
   const sendDisabledReason =
     externalSendDisabledReason ?? (activePendingProgress ? null : attachmentBlockReason);
@@ -2390,20 +2401,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         const filesToAppend = appendedFiles.slice(0, capacity);
         const skippedFiles = appendedFiles.slice(capacity);
         unrestoredFileNames = skippedFiles.map((file) => file.name);
-        for (const file of duplicateFiles) {
-          releasePersistedAttachmentUpload({
-            id: file.id,
-            environmentId,
-            attachmentId: file.attachmentId,
-          });
-        }
-        for (const file of skippedFiles) {
-          if (file.uploadedAttachmentId) {
+        // A non-durable take can resurrect the stash entry after a reload;
+        // deleting these uploads would leave it pointing at nothing.
+        if (durable) {
+          for (const file of duplicateFiles) {
             releasePersistedAttachmentUpload({
               id: file.id,
               environmentId,
-              attachmentId: file.uploadedAttachmentId,
+              attachmentId: file.attachmentId,
             });
+          }
+          for (const file of skippedFiles) {
+            if (file.uploadedAttachmentId) {
+              releasePersistedAttachmentUpload({
+                id: file.id,
+                environmentId,
+                attachmentId: file.uploadedAttachmentId,
+              });
+            }
           }
         }
         const restoredFiles = [...markerReplacements, ...filesToAppend];
