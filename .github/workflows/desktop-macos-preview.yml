@@ -12,7 +12,9 @@ permissions:
 # publish job re-checks PR state before uploading to cover the reverse race.
 concurrency:
   group: desktop-macos-preview-${{ github.event.pull_request.number }}-${{ contains(fromJSON('["closed", "unlabeled"]'), github.event.action) && 'cleanup' || 'build' }}
-  cancel-in-progress: true
+  # Cleanup runs must complete. A close event right after an unlabel queues
+  # behind the running cleanup instead of canceling it mid-delete.
+  cancel-in-progress: ${{ !contains(fromJSON('["closed", "unlabeled"]'), github.event.action) }}
 
 jobs:
   # Builds run PR code, so this job keeps a read-only token. Publishing to the
@@ -102,10 +104,11 @@ jobs:
           fi
           printf 'dmg_name=%s\n' "$(basename "${dmg_files[0]}")" >> "$GITHUB_OUTPUT"
 
+      # archive: false uploads the file as its own artifact named after the
+      # file, so the publish job downloads by *.dmg pattern, not by name.
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v7
         with:
-          name: macos-preview-dmg
           path: release/*.dmg
           if-no-files-found: error
           archive: false
@@ -129,7 +132,8 @@ jobs:
       - name: Download macOS DMG
         uses: actions/download-artifact@v8
         with:
-          name: macos-preview-dmg
+          pattern: "*.dmg"
+          merge-multiple: true
           path: release
 
       - id: upload
