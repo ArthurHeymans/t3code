@@ -83,7 +83,10 @@ export async function verifyPersistedAttachmentUpload<A, E>(input: {
       environmentId: input.environmentId,
       input: { resource: { _tag: "attachment", attachmentId: input.attachmentId } },
     }),
-    { reportFailure: false, reportDefect: false },
+    // `refresh` forces a server round trip: the asset URL query atom caches
+    // results (SWR), so a retry right after a transient failure would
+    // otherwise re-observe the cached failure and never ask the server.
+    { reportFailure: false, reportDefect: false, refresh: true },
   );
   if (result._tag === "Success") {
     return { status: "verified" };
