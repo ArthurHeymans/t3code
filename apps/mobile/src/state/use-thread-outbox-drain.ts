@@ -215,10 +215,12 @@ export async function recoverEditedCreationAfterDelivery(
     // state stays recoverable.
     await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
     appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+    // Only settings the queued message actually carries: spreading explicit
+    // undefined would clear choices the user already made on the draft.
     updateComposerDraftSettings(draftKey, {
-      modelSelection: kept.modelSelection,
-      runtimeMode: kept.runtimeMode,
-      interactionMode: kept.interactionMode,
+      ...(kept.modelSelection !== undefined ? { modelSelection: kept.modelSelection } : {}),
+      ...(kept.runtimeMode !== undefined ? { runtimeMode: kept.runtimeMode } : {}),
+      ...(kept.interactionMode !== undefined ? { interactionMode: kept.interactionMode } : {}),
     });
     // The append only schedules a debounced write; the queue entry is the
     // only durable copy until the draft lands, so flush before removing.

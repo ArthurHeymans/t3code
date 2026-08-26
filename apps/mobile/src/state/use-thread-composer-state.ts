@@ -378,14 +378,16 @@ export function useThreadComposerState() {
     const result = await pasteComposerClipboard({
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
     });
-    if (result.images.length > 0) {
-      appendComposerDraftAttachments(threadKey, result.images);
-    }
+    const rejectedPasteCount = appendComposerDraftAttachments(threadKey, result.images);
     if (result.text) {
       appendComposerDraftText(threadKey, result.text);
     }
     if (result.error) {
       setPendingConnectionError(result.error);
+    } else if (rejectedPasteCount > 0) {
+      setPendingConnectionError(
+        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+      );
     }
   }, [composerDrafts, selectedThreadShell]);
 
