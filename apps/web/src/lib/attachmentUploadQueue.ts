@@ -8,10 +8,16 @@ import {
   deletePendingAttachmentUpload,
   runAttachmentUploadCycle,
   verifyPersistedAttachmentUpload,
+  type PersistedAttachmentVerification,
 } from "@t3tools/client-runtime/state/attachments";
 import { create } from "zustand";
 
-import type { ComposerFileAttachment, ComposerImageAttachment } from "../composerDraftStore";
+import {
+  useComposerDraftStore,
+  type ComposerFileAttachment,
+  type ComposerImageAttachment,
+  type ComposerThreadTarget,
+} from "../composerDraftStore";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { assetEnvironment } from "../state/assets";
 import { attachmentEnvironment } from "../state/attachments";
@@ -32,6 +38,11 @@ export const useAttachmentUploadStore = create<AttachmentUploadStore>(() => ({
 interface UploadJob {
   readonly image: ComposerImageAttachment | ComposerFileAttachment;
   readonly environmentId: EnvironmentId;
+  /**
+   * The draft that owns this file, so a completion can persist its upload
+   * ids even when no composer is mounted to observe it.
+   */
+  readonly draftTarget?: ComposerThreadTarget;
   readonly previous?: ReadyAttachmentUpload;
   /**
    * The draft's persisted server-side upload, to verify instead of re-upload.
@@ -70,6 +81,22 @@ function clearUploadState(imageId: string): void {
 
 export function readAttachmentUpload(imageId: string): AttachmentUploadState | undefined {
   return useAttachmentUploadStore.getState().uploadsByImageId[imageId];
+}
+
+/**
+ * Persists a finished upload's ids onto the draft that owns the file. The
+ * mounted composer effect performs the same write for live UI updates, but a
+ * background completion (user navigated away, upload finished, reload) must
+ * not depend on a mounted composer to survive. `setFileUpload` no-ops when
+ * the draft row is gone or already carries these ids.
+ */
+function stampDraftFileUpload(job: UploadJob, attachmentId: string): void {
+  if (job.draftTarget === undefined || job.image.type !== "file") {
+    return;
+  }
+  useComposerDraftStore
+    .getState()
+    .setFileUpload(job.draftTarget, job.image.id, job.environmentId, attachmentId);
 }
 
 function deletePendingUpload(environmentId: EnvironmentId, attachmentId: string): void {
@@ -129,6 +156,7 @@ async function runUpload(job: UploadJob): Promise<void> {
         environmentId: job.environmentId,
         attachmentId: job.persistedAttachmentId,
       });
+      stampDraftFileUpload(job, job.persistedAttachmentId);
       return;
     }
     if (verification.status === "failed" || !job.image.file) {
@@ -230,6 +258,7 @@ async function runUpload(job: UploadJob): Promise<void> {
       environmentId: job.environmentId,
       attachmentId: result.attachmentId,
     });
+    stampDraftFileUpload(job, result.attachmentId);
     if (job.previous) {
       deletePendingUpload(job.previous.environmentId, job.previous.attachmentId);
     }
@@ -295,6 +324,8 @@ function pumpUploads(): void {
 export function startAttachmentUpload(input: {
   readonly environmentId: EnvironmentId;
   readonly image: ComposerImageAttachment | ComposerFileAttachment;
+  /** Draft that owns the file; lets a background completion persist its ids. */
+  readonly draftTarget?: ComposerThreadTarget;
 }): void {
   const existingJob = jobsByImageId.get(input.image.id);
   if (existingJob?.environmentId === input.environmentId) {
@@ -332,6 +363,7 @@ export function startAttachmentUpload(input: {
   const job: UploadJob = {
     image: input.image,
     environmentId: input.environmentId,
+    ...(input.draftTarget !== undefined ? { draftTarget: input.draftTarget } : {}),
     ...(previous ? { previous } : {}),
     ...(input.image.type === "file" &&
     input.image.uploadEnvironmentId === input.environmentId &&
@@ -424,6 +456,7 @@ export function releasePersistedAttachmentUpload(input: {
 export function retryAttachmentUpload(input: {
   readonly environmentId: EnvironmentId;
   readonly image: ComposerImageAttachment | ComposerFileAttachment;
+  readonly draftTarget?: ComposerThreadTarget;
 }): void {
   const previous = readAttachmentUpload(input.image.id);
   cancelAttachmentUpload(input.image.id);
@@ -439,6 +472,23 @@ export function retryAttachmentUpload(input: {
     clearUploadState(input.image.id);
   }
   startAttachmentUpload(input);
+}
+
+/**
+ * Checks that a stashed upload still exists on the server. Pending uploads
+ * are swept after 24 hours, so a stash restore asks first instead of handing
+ * the composer a dead reference.
+ */
+export function verifyStashedAttachmentUpload(input: {
+  readonly environmentId: EnvironmentId;
+  readonly attachmentId: string;
+}): Promise<PersistedAttachmentVerification> {
+  return verifyPersistedAttachmentUpload({
+    registry: appAtomRegistry,
+    createAssetUrl: assetEnvironment.createUrl,
+    environmentId: input.environmentId,
+    attachmentId: input.attachmentId,
+  });
 }
 
 export async function awaitAttachmentUploads(imageIds: ReadonlyArray<string>): Promise<void> {

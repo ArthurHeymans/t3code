@@ -1,7 +1,12 @@
 import { EnvironmentId } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { ComposerFileAttachment, ComposerImageAttachment } from "../composerDraftStore";
+import {
+  DraftId,
+  useComposerDraftStore,
+  type ComposerFileAttachment,
+  type ComposerImageAttachment,
+} from "../composerDraftStore";
 
 const mocks = vi.hoisted(() => ({
   createAssetUrl: vi.fn(),
@@ -250,6 +255,36 @@ describe("attachmentUploadQueue", () => {
         sizeBytes: 3,
       },
     ]);
+  });
+
+  it("persists a background completion's ids to the draft with no composer mounted", async () => {
+    const draftId = DraftId.make("draft-background-upload");
+    const file = makeFile("background");
+    const draftStore = useComposerDraftStore.getState();
+    draftStore.addFiles(draftId, [file]);
+    try {
+      startAttachmentUpload({
+        environmentId: firstEnvironment,
+        image: file,
+        draftTarget: draftId,
+      });
+      await Promise.resolve();
+
+      // No composer effect is subscribed; only the queue can stamp the draft.
+      const settled = awaitAttachmentUploads([file.id]);
+      TestXmlHttpRequest.requests[0]!.complete();
+      await settled;
+
+      expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.files).toMatchObject([
+        {
+          id: file.id,
+          uploadedAttachmentId: "pending-environment-1-background.pdf",
+          uploadEnvironmentId: firstEnvironment,
+        },
+      ]);
+    } finally {
+      useComposerDraftStore.getState().clearComposerContent(draftId);
+    }
   });
 
   it("verifies an uploaded file reference before restoring it", async () => {

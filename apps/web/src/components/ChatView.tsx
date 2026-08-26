@@ -5712,7 +5712,11 @@ function ChatViewContent(props: ChatViewProps) {
     sendInFlightRef.current = true;
     if (supportsAttachmentUploads && composerAttachmentsSnapshot.length > 0) {
       for (const attachment of composerAttachmentsSnapshot) {
-        startAttachmentUpload({ environmentId, image: attachment });
+        startAttachmentUpload({
+          environmentId,
+          image: attachment,
+          draftTarget: composerDraftTarget,
+        });
       }
       await awaitAttachmentUploads(composerAttachmentsSnapshot.map((attachment) => attachment.id));
       if (getUploadedAttachments({ environmentId, images: composerAttachmentsSnapshot }) === null) {
