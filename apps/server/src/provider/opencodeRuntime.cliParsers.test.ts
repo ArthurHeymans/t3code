@@ -6,6 +6,7 @@ import {
   parseAgentListCliOutput,
   parseModelsCliOutput,
   parseSkillsCliOutput,
+  toOpenCodeFileParts,
 } from "./opencodeRuntime.ts";
 
 describe("parseModelsCliOutput", () => {
@@ -281,5 +282,35 @@ describe("parseSkillsCliOutput", () => {
 
   it("degrades malformed output to an empty skill list", () => {
     NodeAssert.deepEqual(parseSkillsCliOutput("not json"), []);
+  });
+});
+
+describe("toOpenCodeFileParts", () => {
+  const attachment = (mimeType: string) => ({
+    type: "file" as const,
+    id: "thread-1-00000000-0000-4000-8000-000000000001-bin",
+    name: "attachment",
+    mimeType,
+    sizeBytes: 12,
+  });
+
+  it("sends images, text, and PDFs natively and skips formats models reject", () => {
+    const parts = toOpenCodeFileParts({
+      attachments: [
+        attachment("application/pdf"),
+        attachment("text/markdown"),
+        attachment("image/png"),
+        // A ZIP file part makes OpenCode's Anthropic path throw before the
+        // turn starts; it must ride only as the prompt's file path line.
+        attachment("application/zip"),
+        attachment("application/octet-stream"),
+      ],
+      resolveAttachmentPath: () => "/tmp/attachment",
+    });
+
+    NodeAssert.deepEqual(
+      parts.map((part) => part.mime),
+      ["application/pdf", "text/markdown", "image/png"],
+    );
   });
 });

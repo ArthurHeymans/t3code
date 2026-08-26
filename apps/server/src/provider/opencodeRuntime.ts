@@ -345,6 +345,21 @@ export function openCodeQuestionId(
   return header.length > 0 ? `question-${index}-${header}` : `question-${index}`;
 }
 
+/**
+ * Mimes OpenCode can hand to a model as a native file part. Anything else
+ * (ZIP, binaries) makes its Anthropic path throw AI_UnsupportedFunctionalityError
+ * before the turn starts, so those attachments ride only as the file path
+ * ProviderService puts in the prompt.
+ */
+export function isOpenCodeNativeFileMime(mimeType: string): boolean {
+  const normalized = mimeType.trim().toLowerCase();
+  return (
+    normalized.startsWith("image/") ||
+    normalized.startsWith("text/") ||
+    normalized === "application/pdf"
+  );
+}
+
 export function toOpenCodeFileParts(input: {
   readonly attachments: ReadonlyArray<ChatAttachment> | undefined;
   readonly resolveAttachmentPath: (attachment: ChatAttachment) => string | null;
@@ -352,6 +367,9 @@ export function toOpenCodeFileParts(input: {
   const parts: Array<FilePartInput> = [];
 
   for (const attachment of input.attachments ?? []) {
+    if (!isOpenCodeNativeFileMime(attachment.mimeType)) {
+      continue;
+    }
     const attachmentPath = input.resolveAttachmentPath(attachment);
     if (!attachmentPath) {
       continue;
