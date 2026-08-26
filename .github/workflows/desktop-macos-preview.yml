@@ -2,25 +2,31 @@ name: Desktop macOS Preview
 
 on:
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [labeled, unlabeled, synchronize, reopened, closed]
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: desktop-macos-preview-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
+  # Builds run PR code, so this job keeps a read-only token. Publishing to the
+  # release happens in the publish job below, which never checks out PR code.
   build:
     name: Build macOS Apple Silicon preview
     if: >-
+      github.event.action != 'closed' &&
+      github.event.action != 'unlabeled' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, 'preview:mac') &&
       (github.event.action != 'labeled' || github.event.label.name == 'preview:mac')
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 30
+    outputs:
+      dmg_name: ${{ steps.build.outputs.dmg_name }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -93,23 +99,84 @@ jobs:
           fi
           printf 'dmg_name=%s\n' "$(basename "${dmg_files[0]}")" >> "$GITHUB_OUTPUT"
 
-      - id: upload
-        name: Upload macOS DMG
+      - name: Upload macOS DMG
         uses: actions/upload-artifact@v7
         with:
+          name: macos-preview-dmg
           path: release/*.dmg
           if-no-files-found: error
           archive: false
           overwrite: true
           retention-days: 7
 
+  # Release assets download without a GitHub account, unlike workflow
+  # artifacts. All preview DMGs live on one rolling prerelease tagged
+  # "desktop-preview" (release.yml only matches v*.*.* tags), so publishing a
+  # build never notifies release watchers. This job holds the write token and
+  # only handles the artifact the build job produced; it never runs PR code.
+  publish:
+    name: Publish anonymous download
+    needs: build
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Download macOS DMG
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-preview-dmg
+          path: release
+
+      - id: upload
+        name: Upload DMG to the rolling preview release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          tag="desktop-preview"
+
+          dmg_path="$(find release -type f -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg_path" ]]; then
+            echo "No DMG found in the downloaded artifact." >&2
+            exit 1
+          fi
+
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # "|| true" tolerates a concurrent publish job creating the
+            # release between the check and the create.
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$DEFAULT_BRANCH" \
+              --prerelease \
+              --title "Desktop preview builds" \
+              --notes "Rolling unsigned desktop builds from pull requests with a preview label. Each download is removed when its pull request closes or loses the label. Install stable builds from the latest release instead." \
+              || true
+          fi
+
+          # Keep one DMG per PR: drop this PR's older builds first. The
+          # trailing dot keeps -pr.12. from matching -pr.123. builds.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+            | { grep -F -- "-pr.${PR_NUMBER}." || true; } \
+            | while read -r asset; do
+                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+              done
+
+          gh release upload "$tag" "$dmg_path" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "download_url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
+
       - name: Comment download link
         uses: actions/github-script@v8
         env:
-          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
-          DMG_NAME: ${{ steps.build.outputs.dmg_name }}
+          DOWNLOAD_URL: ${{ steps.upload.outputs.download_url }}
+          DMG_NAME: ${{ needs.build.outputs.dmg_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PREVIEW_VERSION: ${{ steps.version.outputs.version }}
+          PREVIEW_VERSION: ${{ needs.build.outputs.version }}
         with:
           script: |
             const { data: pullRequest } = await github.rest.pulls.get({
@@ -127,7 +194,7 @@ jobs:
               marker,
               "### macOS preview",
               "",
-              `[Download Apple Silicon DMG](${process.env.ARTIFACT_URL})`,
+              `[Download Apple Silicon DMG](${process.env.DOWNLOAD_URL})`,
               "",
               `Version: ${process.env.PREVIEW_VERSION}`,
               `Commit: ${process.env.HEAD_SHA.slice(0, 7)}`,
@@ -137,7 +204,7 @@ jobs:
               `xattr -d com.apple.quarantine ~/Downloads/${process.env.DMG_NAME}`,
               "```",
               "",
-              "The download requires GitHub access and expires after 7 days.",
+              "No GitHub sign-in is needed. The download stays available until this PR closes or the preview label is removed.",
             ].join("\n");
 
             const { data: comments } = await github.rest.issues.listComments({
@@ -163,3 +230,65 @@ jobs:
                 body,
               });
             }
+
+  # The way out: closing the PR or removing the label deletes its DMG from the
+  # rolling release and updates the PR comment to say so.
+  cleanup:
+    name: Remove preview download
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      ((github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'preview:mac')) ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'preview:mac'))
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Delete this PR's preview assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          tag="desktop-preview"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "No preview release exists. Nothing to clean up."
+            exit 0
+          fi
+
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+            | { grep -F -- "-pr.${PR_NUMBER}." || true; } \
+            | while read -r asset; do
+                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+              done
+
+      - name: Mark the preview comment as removed
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = "<!-- desktop-macos-preview -->";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+            if (!existing) {
+              return;
+            }
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: [
+                marker,
+                "### macOS preview",
+                "",
+                "The preview download was removed because this PR closed or the preview label was removed.",
+              ].join("\n"),
+            });
