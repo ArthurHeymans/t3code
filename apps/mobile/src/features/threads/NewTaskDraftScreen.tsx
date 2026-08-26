@@ -459,6 +459,7 @@ export function NewTaskDraftScreen(props: {
     shareImportDraftBackupRef.current.set(importKey, draftBackup);
     const importToken = Symbol(importKey);
     let didReserveShare = false;
+    let didConsumeShare = false;
     let needsDraftRestore = false;
     activeShareImportTokenRef.current = importToken;
     setImportingShareKey(importKey);
@@ -499,6 +500,7 @@ export function NewTaskDraftScreen(props: {
         return;
       }
       await consumeShare(shareId);
+      didConsumeShare = true;
       // The consumed inbox draft was the last owner of files that never made
       // it into the composer draft (unsupported server, oversize, limit
       // skips). Release them before any early return: an unmount or a
@@ -548,12 +550,15 @@ export function NewTaskDraftScreen(props: {
                   try {
                     if (needsDraftRestore) {
                       // The restore drops the share's merged-in attachments
-                      // from the draft; with the inbox entry already consumed
-                      // nothing references their files, so sweep them.
+                      // from the draft. Sweep them only when the inbox entry
+                      // was consumed: before that, the inbox still references
+                      // these files and must keep them for a later import.
                       const mergedAttachments = getComposerDraftSnapshot(draftKey).attachments;
                       await restoreComposerDraftSnapshot(draftKey, draftBackup);
                       needsDraftRestore = false;
-                      scheduleUnusedComposerAttachmentCleanup(mergedAttachments);
+                      if (didConsumeShare) {
+                        scheduleUnusedComposerAttachmentCleanup(mergedAttachments);
+                      }
                     }
                     if (didReserveShare) {
                       await releaseShareReservation(shareId, {

@@ -43,7 +43,7 @@ import {
   type QueuedThreadMessage,
   type ThreadOutboxCommandStage,
 } from "./thread-outbox-model";
-import { threadEnvironment } from "./threads";
+import { environmentThreadShells, threadEnvironment } from "./threads";
 import {
   appendComposerDraftAttachments,
   composerDraftsAtom,
@@ -202,12 +202,24 @@ export async function recoverEditedCreationAfterDelivery(
     return;
   }
   const draftKey = scopedThreadKey(kept.environmentId, kept.threadId);
-  // Merge before removing: the draft's reference keeps the removal sweep from
-  // deleting the attachment files. allowOverflow mirrors the send-failure
-  // restore; the send path refuses over-cap drafts, so the state stays
-  // recoverable.
-  await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
-  appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+  try {
+    // Merge before removing: the draft's reference keeps the removal sweep
+    // from deleting the attachment files. allowOverflow mirrors the
+    // send-failure restore; the send path refuses over-cap drafts, so the
+    // state stays recoverable.
+    await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
+    appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+    // The append only schedules a debounced write; the queue entry is the
+    // only durable copy until the draft lands, so flush before removing.
+    await flushComposerDrafts();
+  } catch (error) {
+    // The entry stays queued; the next drain's duplicate-creation removal
+    // still releases its files, matching the behavior before this recovery
+    // existed. Better a lost edit on a failing device than a lost edit plus
+    // a wedged queue.
+    console.warn("[thread-outbox] could not hand an edited pending task to the composer", error);
+    return;
+  }
   await removeThreadOutboxMessage(kept).catch((error) => {
     console.warn("[thread-outbox] could not remove recovered pending task", error);
   });
@@ -852,6 +864,25 @@ export function useThreadOutboxDrain(): void {
         // failure/backoff path) rather than sending a payload being edited.
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
           return true;
+        }
+        // The shell state is equally stale: a thread that vanished or went
+        // busy during the await must not receive this dispatch, and a
+        // creation whose thread appeared must be removed, not re-sent. Defer
+        // and let the next pass re-resolve the delivery action.
+        if (deliveryAction === "send") {
+          const liveThread = findThread(
+            appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
+            nextQueuedMessage,
+          );
+          const liveThreadBusy =
+            liveThread?.session?.status === "running" || liveThread?.session?.status === "starting";
+          if (
+            creation === undefined
+              ? liveThread === undefined || liveThreadBusy
+              : liveThread !== undefined
+          ) {
+            return true;
+          }
         }
         return deliveryAction === "remove"
           ? removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")

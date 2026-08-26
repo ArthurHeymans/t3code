@@ -57,6 +57,7 @@ import { vcsEnvironment } from "../../state/vcs";
 import {
   flattenQueuedThreadMessages,
   threadOutboxManager,
+  threadOutboxRevision,
   updateThreadOutboxMessage,
   type QueuedThreadMessage,
 } from "../../state/thread-outbox";
@@ -229,6 +230,9 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   // Mirrors `editingPendingTask` synchronously so the unmount flush cannot act
   // on a task whose editing session already ended this render.
   const editingPendingTaskRef = useRef<QueuedThreadMessage | null>(null);
+  // Outbox revision when this editor session took the task, for the unmount
+  // flush's CAS: a newer accepted write must beat the dismissed session.
+  const editingRevisionRef = useRef(0);
 
   const reset = useCallback(() => {
     setSelectedEnvironmentId(null);
@@ -823,6 +827,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     setSelectedProjectKey(scopedProjectKey(message.environmentId, message.creation.projectId));
     activeEditingMessageId = message.messageId;
     editingPendingTaskRef.current = message;
+    editingRevisionRef.current = threadOutboxRevision(message.messageId);
     setEditingPendingTask(message);
     // Hold the outbox drain off this task while it is open in the editor.
     holdEditingQueuedMessage(message.messageId);
@@ -974,8 +979,10 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
 
       // update() rewrites the task only if it is still queued — a concurrent
-      // delete or delivery wins, so the flush cannot resurrect it.
-      void updateThreadOutboxMessage(message)
+      // delete or delivery wins, so the flush cannot resurrect it. The CAS
+      // revision keeps a dismissed session's stale payload from overwriting
+      // an edit accepted since this session took the task.
+      void updateThreadOutboxMessage(message, editingRevisionRef.current)
         .then(() => {
           // If this task was reopened (possibly in a fresh provider) while
           // the save was in flight, that session owns the draft and the lock.
