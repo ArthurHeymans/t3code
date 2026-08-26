@@ -57,16 +57,18 @@ export function attachmentsToReleaseOnUploadCapabilityLoss(
   );
 }
 
+/**
+ * Whether a paste's files should be claimed as composer attachments instead of
+ * falling through to the default text paste. Deliberately no capacity or
+ * pending-plan-question gate here: `addComposerAttachments` owns those limits
+ * and reports them, while a gate at this layer would swallow the paste with no
+ * feedback.
+ */
 export function shouldHandleComposerAttachmentPaste(input: {
   readonly files: ReadonlyArray<File>;
   readonly plainText: string;
   readonly maxFileAttachmentBytes: number | null;
-  readonly remainingAttachmentSlots: number;
 }): boolean {
-  if (input.remainingAttachmentSlots <= 0) {
-    return false;
-  }
-
   if (input.files.some((file) => classifyComposerAttachmentFile(file) === "image")) {
     return true;
   }

@@ -35,7 +35,6 @@ describe("composer attachment files", () => {
         files: [file],
         plainText: "Copied text",
         maxFileAttachmentBytes: 50 * 1024 * 1024,
-        remainingAttachmentSlots: 1,
       }),
     ).toBe(false);
   });
@@ -45,7 +44,6 @@ describe("composer attachment files", () => {
     const input = {
       files: [file],
       plainText: "",
-      remainingAttachmentSlots: 1,
     };
 
     expect(shouldHandleComposerAttachmentPaste({ ...input, maxFileAttachmentBytes: null })).toBe(
@@ -115,7 +113,6 @@ describe("composer attachment files", () => {
         files: [image],
         plainText: "Image caption",
         maxFileAttachmentBytes: null,
-        remainingAttachmentSlots: 1,
       }),
     ).toBe(true);
   });

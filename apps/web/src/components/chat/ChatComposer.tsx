@@ -2930,19 +2930,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const onComposerPaste = (event: React.ClipboardEvent<HTMLElement>) => {
     const files = Array.from(event.clipboardData.files);
+    // Claimable pastes go through even when plan questions are pending or the
+    // composer is at its attachment limit: `addComposerAttachments` surfaces
+    // those as a toast and a thread error. An early return here would swallow
+    // the paste with no feedback.
     if (
       files.length === 0 ||
       !activeThreadId ||
-      pendingUserInputs.length > 0 ||
       !shouldHandleComposerAttachmentPaste({
         files,
         plainText: event.clipboardData.getData("text/plain"),
         maxFileAttachmentBytes,
-        remainingAttachmentSlots:
-          PROVIDER_SEND_TURN_MAX_ATTACHMENTS -
-          composerImagesRef.current.length -
-          composerFilesRef.current.length -
-          (pendingImageCompressionsRef.current.get(activeThreadId) ?? 0),
       })
     ) {
       return;
