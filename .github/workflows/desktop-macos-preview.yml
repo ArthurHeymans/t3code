@@ -12,9 +12,11 @@ permissions:
 # publish job re-checks PR state before uploading to cover the reverse race.
 concurrency:
   group: desktop-macos-preview-${{ github.event.pull_request.number }}-${{ contains(fromJSON('["closed", "unlabeled"]'), github.event.action) && 'cleanup' || 'build' }}
-  # Cleanup runs must complete. A close event right after an unlabel queues
-  # behind the running cleanup instead of canceling it mid-delete.
-  cancel-in-progress: ${{ !contains(fromJSON('["closed", "unlabeled"]'), github.event.action) }}
+  # Cleanup runs must complete (a close event right after an unlabel queues
+  # behind the running cleanup instead of canceling it mid-delete), and events
+  # that skip the build job, such as adding an unrelated label, must not
+  # cancel an in-flight build either.
+  cancel-in-progress: ${{ !contains(fromJSON('["closed", "unlabeled"]'), github.event.action) && (github.event.action != 'labeled' || github.event.label.name == 'preview:mac') }}
 
 jobs:
   # Builds run PR code, so this job keeps a read-only token. Publishing to the
@@ -169,6 +171,14 @@ jobs:
             exit 1
           fi
 
+          # The filename comes out of the build, which runs PR code. Requiring
+          # this PR's marker keeps a build from clobbering or deleting another
+          # PR's asset, since those names carry a different -pr.N. marker.
+          if [[ "$(basename "$dmg_path")" != *"-pr.${PR_NUMBER}."* ]]; then
+            echo "DMG name '$(basename "$dmg_path")' does not carry this PR's -pr.${PR_NUMBER}. marker. Refusing to publish." >&2
+            exit 1
+          fi
+
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # "|| true" tolerates a concurrent publish job creating the
             # release between the check and the create.
@@ -288,6 +298,17 @@ jobs:
           set -euo pipefail
 
           tag="desktop-preview"
+
+          # A stale cleanup must not delete a download that became valid
+          # again. If the PR is open and labeled once more, the next publish
+          # owns this PR's assets and replaces them itself.
+          if [[ "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,labels \
+            --jq '.state + " " + (.labels | map(.name) | contains(["preview:mac"]) | tostring)')" == "OPEN true" ]]; then
+            echo "PR is open and labeled again. Skipping cleanup."
+            exit 0
+          fi
+
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "No preview release exists. Nothing to clean up."
             exit 0
