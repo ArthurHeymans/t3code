@@ -10,8 +10,8 @@ Images keep their existing 10 MB limit. Files upload directly to the environment
 can read, copy, or edit them by their file path.
 
 On web and desktop, attachments upload as soon as you add them. The send button becomes available
-after every upload finishes. Failed uploads can be retried or removed. On mobile, use the attachment
-button or share a file with T3 Code from another app.
+after every upload finishes. Failed uploads can be retried or removed. On mobile, attachments are
+currently limited to images.
 
 If you reload before a file finishes uploading, the draft keeps the file's name and shows **Attach
 again** next to it. Attach the file again or remove it, then send.
