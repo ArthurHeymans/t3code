@@ -46,7 +46,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     ((message: string, error: unknown) => {
       console.warn(message, error);
     });
-  let loadPromise: Promise<void> | null = null;
+  let loadPromise: Promise<boolean> | null = null;
   let mutationQueue: Promise<void> = Promise.resolve();
   // Monotonic per-message write counter. Every accepted write (enqueue publish
   // or update) bumps it, so a writer that captured a revision before slow work
@@ -72,13 +72,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     options.registry.set(queuedMessagesByThreadKeyAtom, groupQueuedThreadMessages(messages));
   };
 
-  const load = (): Promise<void> => {
+  // Resolves true when hydration completed; false when the read failed (the
+  // next call retries). Destructive callers (the attachment sweep) must not
+  // treat a failed hydration as an empty queue.
+  const load = (): Promise<boolean> => {
     if (loadPromise !== null) {
       return loadPromise;
     }
     loadPromise = serialize(async () => {
       const persistedMessages = await options.storage.load();
       setMessages([...persistedMessages, ...currentMessages()]);
+      return true;
     }).catch((cause) => {
       loadPromise = null;
       warn(
@@ -91,6 +95,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           cause,
         }),
       );
+      return false;
     });
     return loadPromise;
   };
@@ -199,14 +204,22 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // `expectedRevision` makes the removal a compare-and-set too: an edit
   // accepted after the caller decided to remove (restore-to-composer reads
   // the payload it is about to delete) keeps the newer message queued.
-  const remove = (message: QueuedThreadMessage, expectedRevision?: number): Promise<boolean> =>
+  const remove = (
+    message: QueuedThreadMessage,
+    expectedRevision?: number,
+  ): Promise<QueuedThreadMessage | null> =>
     serialize(async () => {
       const revisionChanged = (): boolean =>
         expectedRevision !== undefined &&
         (revisions.get(message.messageId) ?? 0) !== expectedRevision;
       if (revisionChanged()) {
-        return false;
+        return null;
       }
+      // The live payload may carry attachments an accepted update added after
+      // the caller's snapshot; the caller releases files from what actually
+      // leaves the queue.
+      const removed =
+        currentMessages().find((candidate) => candidate.messageId === message.messageId) ?? message;
       try {
         await options.storage.remove(message);
       } catch (cause) {
@@ -222,13 +235,16 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
         // An enqueue replaced this message while the durable remove was in
         // flight; its serialized write lands after this mutation and restores
         // the disk entry. Keep the newer message published.
-        return false;
+        return null;
       }
       setMessages(
         currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
       );
-      revisions.delete(message.messageId);
-      return true;
+      // Tombstone, not delete: a same-id retry restarting at revision 1 would
+      // otherwise match a stale writer's expectedRevision from before the
+      // removal (ABA).
+      bumpRevision(message.messageId);
+      return removed;
     });
 
   const clearEnvironment = (

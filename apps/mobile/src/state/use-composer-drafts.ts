@@ -260,7 +260,12 @@ export async function releaseUnusedComposerAttachmentFiles(
   // land an incomplete snapshot either.
   await waitForComposerDraftsLoaded();
   await flushComposerDrafts();
-  await threadOutboxManager.load();
+  if (!(await threadOutboxManager.load())) {
+    // An unreadable outbox store must not look like an empty queue: deleting
+    // now would take bytes a persisted queued message still needs. Skip the
+    // sweep; the next one retries hydration.
+    return;
+  }
   await flushThreadOutbox();
 
   const { removePersistedComposerAttachmentFile } = await import("../lib/composerImages");

@@ -624,13 +624,15 @@ describe("thread outbox", () => {
     const revision = manager.revisionOf(original.messageId);
     await manager.update(edited);
 
-    await expect(manager.remove(original, revision)).resolves.toBe(false);
+    await expect(manager.remove(original, revision)).resolves.toBe(null);
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
       "environment-1:thread-1": [edited],
     });
     expect(stored.get(original.messageId)).toEqual(edited);
 
-    await expect(manager.remove(edited, manager.revisionOf(edited.messageId))).resolves.toBe(true);
+    await expect(manager.remove(edited, manager.revisionOf(edited.messageId))).resolves.toEqual(
+      edited,
+    );
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
     registry.dispose();
   });
@@ -667,7 +669,7 @@ describe("thread outbox", () => {
     const enqueue = manager.enqueue(retried);
     resumeRemove();
 
-    await expect(removal).resolves.toBe(false);
+    await expect(removal).resolves.toBe(null);
     await enqueue;
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
       "environment-1:thread-1": [retried],

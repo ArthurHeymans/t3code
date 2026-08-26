@@ -325,8 +325,12 @@ export function useThreadComposerState() {
     const result = await pickComposerImages({
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
     });
-    if (result.images.length > 0) {
-      appendComposerDraftAttachments(threadKey, result.images);
+    const rejectedImageCount = appendComposerDraftAttachments(threadKey, result.images);
+    if (!result.error && rejectedImageCount > 0) {
+      Alert.alert(
+        "Could not attach image",
+        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+      );
     }
     if (result.error) {
       setPendingConnectionError(result.error);

@@ -983,10 +983,16 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       // revision keeps a dismissed session's stale payload from overwriting
       // an edit accepted since this session took the task.
       void updateThreadOutboxMessage(message, editingRevisionRef.current)
-        .then(() => {
+        .then((updated) => {
           // If this task was reopened (possibly in a fresh provider) while
           // the save was in flight, that session owns the draft and the lock.
           if (activeEditingMessageId === editing.messageId) {
+            return;
+          }
+          if (!updated) {
+            // A newer write won the CAS; this session's edits live only in
+            // the draft now. Keep the draft and the drain lock, same as the
+            // failure path: reopening the task resumes from the saved draft.
             return;
           }
           clearComposerDraft(pendingTaskDraftKey(editing.messageId));

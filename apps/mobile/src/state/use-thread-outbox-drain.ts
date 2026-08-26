@@ -155,14 +155,6 @@ async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessag
  * retry pass that delivers the newer payload instead of silently dropping it
  * with the old one. Exported for tests.
  */
-/**
- * Creations whose startTurn delivered while their queue entry was open in the
- * editor. The drain's duplicate-creation removal consults this so the edited
- * payload is handed to the new thread's composer instead of discarded.
- * Exported for tests.
- */
-export const creationsDeliveredWhileEditing = new Set<QueuedThreadMessage["messageId"]>();
-
 export async function completeQueuedMessageDelivery(
   queuedMessage: QueuedThreadMessage,
   deliveryRevision: number,
@@ -223,6 +215,11 @@ export async function recoverEditedCreationAfterDelivery(
     // state stays recoverable.
     await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
     appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+    updateComposerDraftSettings(draftKey, {
+      modelSelection: kept.modelSelection,
+      runtimeMode: kept.runtimeMode,
+      interactionMode: kept.interactionMode,
+    });
     // The append only schedules a debounced write; the queue entry is the
     // only durable copy until the draft lands, so flush before removing.
     await flushComposerDrafts();
@@ -725,9 +722,8 @@ export function useThreadOutboxDrain(): void {
       if (outcome === "edited") {
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           // The editor holds the entry with unsaved edits; merging the queue
-          // payload now would duplicate the delivered turn. Mark it so the
-          // eventual duplicate-creation removal recovers the saved edits.
-          creationsDeliveredWhileEditing.add(queuedMessage.messageId);
+          // payload now would duplicate the delivered turn. Once the editor
+          // saves, the duplicate-creation removal below recovers the edits.
           return true;
         }
         // The thread exists now, so the next drain would remove the edited
@@ -906,15 +902,13 @@ export function useThreadOutboxDrain(): void {
           }
         }
         return deliveryAction === "remove"
-          ? creation !== undefined &&
-            creationsDeliveredWhileEditing.has(nextQueuedMessage.messageId)
-            ? // The creation delivered while its entry was open in the
-              // editor; the entry now holds the saved edits. Hand them to
-              // the thread's composer instead of discarding them.
-              recoverEditedCreationAfterDelivery(nextQueuedMessage).then(() => {
-                creationsDeliveredWhileEditing.delete(nextQueuedMessage.messageId);
-                return true;
-              })
+          ? creation !== undefined
+            ? // A creation entry that survived its delivery cleanup either
+              // holds edits (recover them) or the delivered payload (a
+              // recovered duplicate the user can delete). Restart loses any
+              // in-memory distinction, and losing edits is the worse failure,
+              // so recovery is unconditional here.
+              recoverEditedCreationAfterDelivery(nextQueuedMessage).then(() => true)
             : removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
           : creation !== undefined
             ? creationProjectCwd !== null

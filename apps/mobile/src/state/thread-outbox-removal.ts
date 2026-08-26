@@ -18,10 +18,13 @@ export async function removeThreadOutboxMessage(
   message: QueuedThreadMessage,
   expectedRevision?: number,
 ): Promise<boolean> {
-  if (!(await threadOutboxManager.remove(message, expectedRevision))) {
+  const removed = await threadOutboxManager.remove(message, expectedRevision);
+  if (removed === null) {
     return false;
   }
-  scheduleUnusedComposerAttachmentCleanup(message.attachments);
+  // The removed payload, not the caller's snapshot: an accepted update may
+  // have added files the snapshot never saw.
+  scheduleUnusedComposerAttachmentCleanup(removed.attachments);
   return true;
 }
 
