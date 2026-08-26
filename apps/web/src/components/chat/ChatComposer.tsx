@@ -784,7 +784,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           uploadsByImageId,
           environmentId,
         })
-    : null;
+    : // Retained files cannot upload while the capability is gone; sending
+      // would clear the draft, fail server-side, and bounce back.
+      composerFiles.length > 0
+      ? "This server does not accept file attachments right now. Remove the files to send."
+      : null;
   const sendDisabledReason =
     externalSendDisabledReason ?? (activePendingProgress ? null : attachmentBlockReason);
   const isSendDisabled = sendDisabledReason !== null;
@@ -2250,7 +2254,26 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
         return;
       }
-      // Remove first so a double activation (click + Enter) can't restore twice.
+      setIsStashMenuOpen(false);
+
+      // The server sweeps pending uploads after 24 hours, so ask before
+      // reattaching. An expired upload restores as a needs-reattach row
+      // instead of a reference the next send would fail to verify. Verify
+      // BEFORE taking: the take removes the entry from durable storage, and a
+      // tab closed during this await must still find it there after reload.
+      const verifications = await Promise.all(
+        stashedFiles.map((file) =>
+          verifyStashedAttachmentUpload({ environmentId, attachmentId: file.attachmentId }),
+        ),
+      );
+      const expiredAttachmentIds = new Set(
+        stashedFiles
+          .filter((_, index) => verifications[index]?.status === "missing")
+          .map((file) => file.attachmentId),
+      );
+
+      // The take is also the double-activation guard (click + Enter): the
+      // second caller finds the entry gone and stops here.
       const { entry: taken, durable } = takeStashEntry(entry.id);
       if (!taken) return;
       if (!durable) {
@@ -2262,21 +2285,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           data: { hideCopyButton: true },
         });
       }
-      setIsStashMenuOpen(false);
-
-      // The server sweeps pending uploads after 24 hours, so ask before
-      // reattaching. An expired upload restores as a needs-reattach row
-      // instead of a reference the next send would fail to verify.
-      const verifications = await Promise.all(
-        stashedFiles.map((file) =>
-          verifyStashedAttachmentUpload({ environmentId, attachmentId: file.attachmentId }),
-        ),
-      );
-      const expiredAttachmentIds = new Set(
-        stashedFiles
-          .filter((_, index) => verifications[index]?.status === "missing")
-          .map((file) => file.attachmentId),
-      );
 
       const currentPrompt = promptRef.current;
       // An image-only stash must not append blank lines to whatever is
