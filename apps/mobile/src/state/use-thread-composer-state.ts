@@ -6,6 +6,7 @@ import * as Cause from "effect/Cause";
 import {
   CommandId,
   MessageId,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
   type ModelSelection,
   type ProviderInteractionMode,
@@ -43,6 +44,7 @@ import {
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   removeComposerDraftAttachment,
+  scheduleUnusedComposerAttachmentCleanup,
   setComposerDraftText,
   updateComposerDraftSettings,
   useComposerDraft,
@@ -66,7 +68,7 @@ export function appendReviewCommentToDraft(input: {
   const separator = existing.trim().length > 0 && !existing.endsWith("\n") ? "\n\n" : "";
   setComposerDraftText(threadKey, `${existing}${separator}${input.text}`);
   if (input.attachments && input.attachments.length > 0) {
-    appendComposerDraftAttachments(threadKey, input.attachments);
+    appendComposerDraftAttachments(threadKey, input.attachments, { allowOverflow: true });
   }
 }
 
@@ -256,18 +258,26 @@ export function useThreadComposerState() {
       interactionMode: draft.interactionMode ?? thread.interactionMode,
       createdAt: metadata.createdAt,
     });
-    clearComposerDraftContent(threadKey);
-    enqueuePromise.catch((error: unknown) => {
-      // Restore text via merge (idempotent) but attachments via the uncapped
-      // append: the merge path slots existing attachments first and truncates
-      // at the send limit, which would silently drop this message's images if
-      // the user attached new ones while the write was in flight.
-      void mergeComposerDraftContent(threadKey, { text, attachments: [] });
-      appendComposerDraftAttachments(threadKey, attachments);
-      setPendingConnectionError(
-        error instanceof Error ? error.message : "Failed to save the queued message.",
-      );
-    });
+    clearComposerDraftContent(threadKey, { deferAttachmentCleanup: true });
+    enqueuePromise.then(
+      () => {
+        // The queued message owns the files now; the sweep sees that and
+        // spares them. Deferred to here so a failed write cannot roll the
+        // message out of the queue mid-sweep and lose the bytes.
+        scheduleUnusedComposerAttachmentCleanup(attachments);
+      },
+      (error: unknown) => {
+        // Restore text via merge (idempotent) but attachments via the uncapped
+        // append: the merge path slots existing attachments first and truncates
+        // at the send limit, which would silently drop this message's images if
+        // the user attached new ones while the write was in flight.
+        void mergeComposerDraftContent(threadKey, { text, attachments: [] });
+        appendComposerDraftAttachments(threadKey, attachments, { allowOverflow: true });
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the queued message.",
+        );
+      },
+    );
     return messageId;
   }, [
     selectedEnvironmentRuntime?.serverConfig?.providers,
@@ -323,11 +333,14 @@ export function useThreadComposerState() {
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
       maxBytes,
     });
-    if (result.files.length > 0) {
-      appendComposerDraftAttachments(threadKey, result.files);
-    }
+    const rejectedCount = appendComposerDraftAttachments(threadKey, result.files);
     if (result.error) {
       Alert.alert("Could not attach file", result.error);
+    } else if (rejectedCount > 0) {
+      Alert.alert(
+        "Could not attach file",
+        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+      );
     }
   }, [composerDrafts, selectedEnvironmentRuntime?.serverConfig, selectedThreadShell]);
 

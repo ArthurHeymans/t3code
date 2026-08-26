@@ -192,34 +192,38 @@ export async function pickComposerFiles(input: {
       exceededAttachmentLimit = true;
       break;
     }
+    // A SAF/document picker can hand back a blank display name; the wire
+    // contract rejects empty names at send time, so fall back before the name
+    // reaches storage, errors, or the attachment itself.
+    const name = file.name.trim().length > 0 ? file.name : "file";
     const sizeBytes = file.size ?? null;
     if (sizeBytes !== null && sizeBytes > maxBytes) {
-      error = fileAttachmentTooLargeMessage(file.name, maxBytes);
+      error = fileAttachmentTooLargeMessage(name, maxBytes);
       continue;
     }
     try {
-      const fileUri = await persistComposerAttachmentFile(file.uri, file.name, maxBytes);
+      const fileUri = await persistComposerAttachmentFile(file.uri, name, maxBytes);
       const storedSizeBytes = new File(fileUri).size ?? sizeBytes ?? 0;
       if (storedSizeBytes <= 0) {
         await removePersistedComposerAttachmentFile(fileUri);
-        error = `'${file.name}' is empty or could not be read.`;
+        error = `'${name}' is empty or could not be read.`;
         continue;
       }
       if (storedSizeBytes > maxBytes) {
         await removePersistedComposerAttachmentFile(fileUri);
-        error = fileAttachmentTooLargeMessage(file.name, maxBytes);
+        error = fileAttachmentTooLargeMessage(name, maxBytes);
         continue;
       }
       attachments.push({
         id: uuidv4(),
         type: "file",
-        name: file.name,
+        name,
         mimeType: file.type || "application/octet-stream",
         sizeBytes: storedSizeBytes,
         fileUri,
       });
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : `Could not read '${file.name}'.`;
+      error = cause instanceof Error ? cause.message : `Could not read '${name}'.`;
     }
   }
   if (exceededAttachmentLimit) {

@@ -109,6 +109,25 @@ describe("pickComposerFiles", () => {
     );
   });
 
+  it("falls back to a usable name when the picker reports a blank one", async () => {
+    mocks.pickFile.mockResolvedValue({
+      canceled: false,
+      result: [
+        {
+          uri: "file:///downloads/unnamed",
+          name: "   ",
+          type: "application/pdf",
+          size: 42,
+        },
+      ],
+    });
+
+    const result = await pickComposerFiles({ existingCount: 0 });
+    expect(result.error).toBeNull();
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]?.name).toBe("file");
+  });
+
   it("rejects files that exceed the environment's advertised upload limit", async () => {
     mocks.pickFile.mockResolvedValue({
       canceled: false,

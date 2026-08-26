@@ -375,23 +375,42 @@ export function appendComposerDraftText(draftKey: string, value: string): void {
   });
 }
 
+/**
+ * Appends attachments to a draft, capped at the send limit against the draft's
+ * live state (callers may have counted before an await; the picker can race
+ * concurrent adds). Overflowed file attachments are released. Returns how many
+ * were rejected. Restore paths pass allowOverflow so a failed send never drops
+ * the message's own attachments.
+ */
 export function appendComposerDraftAttachments(
   draftKey: string,
   attachments: ReadonlyArray<DraftComposerAttachment>,
-): void {
+  options?: { readonly allowOverflow?: boolean },
+): number {
   if (attachments.length === 0) {
-    return;
+    return 0;
   }
+  let rejected: ReadonlyArray<DraftComposerAttachment> = [];
   updateComposerDrafts((current) => {
     const existing = normalizeDraft(current[draftKey]);
+    const remaining = options?.allowOverflow
+      ? attachments.length
+      : Math.max(0, PROVIDER_SEND_TURN_MAX_ATTACHMENTS - existing.attachments.length);
+    const accepted = attachments.slice(0, remaining);
+    rejected = attachments.slice(remaining);
+    if (accepted.length === 0) {
+      return current;
+    }
     return {
       ...current,
       [draftKey]: {
         ...existing,
-        attachments: [...existing.attachments, ...attachments],
+        attachments: [...existing.attachments, ...accepted],
       },
     };
   });
+  scheduleUnusedComposerAttachmentCleanup(rejected);
+  return rejected.length;
 }
 
 export function replaceComposerDraftAttachments(
@@ -755,11 +774,21 @@ export async function undoComposerDraftMerge(
 
 export function clearComposerDraftContent(
   draftKey: string,
-  options?: { readonly clearWorkspaceSelection?: boolean },
+  options?: {
+    readonly clearWorkspaceSelection?: boolean;
+    // Send clears the draft while the durable outbox write is still in
+    // flight. Sweeping then would race the write: a failed enqueue rolls the
+    // message out of the queue mid-sweep and its files get deleted right
+    // before the failure handler restores them. The sender re-schedules
+    // cleanup once the write settles.
+    readonly deferAttachmentCleanup?: boolean;
+  },
 ): void {
   const previousAttachments = getComposerDraftSnapshot(draftKey).attachments;
   updateComposerDrafts((current) => clearComposerDraftContentState(current, draftKey, options));
-  scheduleUnusedComposerAttachmentCleanup(previousAttachments);
+  if (!options?.deferAttachmentCleanup) {
+    scheduleUnusedComposerAttachmentCleanup(previousAttachments);
+  }
 }
 
 export function clearComposerDraft(draftKey: string): void {
