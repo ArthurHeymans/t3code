@@ -295,7 +295,8 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Delete this PR's preview assets
+      - id: delete
+        name: Delete this PR's preview assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -312,8 +313,11 @@ jobs:
             --json state,labels \
             --jq '.state + " " + (.labels | map(.name) | contains(["preview:mac"]) | tostring)')" == "OPEN true" ]]; then
             echo "PR is open and labeled again. Skipping cleanup."
+            echo "removed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          echo "removed=true" >> "$GITHUB_OUTPUT"
 
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "No preview release exists. Nothing to clean up."
@@ -328,6 +332,7 @@ jobs:
               done
 
       - name: Mark the preview comment as removed
+        if: steps.delete.outputs.removed == 'true'
         uses: actions/github-script@v8
         with:
           script: |
