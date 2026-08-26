@@ -2813,15 +2813,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const pendingCount = pendingImageCompressionsRef.current.get(threadId) ?? 0;
     let reservedCount =
       composerImagesRef.current.length + composerFilesRef.current.length + pendingCount;
+    // A pick that matches a needs-reattach marker replaces it in the draft, so
+    // it must not consume a slot; a draft full of markers would otherwise hit
+    // the capacity error before the replacement path could run.
+    const reattachKeys = new Set(
+      composerFilesRef.current
+        .filter(composerFileNeedsReattach)
+        .map((file) => `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`),
+    );
     const acceptedImages: File[] = [];
     const acceptedFiles: ComposerFileAttachment[] = [];
     let error: string | null = null;
     for (const file of files) {
-      if (reservedCount >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+      const attachmentKind = classifyComposerAttachmentFile(file);
+      const replacesReattachMarker =
+        attachmentKind === "file" &&
+        reattachKeys.delete(
+          `${file.type || "application/octet-stream"}\u0000${file.size}\u0000${file.name || "file"}`,
+        );
+      if (!replacesReattachMarker && reservedCount >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
         error = `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`;
         break;
       }
-      const attachmentKind = classifyComposerAttachmentFile(file);
       if (attachmentKind === "unsupported-image") {
         error = `'${file.name}' is not a supported image type. Attach GIF, HEIC, HEIF, JPEG, PNG, or WebP images.`;
         continue;
@@ -2860,7 +2873,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           file,
         });
       }
-      reservedCount += 1;
+      if (!replacesReattachMarker) {
+        reservedCount += 1;
+      }
     }
     setThreadError(threadId, error);
     if (acceptedFiles.length > 0) {

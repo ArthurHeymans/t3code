@@ -3732,8 +3732,21 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   parseScopedThreadKey(toKey)?.environmentId ??
                   null)
                 : to.environmentId;
+            // A file the destination already holds (same id, or same
+            // metadata key) stays behind instead of duplicating there.
+            const destinationFileIds = new Set(destination.files.map((file) => file.id));
+            const destinationFileKeys = new Set(
+              destination.files.map(
+                (file) => `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`,
+              ),
+            );
             const transferableFiles = source.files.filter(
-              (file) => file.file !== null || file.uploadEnvironmentId === destinationEnvironmentId,
+              (file) =>
+                (file.file !== null || file.uploadEnvironmentId === destinationEnvironmentId) &&
+                !destinationFileIds.has(file.id) &&
+                !destinationFileKeys.has(
+                  `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`,
+                ),
             );
             const remainingAttachmentSlots = Math.max(
               0,

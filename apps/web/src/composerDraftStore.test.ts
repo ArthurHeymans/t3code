@@ -592,6 +592,27 @@ describe("composerDraftStore moveComposerPromptAndImages", () => {
     ]);
   });
 
+  it("does not duplicate a file the destination already holds", () => {
+    const sourceRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("thread-dup-source"));
+    const destinationRef = scopeThreadRef(
+      TEST_ENVIRONMENT_ID,
+      ThreadId.make("thread-dup-destination"),
+    );
+    const store = useComposerDraftStore.getState();
+    // Same metadata key on both sides; the ids differ.
+    store.addFiles(sourceRef, [makeFile("file-copy-a")]);
+    store.addFiles(destinationRef, [makeFile("file-copy-b")]);
+
+    store.moveComposerPromptAndImages(sourceRef, destinationRef);
+
+    expect(store.getComposerDraft(destinationRef)?.files.map((file) => file.id)).toEqual([
+      "file-copy-b",
+    ]);
+    expect(store.getComposerDraft(sourceRef)?.files.map((file) => file.id)).toEqual([
+      "file-copy-a",
+    ]);
+  });
+
   it("keeps overflow attachments on the source when the destination is nearly full", () => {
     const store = useComposerDraftStore.getState();
     store.addImages(
