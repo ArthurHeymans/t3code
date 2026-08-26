@@ -343,7 +343,7 @@ describe("attachmentUploadQueue", () => {
     );
 
     startAttachmentUpload({ environmentId: firstEnvironment, image: file });
-    releaseAttachmentUpload(file.id);
+    releaseDraftAttachment(file);
     resolveVerification({ _tag: "Success", value: {} });
 
     expect(mocks.runAtomCommand).toHaveBeenCalledWith(
@@ -355,6 +355,75 @@ describe("attachmentUploadQueue", () => {
       },
       expect.anything(),
     );
+  });
+
+  it("keeps the persisted upload when retrying after a transient verification failure", async () => {
+    const file: ComposerFileAttachment = {
+      ...makeFile("flaky"),
+      file: null,
+      uploadedAttachmentId: "pending-flaky-pdf",
+      uploadEnvironmentId: firstEnvironment,
+    };
+    mocks.executeAtomQuery.mockResolvedValueOnce({
+      _tag: "Failure",
+      error: new Error("socket closed"),
+    });
+
+    startAttachmentUpload({ environmentId: firstEnvironment, image: file });
+    await awaitAttachmentUploads([file.id]);
+    expect(readAttachmentUpload(file.id)).toMatchObject({
+      status: "failed",
+      reason: "Uploaded file could not be verified. Retry when the server reconnects.",
+    });
+
+    // The persisted id is the only server copy of the bytes (`file` is null
+    // after a reload), so the retry must verify it again, not delete it.
+    retryAttachmentUpload({ environmentId: firstEnvironment, image: file });
+    await awaitAttachmentUploads([file.id]);
+
+    expect(readAttachmentUpload(file.id)).toEqual({
+      status: "ready",
+      environmentId: firstEnvironment,
+      attachmentId: "pending-flaky-pdf",
+    });
+    const removeCalls = mocks.runAtomCommand.mock.calls.filter(
+      ([, command]) => command === mocks.removeUpload,
+    );
+    expect(removeCalls).toEqual([]);
+  });
+
+  it("keeps the persisted upload when an environment switch cancels its verification", async () => {
+    const file: ComposerFileAttachment = {
+      ...makeFile("moving"),
+      file: null,
+      uploadedAttachmentId: "pending-moving-pdf",
+      uploadEnvironmentId: firstEnvironment,
+    };
+    let resolveVerification: (result: {
+      readonly _tag: "Success";
+      readonly value: object;
+    }) => void = () => {};
+    mocks.executeAtomQuery.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveVerification = resolve;
+      }),
+    );
+
+    startAttachmentUpload({ environmentId: firstEnvironment, image: file });
+    // Switching environments cancels the in-flight verification. The draft
+    // still references the upload in the first environment, so the cancel
+    // must not delete it.
+    startAttachmentUpload({ environmentId: secondEnvironment, image: file });
+    resolveVerification({ _tag: "Success", value: {} });
+    await awaitAttachmentUploads([file.id]);
+
+    const persistedRemoveCalls = mocks.runAtomCommand.mock.calls.filter(
+      ([, command, target]) =>
+        command === mocks.removeUpload &&
+        (target as { readonly input: { readonly attachmentId: string } }).input.attachmentId ===
+          "pending-moving-pdf",
+    );
+    expect(persistedRemoveCalls).toEqual([]);
   });
 
   it("cancels persisted-upload verification when a stash discards its file", async () => {

@@ -33,9 +33,15 @@ interface UploadJob {
   readonly image: ComposerImageAttachment | ComposerFileAttachment;
   readonly environmentId: EnvironmentId;
   readonly previous?: ReadyAttachmentUpload;
+  /**
+   * The draft's persisted server-side upload, to verify instead of re-upload.
+   * The draft owns this id; the queue never deletes it on cancel or retry.
+   * Deleting it goes through `releasePersistedAttachmentUpload` only.
+   */
   readonly persistedAttachmentId?: string;
   readonly settled: Promise<void>;
   resolveSettled: () => void;
+  /** Only ids this queue minted itself. Cancel and retry may delete these. */
   attachmentId: string | null;
   cancelled: boolean;
   abort: (() => void) | null;
@@ -126,10 +132,13 @@ async function runUpload(job: UploadJob): Promise<void> {
       return;
     }
     if (verification.status === "failed" || !job.image.file) {
+      // No `attachmentId` here: a failed state's id marks a pending upload
+      // this queue minted, which retry and release then delete. The persisted
+      // id is the only server copy of a hydrated file, so a transient
+      // verification failure must leave it in place for the next retry.
       setUploadState(job.image.id, {
         status: "failed",
         environmentId: job.environmentId,
-        attachmentId: job.persistedAttachmentId,
         reason:
           verification.status === "missing"
             ? "Uploaded file expired. Remove it and attach it again."
@@ -331,10 +340,7 @@ export function startAttachmentUpload(input: {
       : {}),
     settled,
     resolveSettled,
-    attachmentId:
-      input.image.type === "file" && input.image.uploadEnvironmentId === input.environmentId
-        ? (input.image.uploadedAttachmentId ?? null)
-        : null,
+    attachmentId: null,
     cancelled: false,
     abort: null,
   };
@@ -350,6 +356,11 @@ export function startAttachmentUpload(input: {
   pumpUploads();
 }
 
+/**
+ * Stops the job and deletes only the pending upload it minted itself. A
+ * persisted draft upload survives cancellation (an environment switch cancels
+ * the old job, and the draft still references that server copy).
+ */
 export function cancelAttachmentUpload(imageId: string): void {
   const job = jobsByImageId.get(imageId);
   if (!job) {
@@ -389,14 +400,6 @@ export function releasePersistedAttachmentUpload(input: {
   readonly environmentId: EnvironmentId;
   readonly attachmentId: string;
 }): void {
-  const job = jobsByImageId.get(input.id);
-  if (
-    job?.environmentId === input.environmentId &&
-    job.persistedAttachmentId === input.attachmentId
-  ) {
-    releaseAttachmentUpload(input.id);
-    return;
-  }
   const upload = readAttachmentUpload(input.id);
   if (
     upload?.status === "ready" &&
@@ -405,6 +408,15 @@ export function releasePersistedAttachmentUpload(input: {
   ) {
     releaseAttachmentUpload(input.id);
     return;
+  }
+  const job = jobsByImageId.get(input.id);
+  if (
+    job?.environmentId === input.environmentId &&
+    job.persistedAttachmentId === input.attachmentId
+  ) {
+    // Tears down the in-flight verification or re-upload. The queue only
+    // deletes ids it minted, so the persisted id still needs the delete below.
+    releaseAttachmentUpload(input.id);
   }
   deletePendingUpload(input.environmentId, input.attachmentId);
 }
@@ -415,6 +427,9 @@ export function retryAttachmentUpload(input: {
 }): void {
   const previous = readAttachmentUpload(input.image.id);
   cancelAttachmentUpload(input.image.id);
+  // A failed state's `attachmentId` is always one this queue minted, so this
+  // never deletes a persisted draft upload. Retrying a hydrated file whose
+  // verification failed leaves the server copy alone and verifies it again.
   if (previous?.status === "failed" && previous.attachmentId) {
     deletePendingUpload(previous.environmentId, previous.attachmentId);
   }
