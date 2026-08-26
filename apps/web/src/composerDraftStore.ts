@@ -3160,15 +3160,31 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           set((state) => {
             const existing = state.draftsByThreadKey[threadKey] ?? createEmptyThreadDraft();
             const knownIds = new Set(existing.files.map((file) => file.id));
-            const knownFiles = new Set(
-              existing.files.map(
-                (file) => `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`,
-              ),
+            const knownFiles = new Map<string, ComposerFileAttachment>(
+              existing.files.map((file) => [
+                `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`,
+                file,
+              ]),
             );
             const accepted: ComposerFileAttachment[] = [];
+            // Needs-reattach markers replaced in place by a re-pick, keyed by
+            // the marker's id.
+            const replacements = new Map<string, ComposerFileAttachment>();
             for (const file of files) {
               const key = `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`;
-              if (knownIds.has(file.id) || knownFiles.has(key)) {
+              if (knownIds.has(file.id)) {
+                continue;
+              }
+              const duplicate = knownFiles.get(key);
+              if (duplicate) {
+                // A needs-reattach marker persists exactly the metadata this
+                // key hashes, so re-picking the same file matches its marker.
+                // Dropping the pick as a duplicate would leave the draft
+                // blocked forever; replace the marker so the upload restarts.
+                if (composerFileNeedsReattach(duplicate) && !replacements.has(duplicate.id)) {
+                  replacements.set(duplicate.id, file);
+                  knownIds.add(file.id);
+                }
                 continue;
               }
               if (
@@ -3179,15 +3195,16 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               }
               accepted.push(file);
               knownIds.add(file.id);
-              knownFiles.add(key);
+              knownFiles.set(key, file);
             }
-            if (accepted.length === 0) {
+            if (accepted.length === 0 && replacements.size === 0) {
               return state;
             }
+            const retained = existing.files.map((file) => replacements.get(file.id) ?? file);
             return {
               draftsByThreadKey: {
                 ...state.draftsByThreadKey,
-                [threadKey]: { ...existing, files: [...existing.files, ...accepted] },
+                [threadKey]: { ...existing, files: [...retained, ...accepted] },
               },
             };
           });

@@ -448,6 +448,36 @@ describe("composerDraftStore file attachments", () => {
     expect(draft?.files.map((file) => file.id)).toEqual(["file-accepted"]);
   });
 
+  it("replaces a needs-reattach marker when the same file is picked again", () => {
+    const store = useComposerDraftStore.getState();
+    // A hydrated marker: same metadata as the original pick, no bytes and no
+    // server-side upload.
+    const marker: ComposerFileAttachment = { ...makeFile("file-marker"), file: null };
+    store.addFiles(threadRef, [marker]);
+    expect(store.getComposerDraft(threadRef)?.files.every(composerFileNeedsReattach)).toBe(true);
+
+    // Following the "Attach again" instruction produces a fresh id with the
+    // exact metadata the dedup key hashes.
+    const repicked = makeFile("file-repicked");
+    store.addFiles(threadRef, [repicked]);
+
+    const files = store.getComposerDraft(threadRef)?.files;
+    expect(files?.map((file) => file.id)).toEqual(["file-repicked"]);
+    expect(files?.[0]?.file).not.toBeNull();
+    expect(files?.some(composerFileNeedsReattach)).toBe(false);
+  });
+
+  it("still dedupes a re-pick against a file that does not need reattaching", () => {
+    const store = useComposerDraftStore.getState();
+    store.addFiles(threadRef, [makeFile("file-original")]);
+
+    store.addFiles(threadRef, [makeFile("file-duplicate")]);
+
+    expect(store.getComposerDraft(threadRef)?.files.map((file) => file.id)).toEqual([
+      "file-original",
+    ]);
+  });
+
   it("keeps the remaining file slot available after a duplicate is skipped", () => {
     const store = useComposerDraftStore.getState();
     store.addImages(
