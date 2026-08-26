@@ -47,9 +47,9 @@ attachment to the provider adapter. Each adapter decides what its provider inges
 
 - Codex, Claude, Cursor, and Grok send images as native image inputs and skip generic files. For
   these providers, generic files reach the agent only as file paths in the turn text.
-- OpenCode sends images, text files, and PDFs as native file parts with their real mime type.
-  Formats its model paths reject (ZIP and other binaries) fall back to the file path in the turn
-  text, like the other providers.
+- OpenCode sends PNG/JPEG/GIF/WebP images, text files, and PDFs up to 20 MB as native file parts
+  with their real mime type. Everything else (ZIP and other binaries, image formats model APIs
+  reject, oversized files) falls back to the file path in the turn text, like the other providers.
 
 Claude receives the attachment directory as an allowed additional directory. Codex keeps its
 configured sandbox policy, so access depends on that policy and the selected runtime mode. OpenCode

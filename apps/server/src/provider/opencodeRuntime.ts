@@ -346,15 +346,25 @@ export function openCodeQuestionId(
 }
 
 /**
- * Mimes OpenCode can hand to a model as a native file part. Anything else
- * (ZIP, binaries) makes its Anthropic path throw AI_UnsupportedFunctionalityError
- * before the turn starts, so those attachments ride only as the file path
- * ProviderService puts in the prompt.
+ * Attachments OpenCode can hand to a model as a native file part. Anything
+ * else (ZIP, binaries, image formats like BMP/AVIF/SVG that model APIs
+ * reject, or files over the direct-attachment size limit) would make the turn
+ * fail before it starts, so those ride only as the file path ProviderService
+ * puts in the prompt.
  */
-export function isOpenCodeNativeFileMime(mimeType: string): boolean {
-  const normalized = mimeType.trim().toLowerCase();
+const OPENCODE_NATIVE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+export const OPENCODE_NATIVE_FILE_PART_MAX_BYTES = 20 * 1024 * 1024;
+
+export function isOpenCodeNativeFilePart(input: {
+  readonly mimeType: string;
+  readonly sizeBytes: number;
+}): boolean {
+  if (input.sizeBytes > OPENCODE_NATIVE_FILE_PART_MAX_BYTES) {
+    return false;
+  }
+  const normalized = input.mimeType.trim().toLowerCase();
   return (
-    normalized.startsWith("image/") ||
+    OPENCODE_NATIVE_IMAGE_MIMES.has(normalized) ||
     normalized.startsWith("text/") ||
     normalized === "application/pdf"
   );
@@ -367,7 +377,7 @@ export function toOpenCodeFileParts(input: {
   const parts: Array<FilePartInput> = [];
 
   for (const attachment of input.attachments ?? []) {
-    if (!isOpenCodeNativeFileMime(attachment.mimeType)) {
+    if (!isOpenCodeNativeFilePart(attachment)) {
       continue;
     }
     const attachmentPath = input.resolveAttachmentPath(attachment);
