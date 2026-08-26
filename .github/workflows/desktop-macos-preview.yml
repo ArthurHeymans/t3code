@@ -144,13 +144,17 @@ jobs:
 
           tag="desktop-preview"
 
+          # True while the PR is open and still carries the preview label.
+          preview_eligible() {
+            [[ "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json state,labels \
+              --jq '.state + " " + (.labels | map(.name) | contains(["preview:mac"]) | tostring)')" == "OPEN true" ]]
+          }
+
           # The build ran for many minutes. If the PR closed or lost the label
           # meanwhile, cleanup already ran in its own concurrency group, so
           # publishing now would resurrect a deleted download.
-          pr_state="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json state,labels \
-            --jq '.state + " " + (.labels | map(.name) | contains(["preview:mac"]) | tostring)')"
-          if [[ "$pr_state" != "OPEN true" ]]; then
+          if ! preview_eligible; then
             echo "PR closed or preview label removed while building. Skipping publish."
             exit 0
           fi
@@ -182,6 +186,17 @@ jobs:
               done
 
           gh release upload "$tag" "$dmg_path" --repo "$GITHUB_REPOSITORY" --clobber
+
+          # Re-check after uploading. A cleanup run that started during the
+          # upload listed assets before ours existed, so it cannot delete it.
+          # Whichever writer acts last sees the final PR state; if the preview
+          # became ineligible, delete what we just uploaded.
+          if ! preview_eligible; then
+            gh release delete-asset "$tag" "$(basename "$dmg_path")" --repo "$GITHUB_REPOSITORY" --yes
+            echo "PR closed or preview label removed during upload. Removed the download."
+            exit 0
+          fi
+
           echo "download_url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
 
       - name: Comment download link
