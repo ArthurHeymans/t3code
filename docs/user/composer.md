@@ -10,8 +10,10 @@ Images keep their existing 10 MB limit. Files upload directly to the environment
 can read, copy, or edit them by their file path.
 
 On web and desktop, attachments upload as soon as you add them. The send button becomes available
-after every upload finishes. Failed uploads can be retried or removed. On mobile, attachments are
-currently limited to images.
+after every upload finishes. Failed uploads can be retried or removed. On mobile, the **+** control
+offers Photos and Files, and you can share a file into T3 Code from any app through the system share
+sheet. Mobile uploads happen when the message sends, so queued messages keep their files until they
+deliver.
 
 If you reload before a file finishes uploading, the draft keeps the file's name and shows **Attach
 again** next to it. Attach the file again or remove it, then send.
