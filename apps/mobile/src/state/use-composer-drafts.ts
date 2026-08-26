@@ -230,6 +230,18 @@ export async function flushComposerDrafts(): Promise<void> {
   } while (persistTimer !== null);
 }
 
+function isComposerAttachmentFileReferenced(fileUri: string): boolean {
+  const drafts = Object.values(appAtomRegistry.get(composerDraftsAtom));
+  const queuedMessages = Object.values(
+    appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+  ).flat();
+  return [...drafts, ...queuedMessages].some((owner) =>
+    owner.attachments.some(
+      (attachment) => attachment.type === "file" && attachment.fileUri === fileUri,
+    ),
+  );
+}
+
 export async function releaseUnusedComposerAttachmentFiles(
   attachments: ReadonlyArray<DraftComposerAttachment>,
 ): Promise<void> {
@@ -242,25 +254,23 @@ export async function releaseUnusedComposerAttachmentFiles(
     return;
   }
 
+  // Persisted drafts must hydrate before the reference scan. On a cold start
+  // the atom is still empty, and every file a persisted draft owns would look
+  // unused. Hydrate before flushing so a pending pre-hydration write cannot
+  // land an incomplete snapshot either.
+  await waitForComposerDraftsLoaded();
   await flushComposerDrafts();
   await threadOutboxManager.load();
   await flushThreadOutbox();
 
-  const drafts = Object.values(appAtomRegistry.get(composerDraftsAtom));
-  const queuedMessages = Object.values(
-    appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
-  ).flat();
-  for (const owner of [...drafts, ...queuedMessages]) {
-    for (const attachment of owner.attachments) {
-      if (attachment.type === "file") {
-        candidates.delete(attachment.fileUri);
-      }
+  const { removePersistedComposerAttachmentFile } = await import("../lib/composerImages");
+  for (const fileUri of candidates) {
+    // Re-check ownership immediately before each deletion: a restore or edit
+    // can re-own a file after an earlier scan decided it was unused.
+    if (isComposerAttachmentFileReferenced(fileUri)) {
+      continue;
     }
-  }
-
-  if (candidates.size > 0) {
-    const { removePersistedComposerAttachmentFile } = await import("../lib/composerImages");
-    await Promise.all([...candidates].map((uri) => removePersistedComposerAttachmentFile(uri)));
+    await removePersistedComposerAttachmentFile(fileUri);
   }
 }
 
@@ -655,6 +665,89 @@ export async function restoreComposerDraftSnapshot(
     appAtomRegistry.get(composerDraftsAtom),
     draftKey,
     snapshot,
+  );
+  appAtomRegistry.set(composerDraftsAtom, next);
+  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+}
+
+function sameComposerDraftState(a: ComposerDraft, b: ComposerDraft): boolean {
+  return (
+    a.text === b.text &&
+    a.attachments === b.attachments &&
+    a.importedShareIds === b.importedShareIds &&
+    a.modelSelection === b.modelSelection &&
+    a.runtimeMode === b.runtimeMode &&
+    a.interactionMode === b.interactionMode &&
+    a.workspaceSelection === b.workspaceSelection
+  );
+}
+
+/**
+ * Undoes an abandoned mergeComposerDraftContent. When the draft is untouched
+ * since `merged` (the state captured right after the merge), the pre-merge
+ * snapshot comes back exactly. When the user edited the draft during the
+ * merge's awaits, only what the merge inserted (the appended text and the new
+ * attachments) is taken back out, so the user's edits survive the rollback.
+ */
+export function undoComposerDraftMergeState(
+  current: Record<string, ComposerDraft>,
+  draftKey: string,
+  snapshot: ComposerDraft,
+  merged: ComposerDraft,
+): Record<string, ComposerDraft> {
+  const existing = normalizeDraft(current[draftKey]);
+  if (sameComposerDraftState(existing, merged)) {
+    return restoreComposerDraftSnapshotState(current, draftKey, snapshot);
+  }
+  const insertedText = merged.text.startsWith(snapshot.text)
+    ? merged.text.slice(snapshot.text.length)
+    : "";
+  const snapshotAttachmentIds = new Set(snapshot.attachments.map((attachment) => attachment.id));
+  const insertedAttachmentIds = new Set(
+    merged.attachments
+      .filter((attachment) => !snapshotAttachmentIds.has(attachment.id))
+      .map((attachment) => attachment.id),
+  );
+  const draft = {
+    ...existing,
+    text:
+      insertedText.length > 0 && existing.text.endsWith(insertedText)
+        ? existing.text.slice(0, existing.text.length - insertedText.length)
+        : existing.text,
+    attachments: existing.attachments.filter(
+      (attachment) => !insertedAttachmentIds.has(attachment.id),
+    ),
+  };
+  if (isEmptyDraft(draft)) {
+    const next = { ...current };
+    delete next[draftKey];
+    return next;
+  }
+  return {
+    ...current,
+    [draftKey]: draft,
+  };
+}
+
+/** Applies undoComposerDraftMergeState and lands it durably. */
+export async function undoComposerDraftMerge(
+  draftKey: string,
+  snapshot: ComposerDraft,
+  merged: ComposerDraft,
+): Promise<void> {
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) {
+    await loadPromise;
+  }
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  const next = undoComposerDraftMergeState(
+    appAtomRegistry.get(composerDraftsAtom),
+    draftKey,
+    snapshot,
+    merged,
   );
   appAtomRegistry.set(composerDraftsAtom, next);
   await persistenceQueue.run(() => writePersistedComposerDrafts(next));

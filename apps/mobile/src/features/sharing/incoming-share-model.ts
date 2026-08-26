@@ -63,6 +63,12 @@ function normalizedFileUriPath(uri: string): string | null {
       return null;
     }
     const path = decodeURIComponent(url.pathname);
+    // URL parsing collapses literal ".." segments, but an encoded separator
+    // survives it: "..%2F.." decodes to "../..", which the filesystem would
+    // resolve outside the root the lexical containment check accepted.
+    if (path.split("/").includes("..")) {
+      return null;
+    }
     return path.startsWith("/private/var/") ? path.slice("/private".length) : path;
   } catch {
     return null;

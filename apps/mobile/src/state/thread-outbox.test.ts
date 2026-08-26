@@ -519,6 +519,7 @@ describe("thread outbox", () => {
 
   it("does not publish a stale attachment update after a replacement appears during its write", async () => {
     const registry = AtomRegistry.make();
+    const writes: string[] = [];
     let resumeWrite: () => void = () => {};
     let signalWriteStarted: () => void = () => {};
     const writeStarted = new Promise<void>((resolve) => {
@@ -532,6 +533,7 @@ describe("thread outbox", () => {
       storage: {
         load: async () => [],
         write: async (message) => {
+          writes.push(message.text);
           if (message.text === "stale upload") {
             signalWriteStarted();
             await writeBarrier;
@@ -556,10 +558,93 @@ describe("thread outbox", () => {
     resumeWrite();
 
     await expect(update).resolves.toBe(false);
+    // The losing update re-writes the winning payload inside its own
+    // mutation, before the replacement's serialized write lands, so a crash
+    // between the two cannot leave the stale payload on disk.
+    expect(writes).toEqual([original.text, "stale upload", "newer edit", "newer edit"]);
     await enqueue;
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
       "environment-1:thread-1": [replacement],
     });
+    registry.dispose();
+  });
+
+  it("refuses to remove a message that was rewritten after the removal decision", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          stored.set(message.messageId, message);
+        },
+        remove: async (message) => {
+          stored.delete(message.messageId);
+        },
+      },
+    });
+    const original = queuedMessage({
+      messageId: "message-remove-race",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const edited = { ...original, text: "edited while restoring" };
+
+    await manager.enqueue(original);
+    // Revision captured when restore-to-composer read the payload it intends
+    // to remove; the edit accepted afterwards must survive the removal.
+    const revision = manager.revisionOf(original.messageId);
+    await manager.update(edited);
+
+    await expect(manager.remove(original, revision)).resolves.toBe(false);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [edited],
+    });
+    expect(stored.get(original.messageId)).toEqual(edited);
+
+    await expect(manager.remove(edited, manager.revisionOf(edited.messageId))).resolves.toBe(true);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
+    registry.dispose();
+  });
+
+  it("keeps a retry enqueued when its publish races a revision-checked removal", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let resumeRemove: () => void = () => {};
+    const removeBarrier = new Promise<void>((resolve) => {
+      resumeRemove = resolve;
+    });
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          stored.set(message.messageId, message);
+        },
+        remove: async (message) => {
+          await removeBarrier;
+          stored.delete(message.messageId);
+        },
+      },
+    });
+    const original = queuedMessage({
+      messageId: "message-remove-enqueue-race",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const retried = { ...original, text: "retried" };
+
+    await manager.enqueue(original);
+    const removal = manager.remove(original, manager.revisionOf(original.messageId));
+    // Published synchronously while the durable remove is still in flight.
+    const enqueue = manager.enqueue(retried);
+    resumeRemove();
+
+    await expect(removal).resolves.toBe(false);
+    await enqueue;
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [retried],
+    });
+    expect(stored.get(original.messageId)).toEqual(retried);
     registry.dispose();
   });
 

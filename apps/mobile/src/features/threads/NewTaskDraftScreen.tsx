@@ -498,16 +498,20 @@ export function NewTaskDraftScreen(props: {
         return;
       }
       await consumeShare(shareId);
-      if (!shareImportMountedRef.current || activeShareImportTokenRef.current !== importToken) {
-        return;
-      }
+      // The consumed inbox draft was the last owner of files that never made
+      // it into the composer draft (unsupported server, oversize, limit
+      // skips). Release them before any early return: an unmount or a
+      // superseding import must not leak them, and the sweep re-checks
+      // ownership so it cannot delete a file another draft picked up.
       const retainedAttachmentIds = new Set(
         getComposerDraftSnapshot(draftKey).attachments.map((attachment) => attachment.id),
       );
-      const rejectedAttachments = incomingShare.attachments.filter(
-        (attachment) => !retainedAttachmentIds.has(attachment.id),
+      scheduleUnusedComposerAttachmentCleanup(
+        incomingShare.attachments.filter((attachment) => !retainedAttachmentIds.has(attachment.id)),
       );
-      scheduleUnusedComposerAttachmentCleanup(rejectedAttachments);
+      if (!shareImportMountedRef.current || activeShareImportTokenRef.current !== importToken) {
+        return;
+      }
       const warnings = [...incomingShare.warnings, ...selectedAttachments.warnings];
       if (skippedAttachmentCount > 0) {
         warnings.push(

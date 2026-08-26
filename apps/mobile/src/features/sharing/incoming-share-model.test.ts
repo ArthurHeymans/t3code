@@ -519,6 +519,29 @@ describe("share cleanup ownership", () => {
     ).toBe(false);
   });
 
+  it("refuses traversal segments that escape an owned root", () => {
+    // An encoded separator survives URL normalization: "..%2F.." decodes to
+    // "../..", so the lexical check must reject it before containment.
+    expect(
+      isShareFileUriUnderOwnedRoots(
+        "file:///var/mobile/Containers/Shared/AppGroup/GROUP/..%2F..%2FsenderDoc.pdf",
+        ownedRoots,
+      ),
+    ).toBe(false);
+    expect(
+      isShareFileUriUnderOwnedRoots(
+        "file:///var/mobile/Containers/Shared/AppGroup/GROUP/../senderDoc.pdf",
+        ownedRoots,
+      ),
+    ).toBe(false);
+    expect(
+      isShareFileUriUnderOwnedRoots(
+        "file:///var/mobile/Containers/Shared/AppGroup/GROUP/%2e%2e/senderDoc.pdf",
+        ownedRoots,
+      ),
+    ).toBe(false);
+  });
+
   it("refuses non-file URIs and the owned root itself", () => {
     expect(isShareFileUriUnderOwnedRoots("content://shared/report", ownedRoots)).toBe(false);
     expect(

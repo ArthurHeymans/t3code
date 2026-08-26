@@ -75,6 +75,26 @@ describe("thread outbox removal", () => {
     expect(harness.cleanup).toHaveBeenCalledExactlyOnceWith(message.attachments);
   });
 
+  it("keeps an edited message and its files when a revision-checked removal loses", async () => {
+    const message = queuedMessage({
+      environmentId: "environment-1",
+      messageId: "message-edited",
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    });
+    await harness.manager.enqueue(message);
+    const revision = harness.manager.revisionOf(message.messageId);
+    const edited = { ...message, text: "edited while restoring" };
+    await harness.manager.update(edited);
+
+    await expect(removeThreadOutboxMessage(message, revision)).resolves.toBe(false);
+
+    expect(harness.cleanup).not.toHaveBeenCalled();
+    const remaining = Object.values(
+      appAtomRegistry.get(harness.manager.queuedMessagesByThreadKeyAtom),
+    ).flat();
+    expect(remaining).toEqual([edited]);
+  });
+
   it("releases only the cleared environment's queued attachment files", async () => {
     const cleared = queuedMessage({
       environmentId: "environment-1",

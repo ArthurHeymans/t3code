@@ -121,6 +121,20 @@ export async function persistComposerAttachmentFile(
     }
     throw error;
   }
+  // An Android content: stream can deliver more bytes than the size it
+  // reported before the copy. Validate the persisted copy so an oversized
+  // file is never retained under a stale recorded size.
+  const copiedSize = destination.size;
+  if (maxBytes !== undefined && copiedSize !== null && copiedSize > maxBytes) {
+    try {
+      if (destination.exists) {
+        destination.delete();
+      }
+    } catch (cleanupError) {
+      console.warn("[composer-attachments] could not remove an oversized copy", cleanupError);
+    }
+    throw new Error(fileAttachmentTooLargeMessage(name, maxBytes));
+  }
   return destination.uri;
 }
 

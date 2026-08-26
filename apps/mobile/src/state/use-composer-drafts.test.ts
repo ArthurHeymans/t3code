@@ -90,6 +90,7 @@ import {
   removeComposerDraftsForEnvironment,
   restoreComposerDraftSnapshotState,
   setComposerDraftText,
+  undoComposerDraftMergeState,
 } from "./use-composer-drafts";
 
 const DRAFT: ComposerDraft = {
@@ -104,6 +105,39 @@ afterEach(() => {
 });
 
 describe("mobile composer drafts", () => {
+  // Hydration is one-shot per module instance and the attachment sweep now
+  // triggers it too, so this test must observe it before any sweep test runs.
+  it("waits for persisted drafts before copying content between projects", async () => {
+    const sourceKey = "new-task:environment-1:project-1";
+    const targetKey = "new-task:environment-1:project-2";
+    const unrelatedKey = "environment-1:thread-1";
+    const source = { text: "Current task", attachments: [] } satisfies ComposerDraft;
+    const target = { text: "Persisted target", attachments: [] } satisfies ComposerDraft;
+    const unrelated = { text: "Keep me", attachments: [] } satisfies ComposerDraft;
+
+    composerDraftFileMocks.setDocument({
+      schemaVersion: 1,
+      drafts: {
+        [targetKey]: target,
+        [unrelatedKey]: unrelated,
+      },
+    });
+    composerDraftFileMocks.blockRead();
+    appAtomRegistry.set(composerDraftsAtom, { [sourceKey]: source });
+
+    const copy = copyComposerDraftContentIfEmpty(sourceKey, targetKey);
+    expect(appAtomRegistry.get(composerDraftsAtom)).toEqual({ [sourceKey]: source });
+
+    composerDraftFileMocks.releaseRead();
+    await copy;
+
+    expect(appAtomRegistry.get(composerDraftsAtom)).toEqual({
+      [sourceKey]: source,
+      [targetKey]: target,
+      [unrelatedKey]: unrelated,
+    });
+  });
+
   it("hydrates generic file attachments from their saved local paths", () => {
     const file = {
       id: "file-1",
@@ -532,37 +566,6 @@ describe("mobile composer drafts", () => {
     });
   });
 
-  it("waits for persisted drafts before copying content between projects", async () => {
-    const sourceKey = "new-task:environment-1:project-1";
-    const targetKey = "new-task:environment-1:project-2";
-    const unrelatedKey = "environment-1:thread-1";
-    const source = { text: "Current task", attachments: [] } satisfies ComposerDraft;
-    const target = { text: "Persisted target", attachments: [] } satisfies ComposerDraft;
-    const unrelated = { text: "Keep me", attachments: [] } satisfies ComposerDraft;
-
-    composerDraftFileMocks.setDocument({
-      schemaVersion: 1,
-      drafts: {
-        [targetKey]: target,
-        [unrelatedKey]: unrelated,
-      },
-    });
-    composerDraftFileMocks.blockRead();
-    appAtomRegistry.set(composerDraftsAtom, { [sourceKey]: source });
-
-    const copy = copyComposerDraftContentIfEmpty(sourceKey, targetKey);
-    expect(appAtomRegistry.get(composerDraftsAtom)).toEqual({ [sourceKey]: source });
-
-    composerDraftFileMocks.releaseRead();
-    await copy;
-
-    expect(appAtomRegistry.get(composerDraftsAtom)).toEqual({
-      [sourceKey]: source,
-      [targetKey]: target,
-      [unrelatedKey]: unrelated,
-    });
-  });
-
   it("lands a still-debounced draft write when flushed", async () => {
     const draftKey = "environment-1:thread-1";
     setComposerDraftText(draftKey, "typed right before the restart");
@@ -584,5 +587,131 @@ describe("mobile composer drafts", () => {
     } finally {
       composerDraftFileMocks.setWriteError(null);
     }
+  });
+
+  it("restores the pre-merge snapshot when the draft is untouched since the merge", () => {
+    const draftKey = "environment-1:thread-1";
+    const snapshot: ComposerDraft = { text: "typed before", attachments: [] };
+    const merged: ComposerDraft = {
+      text: "typed before\n\nqueued text",
+      attachments: [],
+      runtimeMode: "approval-required",
+    };
+
+    expect(undoComposerDraftMergeState({ [draftKey]: merged }, draftKey, snapshot, merged)).toEqual(
+      { [draftKey]: snapshot },
+    );
+    expect(
+      undoComposerDraftMergeState(
+        { [draftKey]: merged },
+        draftKey,
+        { text: "", attachments: [] },
+        merged,
+      ),
+    ).toEqual({});
+  });
+
+  it("takes out only what the merge inserted when the user edited during it", () => {
+    const draftKey = "environment-1:thread-1";
+    const keptAttachment = {
+      id: "kept",
+      type: "file" as const,
+      name: "kept.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 1,
+      fileUri: "file:///documents/t3-composer-attachments/kept.pdf",
+    };
+    const insertedAttachment = {
+      id: "inserted",
+      type: "file" as const,
+      name: "inserted.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 1,
+      fileUri: "file:///documents/t3-composer-attachments/inserted.pdf",
+    };
+    const userAttachment = { ...keptAttachment, id: "user-added" };
+    const snapshot: ComposerDraft = { text: "typed before", attachments: [keptAttachment] };
+    const merged: ComposerDraft = {
+      text: "typed before\n\nqueued text",
+      attachments: [keptAttachment, insertedAttachment],
+    };
+    // The user rewrote the leading text and attached a file mid-recovery.
+    const edited: ComposerDraft = {
+      text: "typed EDITED before\n\nqueued text",
+      attachments: [keptAttachment, insertedAttachment, userAttachment],
+    };
+
+    expect(undoComposerDraftMergeState({ [draftKey]: edited }, draftKey, snapshot, merged)).toEqual(
+      {
+        [draftKey]: {
+          text: "typed EDITED before",
+          attachments: [keptAttachment, userAttachment],
+        },
+      },
+    );
+
+    // Edits that broke the merged suffix keep their text untouched; only the
+    // inserted attachments still come out.
+    const rewritten: ComposerDraft = {
+      text: "totally rewritten",
+      attachments: [insertedAttachment],
+    };
+    expect(
+      undoComposerDraftMergeState({ [draftKey]: rewritten }, draftKey, snapshot, merged),
+    ).toEqual({
+      [draftKey]: { text: "totally rewritten", attachments: [] },
+    });
+  });
+
+  it("spares a file re-owned between the sweep's scan and its deletion", async () => {
+    const fileFor = (id: string) => ({
+      id,
+      type: "file" as const,
+      name: `${id}.pdf`,
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: `file:///documents/t3-composer-attachments/${id}.pdf`,
+    });
+    const first = fileFor("file-first");
+    const reowned = fileFor("file-reowned");
+    // A restore re-owns the second file while the first deletion is in
+    // flight, after the sweep already decided both were unused.
+    composerAttachmentCleanupMocks.remove.mockImplementationOnce(async () => {
+      appAtomRegistry.set(composerDraftsAtom, {
+        "environment-1:thread-1": { text: "restored", attachments: [reowned] },
+      });
+    });
+
+    await releaseUnusedComposerAttachmentFiles([first, reowned]);
+
+    expect(composerAttachmentCleanupMocks.remove.mock.calls).toEqual([[first.fileUri]]);
+  });
+
+  // Uses a fresh module instance (hydration is one-shot), so it stays last.
+  it("hydrates persisted drafts before a cold-start sweep deletes their files", async () => {
+    const file = {
+      id: "file-cold-start",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    };
+    composerDraftFileMocks.setDocument({
+      schemaVersion: 1,
+      drafts: {
+        "environment-1:thread-1": { text: "Persisted draft", attachments: [file] },
+      },
+    });
+    vi.resetModules();
+    const fresh = await import("./use-composer-drafts");
+    const freshRegistry = (await import("./atom-registry")).appAtomRegistry;
+
+    await fresh.releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(freshRegistry.get(fresh.composerDraftsAtom)).toEqual({
+      "environment-1:thread-1": { text: "Persisted draft", attachments: [file] },
+    });
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
   });
 });

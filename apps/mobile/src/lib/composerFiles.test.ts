@@ -199,6 +199,24 @@ describe("pickComposerFiles", () => {
     expect(mocks.copy).not.toHaveBeenCalled();
   });
 
+  it("rejects a copy that delivered more bytes than the source reported", async () => {
+    const maxBytes = 1024 * 1024;
+    // An Android content: stream can report a small size and still deliver
+    // more bytes; the persisted copy is what must satisfy the limit.
+    mocks.size.mockImplementation((uri: string) =>
+      uri.startsWith("content:") ? 42 : 2 * 1024 * 1024,
+    );
+
+    await expect(
+      persistComposerAttachmentFile("content://shared/liar", "liar.bin", maxBytes),
+    ).rejects.toThrow("'liar.bin' exceeds the 1 MB attachment limit.");
+
+    expect(mocks.copy).toHaveBeenCalledOnce();
+    expect(mocks.delete).toHaveBeenCalledWith(
+      "file:///documents/t3-composer-attachments/attachment-id-liar.bin",
+    );
+  });
+
   it("reports an empty file without calling it oversized", async () => {
     mocks.size.mockReturnValue(0);
     mocks.pickFile.mockResolvedValue({

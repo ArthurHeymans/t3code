@@ -10,10 +10,20 @@ import { scheduleUnusedComposerAttachmentCleanup } from "./use-composer-drafts";
  * message's local attachment files (via the reference-counting sweep, so a
  * file still referenced by a draft or another queued message survives).
  * Keeping release inside the removal call means no call site can forget it.
+ *
+ * `expectedRevision` (from `threadOutboxRevision`) makes the removal a
+ * compare-and-set: when an edit was accepted since the revision was read, the
+ * newer message stays queued, nothing is released, and this returns false.
  */
-export async function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
-  await threadOutboxManager.remove(message);
+export async function removeThreadOutboxMessage(
+  message: QueuedThreadMessage,
+  expectedRevision?: number,
+): Promise<boolean> {
+  if (!(await threadOutboxManager.remove(message, expectedRevision))) {
+    return false;
+  }
   scheduleUnusedComposerAttachmentCleanup(message.attachments);
+  return true;
 }
 
 /** Removes every queued message of an environment and releases their files. */

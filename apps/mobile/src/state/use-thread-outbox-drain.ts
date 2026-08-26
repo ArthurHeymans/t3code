@@ -49,7 +49,7 @@ import {
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   replaceComposerDraftAttachments,
-  restoreComposerDraftSnapshot,
+  undoComposerDraftMerge,
   updateComposerDraftSettings,
   waitForComposerDraftsLoaded,
 } from "./use-composer-drafts";
@@ -152,6 +152,10 @@ async function restoreRejectedQueuedMessage(
     ) {
       return "deferred";
     }
+    // The confirmation above checked this exact payload is what is queued, so
+    // the current revision guards the removal at the end against an edit
+    // accepted while this recovery ran.
+    const revision = threadOutboxRevision(queuedMessage.messageId);
 
     await waitForComposerDraftsLoaded();
     if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
@@ -175,8 +179,12 @@ async function restoreRejectedQueuedMessage(
       text: queuedMessage.text,
       attachments: queuedMessage.attachments,
     });
+    // Snapshots for the rollback below: undoComposerDraftMerge restores the
+    // original draft only while it is untouched, and otherwise takes out just
+    // what this recovery inserted so edits typed during the awaits survive.
+    const mergedDraft = getComposerDraftSnapshot(draftKey);
     if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
-      await restoreComposerDraftSnapshot(draftKey, originalDraft);
+      await undoComposerDraftMerge(draftKey, originalDraft, mergedDraft);
       return "deferred";
     }
     updateComposerDraftSettings(draftKey, {
@@ -196,16 +204,22 @@ async function restoreRejectedQueuedMessage(
           }
         : {}),
     });
+    const restoredDraft = getComposerDraftSnapshot(draftKey);
     await flushComposerDrafts();
     if (
       appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId] ||
       !(await confirmThreadOutboxMessageQueued(queuedMessage)) ||
       appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]
     ) {
-      await restoreComposerDraftSnapshot(draftKey, originalDraft);
+      await undoComposerDraftMerge(draftKey, originalDraft, restoredDraft);
       return "deferred";
     }
-    await removeThreadOutboxMessage(queuedMessage);
+    // Revision-checked: an edit that landed after the confirmation above
+    // must not be deleted with the pre-edit payload this recovery restored.
+    if (!(await removeThreadOutboxMessage(queuedMessage, revision))) {
+      await undoComposerDraftMerge(draftKey, originalDraft, restoredDraft);
+      return "deferred";
+    }
     setPendingConnectionError(message);
     return "restored";
   } catch (error) {

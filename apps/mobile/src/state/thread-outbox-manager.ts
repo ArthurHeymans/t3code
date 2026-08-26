@@ -139,8 +139,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // read before starting slow work, and the update is rejected before the
   // stale payload is persisted when any other write was accepted since. An
   // enqueue can still publish synchronously while the durable write below is
-  // in flight, so the revision is re-checked after the write too; the newer
-  // enqueue's serialized write then lands last and owns the disk state.
+  // in flight, so the revision is re-checked after the write too; the stale
+  // payload it just persisted is then overwritten with the winning payload
+  // inside this mutation, so a crash before the winner's own serialized write
+  // cannot leave stale state on disk.
   const update = (message: QueuedThreadMessage, expectedRevision?: number): Promise<boolean> =>
     serialize(async () => {
       const staleOrMissing = (): boolean =>
@@ -162,6 +164,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
         });
       }
       if (staleOrMissing()) {
+        const winner = currentMessages().find(
+          (candidate) => candidate.messageId === message.messageId,
+        );
+        if (winner !== undefined) {
+          try {
+            await options.storage.write(winner);
+          } catch {
+            // The winner's own serialized write follows this mutation and
+            // owns the failure handling for its payload.
+          }
+        }
         return false;
       }
       bumpRevision(message.messageId);
@@ -172,8 +185,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       return true;
     });
 
-  const remove = (message: QueuedThreadMessage): Promise<void> =>
+  // `expectedRevision` makes the removal a compare-and-set too: an edit
+  // accepted after the caller decided to remove (restore-to-composer reads
+  // the payload it is about to delete) keeps the newer message queued.
+  const remove = (message: QueuedThreadMessage, expectedRevision?: number): Promise<boolean> =>
     serialize(async () => {
+      const revisionChanged = (): boolean =>
+        expectedRevision !== undefined &&
+        (revisions.get(message.messageId) ?? 0) !== expectedRevision;
+      if (revisionChanged()) {
+        return false;
+      }
       try {
         await options.storage.remove(message);
       } catch (cause) {
@@ -185,10 +207,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           cause,
         });
       }
+      if (revisionChanged()) {
+        // An enqueue replaced this message while the durable remove was in
+        // flight; its serialized write lands after this mutation and restores
+        // the disk entry. Keep the newer message published.
+        return false;
+      }
       setMessages(
         currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
       );
       revisions.delete(message.messageId);
+      return true;
     });
 
   const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
