@@ -781,7 +781,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const needsReattachFileCount = composerFiles.filter(composerFileNeedsReattach).length;
   // On a server without file support there is no paperclip, so "attach again"
   // is advice the UI cannot back up; removing is the only recovery there.
-  const canReattachFiles = maxFileAttachmentBytes !== null;
+  // While the capability answer is pending the optimistic wording stays, to
+  // match the send path's "waiting" state.
+  const canReattachFiles = !attachmentUploadsCapabilityKnown || maxFileAttachmentBytes !== null;
   const attachmentBlockReason = supportsAttachmentUploads
     ? needsReattachFileCount > 0
       ? needsReattachFileCount === 1
