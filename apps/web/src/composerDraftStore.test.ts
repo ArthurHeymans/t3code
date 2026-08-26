@@ -582,14 +582,23 @@ describe("composerDraftStore moveComposerPromptAndImages", () => {
       ThreadId.make("thread-file-destination"),
     );
     const store = useComposerDraftStore.getState();
-    store.addFiles(sourceRef, [makeFile("file-local")]);
+    store.addFiles(sourceRef, [
+      {
+        ...makeFile("file-local"),
+        uploadedAttachmentId: "pending-source-env",
+        uploadEnvironmentId: TEST_ENVIRONMENT_ID,
+      },
+    ]);
 
     store.moveComposerPromptAndImages(sourceRef, destinationRef);
 
     expect(store.getComposerDraft(sourceRef)).toBeNull();
-    expect(store.getComposerDraft(destinationRef)?.files.map((file) => file.id)).toEqual([
-      "file-local",
-    ]);
+    const moved = store.getComposerDraft(destinationRef)?.files;
+    expect(moved?.map((file) => file.id)).toEqual(["file-local"]);
+    // The source-environment upload is unreachable from the destination; the
+    // move drops it so the destination upload can mint its own.
+    expect(moved?.[0]?.uploadedAttachmentId).toBeUndefined();
+    expect(moved?.[0]?.uploadEnvironmentId).toBeUndefined();
   });
 
   it("does not duplicate a file the destination already holds", () => {

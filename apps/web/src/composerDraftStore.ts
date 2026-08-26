@@ -3757,11 +3757,26 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const movedImages = source.images.slice(0, remainingAttachmentSlots);
             const movedImageIds = new Set(movedImages.map((image) => image.id));
             const retainedImages = source.images.filter((image) => !movedImageIds.has(image.id));
-            const movedFiles = transferableFiles.slice(
-              0,
-              remainingAttachmentSlots - movedImages.length,
-            );
-            const retainedFiles = source.files.filter((file) => !movedFiles.includes(file));
+            const movedFiles = transferableFiles
+              .slice(0, remainingAttachmentSlots - movedImages.length)
+              .map((file) => {
+                // A byte-backed file moving across environments re-uploads at
+                // the destination. Keeping the source-environment upload id
+                // would mark it uploaded after a reload with no local bytes
+                // and no valid upload anywhere the destination can reach. The
+                // orphaned source upload expires via the server sweep.
+                if (
+                  file.file === null ||
+                  file.uploadEnvironmentId === undefined ||
+                  file.uploadEnvironmentId === destinationEnvironmentId
+                ) {
+                  return file;
+                }
+                const { uploadedAttachmentId: _a, uploadEnvironmentId: _e, ...rest } = file;
+                return rest;
+              });
+            const movedFileIds = new Set(movedFiles.map((file) => file.id));
+            const retainedFiles = source.files.filter((file) => !movedFileIds.has(file.id));
             // Inline placeholders reference the source's terminal contexts,
             // which stay behind; re-anchor the moved prompt to whatever
             // contexts the destination already holds.

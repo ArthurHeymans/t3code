@@ -2833,7 +2833,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         );
       if (!replacesReattachMarker && reservedCount >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
         error = `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`;
-        break;
+        // Keep scanning: a later file in this batch can still replace a
+        // needs-reattach marker without needing a free slot.
+        continue;
       }
       if (attachmentKind === "unsupported-image") {
         error = `'${file.name}' is not a supported image type. Attach GIF, HEIC, HEIF, JPEG, PNG, or WebP images.`;
