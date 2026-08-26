@@ -230,7 +230,11 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.payload.pull_request.number,
             });
-            if (pullRequest.head.sha !== process.env.HEAD_SHA) {
+            if (
+              pullRequest.head.sha !== process.env.HEAD_SHA ||
+              pullRequest.state !== "open" ||
+              !pullRequest.labels.some((label) => label.name === "preview:mac")
+            ) {
               core.info("Skipping the outdated macOS preview comment.");
               return;
             }
