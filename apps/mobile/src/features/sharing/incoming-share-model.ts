@@ -206,8 +206,11 @@ function fallbackName(uri: string, index: number, mimeType: string): string {
   } catch {
     // Fall through to a deterministic attachment name.
   }
-  const extension = mimeType.split("/")[1]?.replace(/[^a-z0-9.+-]/gi, "") || "png";
-  return `shared-image-${index + 1}.${extension}`;
+  const family = mimeType.split("/")[0]?.toLowerCase();
+  const kind = family === "image" || family === "audio" || family === "video" ? family : "file";
+  const extension =
+    mimeType.split("/")[1]?.replace(/[^a-z0-9.+-]/gi, "") || (kind === "image" ? "png" : "bin");
+  return `shared-${kind}-${index + 1}.${extension}`;
 }
 
 export async function buildIncomingShareDraft(input: {

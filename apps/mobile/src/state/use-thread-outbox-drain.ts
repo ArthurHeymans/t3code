@@ -25,6 +25,7 @@ import { useProjects, useServerConfigs, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
+  threadOutboxManager,
   threadOutboxRevision,
   updateThreadOutboxMessage,
 } from "./thread-outbox";
@@ -44,6 +45,7 @@ import {
 } from "./thread-outbox-model";
 import { threadEnvironment } from "./threads";
 import {
+  appendComposerDraftAttachments,
   composerDraftsAtom,
   flushComposerDrafts,
   type ComposerDraft,
@@ -156,7 +158,7 @@ async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessag
 export async function completeQueuedMessageDelivery(
   queuedMessage: QueuedThreadMessage,
   deliveryRevision: number,
-): Promise<boolean> {
+): Promise<"removed" | "edited" | "failed"> {
   try {
     // Removal also releases the message's local attachment files.
     const removed = await removeThreadOutboxMessage(queuedMessage, deliveryRevision);
@@ -169,8 +171,9 @@ export async function completeQueuedMessageDelivery(
           messageId: queuedMessage.messageId,
         },
       );
+      return "edited";
     }
-    return removed;
+    return "removed";
   } catch (error) {
     console.warn("[thread-outbox] failed to remove delivered queued message", {
       environmentId: queuedMessage.environmentId,
@@ -178,8 +181,36 @@ export async function completeQueuedMessageDelivery(
       messageId: queuedMessage.messageId,
       error,
     });
-    return false;
+    return "failed";
   }
+}
+
+/**
+ * A creation delivered its startTurn but an edit won the cleanup race, so the
+ * edited payload is still queued. The next drain would see the created thread
+ * and take the creation "remove" path, silently discarding the edit; hand the
+ * edited content to the new thread's composer instead and remove the entry.
+ * Exported for tests; the drain is the only production caller.
+ */
+export async function recoverEditedCreationAfterDelivery(
+  queuedMessage: QueuedThreadMessage,
+): Promise<void> {
+  const kept = Object.values(appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom))
+    .flat()
+    .find((candidate) => candidate.messageId === queuedMessage.messageId);
+  if (!kept) {
+    return;
+  }
+  const draftKey = scopedThreadKey(kept.environmentId, kept.threadId);
+  // Merge before removing: the draft's reference keeps the removal sweep from
+  // deleting the attachment files. allowOverflow mirrors the send-failure
+  // restore; the send path refuses over-cap drafts, so the state stays
+  // recoverable.
+  await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
+  appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+  await removeThreadOutboxMessage(kept).catch((error) => {
+    console.warn("[thread-outbox] could not remove recovered pending task", error);
+  });
 }
 
 /** Exported for tests; the drain is the only production caller. */
@@ -481,7 +512,7 @@ export function useThreadOutboxDrain(): void {
       if (reportFailure(deliveryResult, "start-turn")) {
         return false;
       }
-      return completeQueuedMessageDelivery(queuedMessage, deliveryRevision);
+      return (await completeQueuedMessageDelivery(queuedMessage, deliveryRevision)) === "removed";
     };
     return { reportFailure, completeDelivery };
   }, []);
@@ -612,7 +643,6 @@ export function useThreadOutboxDrain(): void {
       if (modelSelection === undefined) {
         return false;
       }
-      const { completeDelivery } = makeDeliveryHelpers(queuedMessage);
       let prepared: PreparedTurnAttachments;
       let deliveryRevision: number;
       try {
@@ -661,13 +691,24 @@ export function useThreadOutboxDrain(): void {
           worktreeBranchName: buildTemporaryWorktreeBranchName(randomHex),
         }),
       });
-      const delivered = await completeDelivery(deliveryResult, deliveryRevision);
-      if (delivered) {
+      const { reportFailure } = makeDeliveryHelpers(queuedMessage);
+      if (reportFailure(deliveryResult, "start-turn")) {
+        return false;
+      }
+      const outcome = await completeQueuedMessageDelivery(queuedMessage, deliveryRevision);
+      if (outcome === "edited") {
+        // The thread exists now, so the next drain would remove the edited
+        // payload as a duplicate creation. Hand it to the thread's composer.
+        await recoverEditedCreationAfterDelivery(queuedMessage);
+        return true;
+      }
+      if (outcome === "removed") {
         await prepared.releaseUploads().catch((error) => {
           console.warn("[thread-outbox] could not delete consumed pending uploads", error);
         });
+        return true;
       }
-      return delivered;
+      return false;
     },
     [makeDeliveryHelpers, restoreQueuedMessage, startTurn],
   );

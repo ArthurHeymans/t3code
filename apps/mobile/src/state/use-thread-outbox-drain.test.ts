@@ -173,7 +173,7 @@ describe("thread outbox drain delivery cleanup", () => {
     const edited = { ...message, text: "edited while the turn delivered" };
     await harness.manager.update(edited);
 
-    await expect(completeQueuedMessageDelivery(message, deliveryRevision)).resolves.toBe(false);
+    await expect(completeQueuedMessageDelivery(message, deliveryRevision)).resolves.toBe("edited");
 
     expect(remainingMessages()).toEqual([edited]);
     expect(harness.removePersistedFile).not.toHaveBeenCalled();
@@ -184,7 +184,7 @@ describe("thread outbox drain delivery cleanup", () => {
     await harness.manager.enqueue(message);
     const deliveryRevision = harness.manager.revisionOf(message.messageId);
 
-    await expect(completeQueuedMessageDelivery(message, deliveryRevision)).resolves.toBe(true);
+    await expect(completeQueuedMessageDelivery(message, deliveryRevision)).resolves.toBe("removed");
 
     expect(remainingMessages()).toEqual([]);
   });

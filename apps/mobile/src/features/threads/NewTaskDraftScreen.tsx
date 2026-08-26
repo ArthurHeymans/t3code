@@ -547,8 +547,13 @@ export function NewTaskDraftScreen(props: {
                   setIsCancellingShareImport(true);
                   try {
                     if (needsDraftRestore) {
+                      // The restore drops the share's merged-in attachments
+                      // from the draft; with the inbox entry already consumed
+                      // nothing references their files, so sweep them.
+                      const mergedAttachments = getComposerDraftSnapshot(draftKey).attachments;
                       await restoreComposerDraftSnapshot(draftKey, draftBackup);
                       needsDraftRestore = false;
+                      scheduleUnusedComposerAttachmentCleanup(mergedAttachments);
                     }
                     if (didReserveShare) {
                       await releaseShareReservation(shareId, {
