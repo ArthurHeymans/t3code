@@ -196,7 +196,8 @@ jobs:
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
             | { grep -F -- "-pr.${PR_NUMBER}." || true; } \
             | while read -r asset; do
-                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes \
+                  || echo "Asset $asset was already removed by a concurrent run."
               done
 
           gh release upload "$tag" "$dmg_path" --repo "$GITHUB_REPOSITORY" --clobber
@@ -206,7 +207,8 @@ jobs:
           # Whichever writer acts last sees the final PR state; if the preview
           # became ineligible, delete what we just uploaded.
           if ! preview_eligible; then
-            gh release delete-asset "$tag" "$(basename "$dmg_path")" --repo "$GITHUB_REPOSITORY" --yes
+            gh release delete-asset "$tag" "$(basename "$dmg_path")" --repo "$GITHUB_REPOSITORY" --yes \
+              || echo "Asset was already removed by a concurrent run."
             echo "PR closed or preview label removed during upload. Removed the download."
             exit 0
           fi
@@ -317,7 +319,8 @@ jobs:
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
             | { grep -F -- "-pr.${PR_NUMBER}." || true; } \
             | while read -r asset; do
-                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes \
+                  || echo "Asset $asset was already removed by a concurrent run."
               done
 
       - name: Mark the preview comment as removed
