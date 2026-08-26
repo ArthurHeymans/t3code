@@ -231,7 +231,9 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       return true;
     });
 
-  const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
+  const clearEnvironment = (
+    environmentId: EnvironmentId,
+  ): Promise<ReadonlyArray<QueuedThreadMessage>> =>
     serialize(async () => {
       const persisted = await options.storage.load().catch((cause) => {
         warn(
@@ -274,6 +276,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       );
 
       setMessages(allMessages.filter((message) => !removedMessageIds.has(message.messageId)));
+      // The caller releases these messages' attachment files; reporting what
+      // was actually removed keeps the release set honest even when this
+      // function's own load produced the messages.
+      return allMessages.filter((message) => removedMessageIds.has(message.messageId));
     });
 
   return {

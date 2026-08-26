@@ -1,8 +1,7 @@
 import type { EnvironmentId } from "@t3tools/contracts";
 
-import { appAtomRegistry } from "./atom-registry";
 import { threadOutboxManager } from "./thread-outbox";
-import { flattenQueuedThreadMessages, type QueuedThreadMessage } from "./thread-outbox-model";
+import type { QueuedThreadMessage } from "./thread-outbox-model";
 import { scheduleUnusedComposerAttachmentCleanup } from "./use-composer-drafts";
 
 /**
@@ -28,14 +27,9 @@ export async function removeThreadOutboxMessage(
 
 /** Removes every queued message of an environment and releases their files. */
 export async function clearThreadOutboxEnvironment(environmentId: EnvironmentId): Promise<void> {
-  // Load first so persisted-but-not-yet-hydrated messages contribute their
-  // attachments to the release set.
-  await threadOutboxManager.load();
-  const removedAttachments = flattenQueuedThreadMessages(
-    appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
-  )
-    .filter((message) => message.environmentId === environmentId)
-    .flatMap((message) => message.attachments);
-  await threadOutboxManager.clearEnvironment(environmentId);
-  scheduleUnusedComposerAttachmentCleanup(removedAttachments);
+  // clearEnvironment loads and merges persisted messages itself and reports
+  // what it actually removed, so the release set cannot miss messages a
+  // failed earlier hydration would have hidden.
+  const removed = await threadOutboxManager.clearEnvironment(environmentId);
+  scheduleUnusedComposerAttachmentCleanup(removed.flatMap((message) => message.attachments));
 }
