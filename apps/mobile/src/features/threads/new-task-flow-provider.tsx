@@ -173,7 +173,8 @@ type NewTaskFlowContextValue = {
   readonly buildPendingTaskMessage: (metadata: TurnCommandMetadata) => QueuedThreadMessage | null;
   readonly setPrompt: (value: string) => void;
   readonly replaceAttachments: (attachments: ReadonlyArray<DraftComposerAttachment>) => void;
-  readonly appendAttachments: (attachments: ReadonlyArray<DraftComposerAttachment>) => void;
+  /** Appends draft attachments; returns how many the live cap rejected. */
+  readonly appendAttachments: (attachments: ReadonlyArray<DraftComposerAttachment>) => number;
   readonly removeAttachment: (imageId: string) => void;
   readonly clearAttachments: () => void;
   readonly setSubmitting: (value: boolean) => void;
@@ -506,12 +507,14 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     },
     [selectedProjectDraftKey],
   );
+  // Returns how many attachments the live cap rejected so the caller can
+  // tell the user (a concurrent add can fill the draft mid-pick).
   const appendAttachments = useCallback(
-    (nextAttachments: ReadonlyArray<DraftComposerAttachment>) => {
+    (nextAttachments: ReadonlyArray<DraftComposerAttachment>): number => {
       if (!selectedProjectDraftKey) {
-        return;
+        return 0;
       }
-      appendComposerDraftAttachments(selectedProjectDraftKey, nextAttachments);
+      return appendComposerDraftAttachments(selectedProjectDraftKey, nextAttachments);
     },
     [selectedProjectDraftKey],
   );

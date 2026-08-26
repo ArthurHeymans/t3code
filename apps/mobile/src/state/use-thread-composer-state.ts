@@ -68,7 +68,14 @@ export function appendReviewCommentToDraft(input: {
   const separator = existing.trim().length > 0 && !existing.endsWith("\n") ? "\n\n" : "";
   setComposerDraftText(threadKey, `${existing}${separator}${input.text}`);
   if (input.attachments && input.attachments.length > 0) {
-    appendComposerDraftAttachments(threadKey, input.attachments, { allowOverflow: true });
+    // Capped: a review comment is new content, not a send-failure restore, so
+    // it must not push the draft over the send limit. Overflow is released.
+    const rejectedCount = appendComposerDraftAttachments(threadKey, input.attachments);
+    if (rejectedCount > 0) {
+      setPendingConnectionError(
+        `${rejectedCount} comment attachment${rejectedCount === 1 ? " was" : "s were"} not added. Messages can contain at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments.`,
+      );
+    }
   }
 }
 
@@ -172,6 +179,17 @@ export function useThreadComposerState() {
     const text = draft.text.trim();
     const attachments = draft.attachments;
     if (text.length === 0 && attachments.length === 0) {
+      return null;
+    }
+    // A send-failure restore appends with allowOverflow so it never drops the
+    // user's files, which can leave the draft over the cap. Sending it anyway
+    // would enqueue a message that outbox recovery rejects forever, so block
+    // here until the user removes attachments.
+    if (attachments.length > PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+      Alert.alert(
+        "Too many attachments",
+        `Remove attachments until there are at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS}.`,
+      );
       return null;
     }
 
@@ -334,13 +352,16 @@ export function useThreadComposerState() {
       maxBytes,
     });
     const rejectedCount = appendComposerDraftAttachments(threadKey, result.files);
-    if (result.error) {
-      Alert.alert("Could not attach file", result.error);
-    } else if (rejectedCount > 0) {
-      Alert.alert(
-        "Could not attach file",
-        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
-      );
+    // The picker error and the live-cap rejection can both happen in one
+    // pick; report both in a single alert.
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach file", problems.join("\n\n"));
     }
   }, [composerDrafts, selectedEnvironmentRuntime?.serverConfig, selectedThreadShell]);
 

@@ -292,6 +292,36 @@ describe("incoming native shares", () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it("rejects a shared file whose persisted copy measures empty and releases the copy", async () => {
+    const file: SharePayload = {
+      shareType: "file",
+      value: "content://shared/report",
+      mimeType: "application/pdf",
+    };
+    const persistedUri = "file:///documents/report.pdf";
+    const removeOwnedFile = vi.fn(async (_uri: string) => undefined);
+
+    const result = await buildIncomingShareDraft({
+      id: "share-empty-copy",
+      createdAt: "2026-07-15T10:00:00.000Z",
+      payloads: [file],
+      resolvedPayloads: [],
+      fileReader: {
+        readBase64: async () => "unused",
+        persistFile: async () => persistedUri,
+        // The source claims 42 bytes but the stored copy measures zero: the
+        // copy is what uploads, so its measured size wins and the empty file
+        // is rejected instead of shipped with a made-up size.
+        readSize: async (uri) => (uri.startsWith("content:") ? 42 : 0),
+        removeOwnedFile,
+      },
+    });
+
+    expect(result.attachments).toEqual([]);
+    expect(result.warnings).toEqual(["'report' is empty or could not be read."]);
+    expect(removeOwnedFile.mock.calls.map(([uri]) => uri)).toContain(persistedUri);
+  });
+
   it("keeps the Android display name without copying the file into the Expo cache", async () => {
     const file = {
       shareType: "file" as const,

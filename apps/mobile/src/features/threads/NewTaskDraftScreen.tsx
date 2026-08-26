@@ -21,6 +21,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { PROVIDER_SEND_TURN_MAX_ATTACHMENTS } from "@t3tools/contracts";
 
 import { ComposerEditor, type ComposerEditorHandle } from "../../components/ComposerEditor";
 import {
@@ -677,11 +678,17 @@ export function NewTaskDraftScreen(props: {
       existingCount: flow.attachments.length,
       maxBytes,
     });
-    if (result.files.length > 0) {
-      flow.appendAttachments(result.files);
-    }
-    if (result.error) {
-      Alert.alert("Could not attach file", result.error);
+    const rejectedCount = result.files.length > 0 ? flow.appendAttachments(result.files) : 0;
+    // The picker error and the live-cap rejection can both happen in one
+    // pick; report both in a single alert.
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach file", problems.join("\n\n"));
     }
   }
 

@@ -273,8 +273,8 @@ function MessageAttachmentFile(props: {
             preparedConnection.value.httpBaseUrl,
             result.value.relativeUrl,
           );
-          if (url !== null) {
-            await tryOpenExternalUrl(url, "file-preview");
+          if (url === null || !(await tryOpenExternalUrl(url, "file-preview"))) {
+            Alert.alert("Could not open attachment", "The attachment could not be opened.");
           }
         })();
       }}

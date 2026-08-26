@@ -299,12 +299,18 @@ export async function buildIncomingShareDraft(input: {
         }
         if (persistedFileUri === undefined && input.fileReader.persistFile) {
           persistedFileUri = await input.fileReader.persistFile(uri, name);
-          // An Android content: source can under-report its size while still
-          // delivering more bytes. The stored copy is what uploads, so its
-          // measured size is what the attachment must record.
+          // An Android content: source can misreport its size while the
+          // stored copy is what uploads, so the copy's measured size is what
+          // the attachment must record. A measured zero means the copy holds
+          // no bytes: reject it, whatever the source claimed.
           const storedSize = (await input.fileReader.readSize?.(persistedFileUri)) ?? null;
-          if (storedSize !== null && storedSize > 0) {
+          if (storedSize !== null) {
             sizeBytes = storedSize;
+          }
+          if (sizeBytes <= 0) {
+            warnings.push(`'${name}' is empty or could not be read.`);
+            await releaseOwnedFiles(input.fileReader, [persistedFileUri]);
+            continue;
           }
           if (sizeBytes > PROVIDER_SEND_TURN_MAX_FILE_BYTES) {
             warnings.push(fileAttachmentTooLargeMessage(name, PROVIDER_SEND_TURN_MAX_FILE_BYTES));

@@ -46,6 +46,7 @@ import { threadEnvironment } from "./threads";
 import {
   composerDraftsAtom,
   flushComposerDrafts,
+  type ComposerDraft,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   replaceComposerDraftAttachments,
@@ -108,17 +109,21 @@ function settingsCommandId(message: QueuedThreadMessage, setting: string): Comma
  * onto the queued message. The revision-checked update means an edit accepted
  * while the bytes uploaded wins: this attempt then abandons (the owner call
  * deletes the uploads it minted) and the next drain pass re-reads the message.
+ * `deliveryRevision` is the revision of the payload this attempt will send,
+ * read for the delivery removal's compare-and-set.
  */
 async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessage): Promise<
   | {
       readonly status: "ready";
       readonly prepared: PreparedTurnAttachments;
       readonly persistedMessage: QueuedThreadMessage;
+      readonly deliveryRevision: number;
     }
   | { readonly status: "abandoned" }
 > {
   const revision = threadOutboxRevision(queuedMessage.messageId);
   let persistedMessage = queuedMessage;
+  let deliveryRevision = revision;
   const result = await prepareTurnAttachments({
     environmentId: queuedMessage.environmentId,
     attachments: queuedMessage.attachments,
@@ -131,19 +136,62 @@ async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessag
         return "abandon";
       }
       persistedMessage = updatedMessage;
+      deliveryRevision = threadOutboxRevision(queuedMessage.messageId);
       return "persisted";
     },
   });
   return result.status === "abandoned"
     ? { status: "abandoned" }
-    : { status: "ready", prepared: result, persistedMessage };
+    : { status: "ready", prepared: result, persistedMessage, deliveryRevision };
 }
 
-async function restoreRejectedQueuedMessage(
+/**
+ * Removes a delivered message from the outbox. Revision-checked with
+ * `deliveryRevision` (read when the delivered payload was fixed): an edit
+ * accepted while the turn was in flight stays queued and keeps the pending
+ * uploads it references, and the false return makes the drain schedule a
+ * retry pass that delivers the newer payload instead of silently dropping it
+ * with the old one. Exported for tests.
+ */
+export async function completeQueuedMessageDelivery(
+  queuedMessage: QueuedThreadMessage,
+  deliveryRevision: number,
+): Promise<boolean> {
+  try {
+    // Removal also releases the message's local attachment files.
+    const removed = await removeThreadOutboxMessage(queuedMessage, deliveryRevision);
+    if (!removed) {
+      console.warn(
+        "[thread-outbox] delivered message was edited before cleanup; keeping the newer message",
+        {
+          environmentId: queuedMessage.environmentId,
+          threadId: queuedMessage.threadId,
+          messageId: queuedMessage.messageId,
+        },
+      );
+    }
+    return removed;
+  } catch (error) {
+    console.warn("[thread-outbox] failed to remove delivered queued message", {
+      environmentId: queuedMessage.environmentId,
+      threadId: queuedMessage.threadId,
+      messageId: queuedMessage.messageId,
+      error,
+    });
+    return false;
+  }
+}
+
+/** Exported for tests; the drain is the only production caller. */
+export async function restoreRejectedQueuedMessage(
   queuedMessage: QueuedThreadMessage,
   message: string,
 ): Promise<"restored" | "deferred" | "blocked" | "retry"> {
   const draftKey = recoveryDraftKey(queuedMessage);
+  // Set once the merge publishes, cleared once the queued message is removed.
+  // The catch below uses it to take the merged content back out, so a retry
+  // after a mid-recovery failure cannot append the recovered text again.
+  let rollback: { readonly snapshot: ComposerDraft; readonly merged: ComposerDraft } | null = null;
   try {
     if (
       appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId] ||
@@ -175,14 +223,22 @@ async function restoreRejectedQueuedMessage(
       return "blocked";
     }
 
-    await mergeComposerDraftContent(draftKey, {
-      text: queuedMessage.text,
-      attachments: queuedMessage.attachments,
-    });
-    // Snapshots for the rollback below: undoComposerDraftMerge restores the
-    // original draft only while it is untouched, and otherwise takes out just
-    // what this recovery inserted so edits typed during the awaits survive.
-    const mergedDraft = getComposerDraftSnapshot(draftKey);
+    let mergedDraft: ComposerDraft;
+    try {
+      await mergeComposerDraftContent(draftKey, {
+        text: queuedMessage.text,
+        attachments: queuedMessage.attachments,
+      });
+    } finally {
+      // Snapshots for the rollbacks below: undoComposerDraftMerge restores
+      // the original draft only while it is untouched, and otherwise takes
+      // out just what this recovery inserted so edits typed during the awaits
+      // survive. Captured in a finally because mergeComposerDraftContent
+      // publishes before its persistence await: even its failure leaves the
+      // merged content in the draft.
+      mergedDraft = getComposerDraftSnapshot(draftKey);
+      rollback = { snapshot: originalDraft, merged: mergedDraft };
+    }
     if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
       await undoComposerDraftMerge(draftKey, originalDraft, mergedDraft);
       return "deferred";
@@ -205,6 +261,7 @@ async function restoreRejectedQueuedMessage(
         : {}),
     });
     const restoredDraft = getComposerDraftSnapshot(draftKey);
+    rollback = { snapshot: originalDraft, merged: restoredDraft };
     await flushComposerDrafts();
     if (
       appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId] ||
@@ -220,9 +277,22 @@ async function restoreRejectedQueuedMessage(
       await undoComposerDraftMerge(draftKey, originalDraft, restoredDraft);
       return "deferred";
     }
+    // The queued message is gone; from here the draft owns the content and
+    // must never be rolled back.
+    rollback = null;
     setPendingConnectionError(message);
     return "restored";
   } catch (error) {
+    if (rollback !== null) {
+      // Take the recovered content back out (keeping edits typed since) so
+      // the retry's merge starts clean instead of appending a duplicate. The
+      // in-memory rollback lands even when its own persistence write fails.
+      await undoComposerDraftMerge(draftKey, rollback.snapshot, rollback.merged).catch(
+        (undoError) => {
+          console.warn("[thread-outbox] failed to persist a recovery rollback", undoError);
+        },
+      );
+    }
     console.warn("[thread-outbox] failed to restore an undeliverable message", error);
     setPendingConnectionError(
       error instanceof Error ? error.message : "The unsent message could not be restored.",
@@ -406,24 +476,12 @@ export function useThreadOutboxDrain(): void {
     };
     const completeDelivery = async (
       deliveryResult: AtomCommandResult<unknown, unknown>,
+      deliveryRevision: number,
     ): Promise<boolean> => {
       if (reportFailure(deliveryResult, "start-turn")) {
         return false;
       }
-
-      try {
-        // Removal also releases the message's local attachment files.
-        await removeThreadOutboxMessage(queuedMessage);
-        return true;
-      } catch (error) {
-        console.warn("[thread-outbox] failed to remove delivered queued message", {
-          environmentId: queuedMessage.environmentId,
-          threadId: queuedMessage.threadId,
-          messageId: queuedMessage.messageId,
-          error,
-        });
-        return false;
-      }
+      return completeQueuedMessageDelivery(queuedMessage, deliveryRevision);
     };
     return { reportFailure, completeDelivery };
   }, []);
@@ -481,12 +539,14 @@ export function useThreadOutboxDrain(): void {
       }
 
       let prepared: PreparedTurnAttachments;
+      let deliveryRevision: number;
       try {
         const preparedResult = await prepareQueuedMessageAttachments(queuedMessage);
         if (preparedResult.status === "abandoned") {
           return true;
         }
         prepared = preparedResult.prepared;
+        deliveryRevision = preparedResult.deliveryRevision;
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           await preserveUploadedAttachmentsForEditor(
             queuedMessage,
@@ -521,7 +581,7 @@ export function useThreadOutboxDrain(): void {
           createdAt: queuedMessage.createdAt,
         },
       });
-      const delivered = await completeDelivery(deliveryResult);
+      const delivered = await completeDelivery(deliveryResult, deliveryRevision);
       if (delivered) {
         // The delivered turn holds its own copy of the bytes. A failed delete
         // is surfaced (never fails the delivered turn); the server also
@@ -554,12 +614,14 @@ export function useThreadOutboxDrain(): void {
       }
       const { completeDelivery } = makeDeliveryHelpers(queuedMessage);
       let prepared: PreparedTurnAttachments;
+      let deliveryRevision: number;
       try {
         const preparedResult = await prepareQueuedMessageAttachments(queuedMessage);
         if (preparedResult.status === "abandoned") {
           return true;
         }
         prepared = preparedResult.prepared;
+        deliveryRevision = preparedResult.deliveryRevision;
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           await preserveUploadedAttachmentsForEditor(
             queuedMessage,
@@ -599,7 +661,7 @@ export function useThreadOutboxDrain(): void {
           worktreeBranchName: buildTemporaryWorktreeBranchName(randomHex),
         }),
       });
-      const delivered = await completeDelivery(deliveryResult);
+      const delivered = await completeDelivery(deliveryResult, deliveryRevision);
       if (delivered) {
         await prepared.releaseUploads().catch((error) => {
           console.warn("[thread-outbox] could not delete consumed pending uploads", error);
