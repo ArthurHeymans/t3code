@@ -467,6 +467,31 @@ describe("composerDraftStore file attachments", () => {
     expect(files?.some(composerFileNeedsReattach)).toBe(false);
   });
 
+  it("replaces a needs-reattach marker with a stash-restored uploaded file", () => {
+    const store = useComposerDraftStore.getState();
+    const marker: ComposerFileAttachment = { ...makeFile("file-marker"), file: null };
+    store.addFiles(threadRef, [marker]);
+    expect(store.getComposerDraft(threadRef)?.files.every(composerFileNeedsReattach)).toBe(true);
+
+    // A stash restore carries a finished server-side upload instead of bytes.
+    // Matching metadata must replace the marker, not be dropped as a
+    // duplicate: the marker cannot send, and the restored ids are the only
+    // valid copy.
+    const restored: ComposerFileAttachment = {
+      ...makeFile("file-restored"),
+      file: null,
+      uploadedAttachmentId: "pending-stash-pdf",
+      uploadEnvironmentId: TEST_ENVIRONMENT_ID,
+    };
+    store.addFiles(threadRef, [restored]);
+
+    const files = store.getComposerDraft(threadRef)?.files;
+    expect(files?.map((file) => file.id)).toEqual(["file-restored"]);
+    expect(files?.[0]?.uploadedAttachmentId).toBe("pending-stash-pdf");
+    expect(files?.[0]?.uploadEnvironmentId).toBe(TEST_ENVIRONMENT_ID);
+    expect(files?.some(composerFileNeedsReattach)).toBe(false);
+  });
+
   it("still dedupes a re-pick against a file that does not need reattaching", () => {
     const store = useComposerDraftStore.getState();
     store.addFiles(threadRef, [makeFile("file-original")]);

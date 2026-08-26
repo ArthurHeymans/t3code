@@ -19,6 +19,13 @@ again** next to it. Attach the file again or remove it, then send.
 On web and desktop, HEIC and HEIF photos are automatically converted to JPEG when you drag them into
 the composer or paste them into a message.
 
+## Prompt stash
+
+Press `Cmd+S` on macOS or `Ctrl+S` on Windows and Linux to stash the current prompt and its
+attachments, then restore the entry later from the stash menu. Stashed files stay uploaded on the
+server for 24 hours. If you restore an entry after that, the file comes back with **Attach again**
+next to it. Attach the file again or remove it, then send.
+
 ## Commands and skills
 
 Type `/` to open the command menu. Type `$` to find and add a skill. Skill rows show their source,

@@ -94,6 +94,7 @@ import {
   retryAttachmentUpload,
   startAttachmentUpload,
   useAttachmentUploadStore,
+  verifyStashedAttachmentUpload,
 } from "../../lib/attachmentUploadQueue";
 import {
   attachmentUploadBlockReason,
@@ -845,10 +846,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       if (attachment.type === "file" && composerFileNeedsReattach(attachment)) {
         continue;
       }
-      startAttachmentUpload({ environmentId, image: attachment });
+      startAttachmentUpload({ environmentId, image: attachment, draftTarget: composerDraftTarget });
     }
   }, [
     attachmentUploadsCapabilityKnown,
+    composerDraftTarget,
     composerFiles,
     composerImages,
     environmentId,
@@ -2238,7 +2240,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   }, []);
 
   const restoreStashEntry = useCallback(
-    (entry: PromptStashEntry) => {
+    async (entry: PromptStashEntry) => {
       const stashedFiles = entry.files ?? [];
       if (stashedFiles.some((file) => file.environmentId !== environmentId)) {
         toastManager.add({
@@ -2262,6 +2264,20 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       setIsStashMenuOpen(false);
 
+      // The server sweeps pending uploads after 24 hours, so ask before
+      // reattaching. An expired upload restores as a needs-reattach row
+      // instead of a reference the next send would fail to verify.
+      const verifications = await Promise.all(
+        stashedFiles.map((file) =>
+          verifyStashedAttachmentUpload({ environmentId, attachmentId: file.attachmentId }),
+        ),
+      );
+      const expiredAttachmentIds = new Set(
+        stashedFiles
+          .filter((_, index) => verifications[index]?.status === "missing")
+          .map((file) => file.attachmentId),
+      );
+
       const currentPrompt = promptRef.current;
       // An image-only stash must not append blank lines to whatever is
       // already in the composer.
@@ -2280,61 +2296,112 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
 
       let unrestoredFileNames: string[] = [];
+      const expiredFileNames: string[] = [];
       let restoredFileCount = 0;
       if (stashedFiles.length > 0) {
-        const existingFileIds = new Set(composerFilesRef.current.map((file) => file.id));
+        const fileDedupKey = (file: {
+          readonly mimeType: string;
+          readonly sizeBytes: number;
+          readonly name: string;
+        }) => `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`;
+        const composerFilesNow = composerFilesRef.current;
+        const existingFileIds = new Set(composerFilesNow.map((file) => file.id));
         const retainedUploadIds = new Set(
-          composerFilesRef.current.flatMap((file) =>
+          composerFilesNow.flatMap((file) =>
             file.uploadedAttachmentId ? [file.uploadedAttachmentId] : [],
           ),
         );
-        const existingFileKeys = new Set(
-          composerFilesRef.current.map(
-            (file) => `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`,
-          ),
+        const existingFileKeys = new Set(composerFilesNow.map(fileDedupKey));
+        const reattachMarkerKeys = new Set(
+          composerFilesNow.filter(composerFileNeedsReattach).map(fileDedupKey),
         );
         const duplicateFiles: PersistedComposerFileAttachment[] = [];
-        const filesToRestore = stashedFiles.filter((file) => {
-          const key = `${file.mimeType}\u0000${file.sizeBytes}\u0000${file.name}`;
-          if (existingFileIds.has(file.id) || existingFileKeys.has(key)) {
-            if (!retainedUploadIds.has(file.attachmentId)) {
+        const markerReplacements: ComposerFileAttachment[] = [];
+        const appendedFiles: ComposerFileAttachment[] = [];
+        for (const file of stashedFiles) {
+          const expired = expiredAttachmentIds.has(file.attachmentId);
+          const key = fileDedupKey(file);
+          const restored: ComposerFileAttachment = {
+            type: "file",
+            id: file.id,
+            name: file.name,
+            mimeType: file.mimeType,
+            sizeBytes: file.sizeBytes,
+            file: null,
+            // An expired upload carries no ids, so it hydrates as a
+            // needs-reattach row and the "Attach again" flow takes over.
+            ...(expired
+              ? {}
+              : { uploadedAttachmentId: file.attachmentId, uploadEnvironmentId: environmentId }),
+          };
+          if (existingFileIds.has(file.id)) {
+            if (!expired && !retainedUploadIds.has(file.attachmentId)) {
               duplicateFiles.push(file);
             }
-            return false;
+            continue;
+          }
+          if (existingFileKeys.has(key)) {
+            if (reattachMarkerKeys.has(key)) {
+              // The draft row with this identity is a needs-reattach marker,
+              // not a real duplicate. Replace it (addFiles swaps a matching
+              // marker in place) instead of deleting the only uploaded copy.
+              reattachMarkerKeys.delete(key);
+              existingFileIds.add(file.id);
+              if (expired) {
+                // The draft's marker already says "attach again"; nothing to
+                // restore or release, but say why the stash copy is gone.
+                expiredFileNames.push(file.name);
+              } else {
+                retainedUploadIds.add(file.attachmentId);
+                markerReplacements.push(restored);
+              }
+              continue;
+            }
+            if (!expired && !retainedUploadIds.has(file.attachmentId)) {
+              duplicateFiles.push(file);
+            }
+            continue;
           }
           existingFileIds.add(file.id);
           existingFileKeys.add(key);
-          retainedUploadIds.add(file.attachmentId);
-          return true;
-        });
+          if (expired) {
+            expiredFileNames.push(file.name);
+          } else {
+            retainedUploadIds.add(file.attachmentId);
+          }
+          appendedFiles.push(restored);
+        }
         const capacity = Math.max(
           0,
           PROVIDER_SEND_TURN_MAX_ATTACHMENTS -
             composerImagesRef.current.length -
-            composerFilesRef.current.length,
+            composerFilesNow.length,
         );
-        const restoredFiles = filesToRestore.slice(0, capacity).map((file) => ({
-          type: "file" as const,
-          id: file.id,
-          name: file.name,
-          mimeType: file.mimeType,
-          sizeBytes: file.sizeBytes,
-          file: null,
-          uploadedAttachmentId: file.attachmentId,
-          uploadEnvironmentId: environmentId,
-        }));
-        const skippedFiles = filesToRestore.slice(capacity);
+        // Marker replacements reuse their marker's slot; only appended files
+        // consume capacity.
+        const filesToAppend = appendedFiles.slice(0, capacity);
+        const skippedFiles = appendedFiles.slice(capacity);
         unrestoredFileNames = skippedFiles.map((file) => file.name);
-        for (const file of [...duplicateFiles, ...skippedFiles]) {
+        for (const file of duplicateFiles) {
           releasePersistedAttachmentUpload({
             id: file.id,
             environmentId,
             attachmentId: file.attachmentId,
           });
         }
+        for (const file of skippedFiles) {
+          if (file.uploadedAttachmentId) {
+            releasePersistedAttachmentUpload({
+              id: file.id,
+              environmentId,
+              attachmentId: file.uploadedAttachmentId,
+            });
+          }
+        }
+        const restoredFiles = [...markerReplacements, ...filesToAppend];
         if (restoredFiles.length > 0) {
           addComposerDraftFiles(composerDraftTarget, restoredFiles);
-          restoredFileCount = restoredFiles.length;
+          restoredFileCount = filesToAppend.length;
         }
       }
 
@@ -2400,6 +2467,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       if (unrestoredFileNames.length > 0) {
         missingImageReasons.push(
           `${unrestoredFileNames.join(", ")} could not be restored: the composer is at its ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS}-attachment limit.`,
+        );
+      }
+      if (expiredFileNames.length > 0) {
+        missingImageReasons.push(
+          `${expiredFileNames.join(", ")}: stashed files are kept for 24 hours and this upload expired. Attach the file again.`,
         );
       }
       if (missingImageReasons.length > 0) {
@@ -3502,7 +3574,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       ? {
                           uploadsByImageId,
                           onRetryUpload: (image: ComposerImageAttachment) =>
-                            retryAttachmentUpload({ environmentId, image }),
+                            retryAttachmentUpload({
+                              environmentId,
+                              image,
+                              draftTarget: composerDraftTarget,
+                            }),
                         }
                       : {})}
                     onRemove={(annotationId) => {
@@ -3628,7 +3704,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                       size="icon-xs"
                                       className="absolute bottom-1 left-1 bg-background/85 hover:bg-background/95"
                                       onClick={() =>
-                                        retryAttachmentUpload({ environmentId, image })
+                                        retryAttachmentUpload({
+                                          environmentId,
+                                          image,
+                                          draftTarget: composerDraftTarget,
+                                        })
                                       }
                                       aria-label={`Retry upload for ${image.name}`}
                                     />
@@ -3689,7 +3769,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                     variant="ghost"
                                     size="icon-xs"
                                     onClick={() =>
-                                      retryAttachmentUpload({ environmentId, image: file })
+                                      retryAttachmentUpload({
+                                        environmentId,
+                                        image: file,
+                                        draftTarget: composerDraftTarget,
+                                      })
                                     }
                                     aria-label={`Retry upload for ${file.name}`}
                                   />
