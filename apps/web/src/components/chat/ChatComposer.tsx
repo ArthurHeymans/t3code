@@ -56,6 +56,7 @@ import {
   type PersistedComposerFileAttachment,
   type PersistedComposerImageAttachment,
   composerFileNeedsReattach,
+  composerTargetKey,
   hydrateImagesFromPersisted,
   useComposerDraftStore,
   useComposerThreadDraft,
@@ -764,6 +765,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Store subscriptions (prompt / images / terminal contexts)
   // ------------------------------------------------------------------
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
+  // Live target key, for async flows that must notice a thread switch that
+  // happened while they awaited.
+  const composerDraftTargetKeyRef = useRef("");
+  composerDraftTargetKeyRef.current = composerTargetKey(composerDraftTarget);
   const prompt = composerDraft.prompt;
   const composerImages = composerDraft.images;
   const composerFiles = composerDraft.files;
@@ -2283,6 +2288,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           .map((file) => file.attachmentId),
       );
 
+      // A thread switch during the verify await would mix the new thread's
+      // prompt with this invocation's captured target. Nothing was taken yet,
+      // so abort and leave the entry restorable where the user now is.
+      if (composerTargetKey(composerDraftTarget) !== composerDraftTargetKeyRef.current) {
+        return;
+      }
+
       // The take is also the double-activation guard (click + Enter): the
       // second caller finds the entry gone and stops here.
       const { entry: taken, durable } = takeStashEntry(entry.id);
@@ -3779,7 +3791,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                           <span className="min-w-0 flex-1 truncate">{file.name}</span>
                           <span className="shrink-0 text-xs text-secondary-label">
                             {needsReattach
-                              ? "Attach again"
+                              ? canReattachFiles
+                                ? "Attach again"
+                                : "Remove to send"
                               : upload?.status === "uploading"
                                 ? formatAttachmentUploadProgress(upload.progress)
                                 : formatAttachmentSize(file.sizeBytes)}

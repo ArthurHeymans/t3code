@@ -1308,7 +1308,7 @@ function logicalProjectDraftKey(logicalProjectKey: string): string {
  * Draft sessions are keyed by `DraftId`. Real threads are keyed by
  * `ScopedThreadRef` so environment identity is always preserved.
  */
-function composerTargetKey(target: ScopedThreadRef | DraftId): string {
+export function composerTargetKey(target: ScopedThreadRef | DraftId): string {
   if (typeof target === "string") {
     return target.trim();
   }
