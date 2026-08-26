@@ -1,5 +1,4 @@
 import {
-  AssetAttachmentNotFoundError,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   WS_METHODS,
   type AttachmentCreateUploadUrlInput,
@@ -7,7 +6,6 @@ import {
   type AttachmentDeleteInput,
   type EnvironmentId,
 } from "@t3tools/contracts";
-import * as Schema from "effect/Schema";
 import type { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -39,20 +37,21 @@ export function createAttachmentEnvironmentAtoms<R, E>(
   };
 }
 
-const isAssetAttachmentNotFound = Schema.is(AssetAttachmentNotFoundError);
-
 /**
  * Whether a failed asset lookup means the attachment no longer exists on the
  * server, as opposed to a transient transport failure. Pending uploads expire,
  * so this is the signal to upload the bytes again rather than retry the lookup.
+ *
+ * A structural `_tag` check rather than a schema check: the squashed cause of
+ * a failed RPC is not guaranteed to be a decoded error class instance, only a
+ * tagged value.
  */
 export function isAssetAttachmentNotFoundFailure(error: unknown): boolean {
   return (
-    isAssetAttachmentNotFound(error) ||
-    (typeof error === "object" &&
-      error !== null &&
-      "_tag" in error &&
-      error._tag === "AssetAttachmentNotFoundError")
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    error._tag === "AssetAttachmentNotFoundError"
   );
 }
 
