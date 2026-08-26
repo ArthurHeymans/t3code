@@ -381,6 +381,34 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("drops the disk entry when a failed enqueue leaves no queued message behind", async () => {
+    const registry = AtomRegistry.make();
+    const removed: string[] = [];
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [],
+        write: async () => {
+          throw new Error("disk full");
+        },
+        remove: async (message) => {
+          removed.push(message.messageId);
+        },
+      },
+    });
+    const message = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+
+    // A concurrent update losing its race can compensate-write this payload
+    // to disk before this write fails; rollback must clear that copy or a
+    // restart resurrects the message.
+    await expect(manager.enqueue(message)).rejects.toBeInstanceOf(ThreadOutboxManagerError);
+    expect(removed).toEqual(["message-1"]);
+    registry.dispose();
+  });
+
   it("keeps a same-id retry queued when the first attempt's write fails", async () => {
     const registry = AtomRegistry.make();
     let failNextWrite = true;

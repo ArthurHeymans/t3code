@@ -113,6 +113,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
         // id may have optimistically replaced this attempt while the write was
         // in flight, and its entry must survive this attempt's failure.
         setMessages(currentMessages().filter((candidate) => candidate !== message));
+        // A concurrent update losing its post-write race compensates by
+        // persisting this message's payload before this write settles. When
+        // no same-id entry survives the rollback, drop that disk copy too, or
+        // a restart resurrects a message the queue no longer holds.
+        if (!currentMessages().some((candidate) => candidate.messageId === message.messageId)) {
+          try {
+            await options.storage.remove(message);
+          } catch {
+            // Best effort: bootstrap reconciles the queue against storage.
+          }
+        }
         throw new ThreadOutboxManagerError({
           operation: "enqueue",
           environmentId: message.environmentId,

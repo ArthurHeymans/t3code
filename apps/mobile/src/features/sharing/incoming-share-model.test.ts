@@ -241,6 +241,33 @@ describe("incoming native shares", () => {
     ]);
   });
 
+  it("records the stored copy's measured size when a content URI under-reports", async () => {
+    const file: SharePayload = {
+      shareType: "file",
+      value: "content://shared/report",
+      mimeType: "application/pdf",
+    };
+    // The source claims 42 bytes but the stored copy measures 4200.
+    const persistFile = vi.fn(async () => "file:///documents/report.pdf");
+    const readSize = vi.fn(async (uri: string) => (uri.startsWith("content:") ? 42 : 4200));
+
+    const result = await buildIncomingShareDraft({
+      id: "share-android-report",
+      createdAt: "2026-07-15T10:00:00.000Z",
+      payloads: [file],
+      resolvedPayloads: [],
+      fileReader: {
+        readBase64: async () => "unused",
+        persistFile,
+        readSize,
+        removeOwnedFile: async () => undefined,
+      },
+    });
+
+    expect(result.attachments).toHaveLength(1);
+    expect(result.attachments[0]?.sizeBytes).toBe(4200);
+  });
+
   it("treats a zero-length Android content URI as unknown until its copy is measured", async () => {
     const file: SharePayload = {
       shareType: "file",

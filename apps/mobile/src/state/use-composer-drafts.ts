@@ -727,6 +727,13 @@ export function undoComposerDraftMergeState(
       .filter((attachment) => !snapshotAttachmentIds.has(attachment.id))
       .map((attachment) => attachment.id),
   );
+  // A setting still holding the merge's value is the merge's doing: restore
+  // the snapshot's. One the user changed since the merge stays theirs.
+  const undoSetting = <
+    K extends "modelSelection" | "runtimeMode" | "interactionMode" | "workspaceSelection",
+  >(
+    key: K,
+  ): ComposerDraft[K] => (existing[key] === merged[key] ? snapshot[key] : existing[key]);
   const draft = {
     ...existing,
     text:
@@ -736,6 +743,10 @@ export function undoComposerDraftMergeState(
     attachments: existing.attachments.filter(
       (attachment) => !insertedAttachmentIds.has(attachment.id),
     ),
+    modelSelection: undoSetting("modelSelection"),
+    runtimeMode: undoSetting("runtimeMode"),
+    interactionMode: undoSetting("interactionMode"),
+    workspaceSelection: undoSetting("workspaceSelection"),
   };
   if (isEmptyDraft(draft)) {
     const next = { ...current };

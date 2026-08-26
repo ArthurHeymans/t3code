@@ -299,6 +299,18 @@ export async function buildIncomingShareDraft(input: {
         }
         if (persistedFileUri === undefined && input.fileReader.persistFile) {
           persistedFileUri = await input.fileReader.persistFile(uri, name);
+          // An Android content: source can under-report its size while still
+          // delivering more bytes. The stored copy is what uploads, so its
+          // measured size is what the attachment must record.
+          const storedSize = (await input.fileReader.readSize?.(persistedFileUri)) ?? null;
+          if (storedSize !== null && storedSize > 0) {
+            sizeBytes = storedSize;
+          }
+          if (sizeBytes > PROVIDER_SEND_TURN_MAX_FILE_BYTES) {
+            warnings.push(fileAttachmentTooLargeMessage(name, PROVIDER_SEND_TURN_MAX_FILE_BYTES));
+            await releaseOwnedFiles(input.fileReader, [persistedFileUri]);
+            continue;
+          }
         }
         attachments.push({
           id: `${input.id}:file:${index}`,

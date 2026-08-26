@@ -648,6 +648,41 @@ describe("mobile composer drafts", () => {
     ).toEqual({});
   });
 
+  it("returns merge-written settings to the snapshot but keeps user-edited ones", () => {
+    const draftKey = "environment-1:thread-1";
+    const snapshot: ComposerDraft = {
+      text: "typed before",
+      attachments: [],
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+    };
+    const merged: ComposerDraft = {
+      text: "typed before\n\nqueued text",
+      attachments: [],
+      runtimeMode: "full-access",
+      interactionMode: "default",
+    };
+    // The user edited the text (forcing the partial undo) and also switched
+    // interaction mode, but never touched the merge-written runtime mode.
+    const edited: ComposerDraft = {
+      text: "typed EDITED before\n\nqueued text",
+      attachments: [],
+      runtimeMode: "full-access",
+      interactionMode: "plan",
+    };
+
+    expect(undoComposerDraftMergeState({ [draftKey]: edited }, draftKey, snapshot, merged)).toEqual(
+      {
+        [draftKey]: {
+          text: "typed EDITED before",
+          attachments: [],
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+        },
+      },
+    );
+  });
+
   it("takes out only what the merge inserted when the user edited during it", () => {
     const draftKey = "environment-1:thread-1";
     const keptAttachment = {
