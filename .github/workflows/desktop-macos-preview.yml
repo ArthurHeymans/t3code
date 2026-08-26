@@ -207,7 +207,7 @@ jobs:
               "No GitHub sign-in is needed. The download stays available until this PR closes or the preview label is removed.",
             ].join("\n");
 
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
@@ -270,7 +270,7 @@ jobs:
         with:
           script: |
             const marker = "<!-- desktop-macos-preview -->";
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
