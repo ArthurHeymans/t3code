@@ -1,5 +1,6 @@
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
+  type EnvironmentId,
   type ProviderInstanceId,
   type ProviderDriverKind,
   type ResolvedKeybindingsConfig,
@@ -35,7 +36,11 @@ import {
   resolveShortcutCommand,
   shortcutLabelForCommand,
 } from "../../keybindings";
-import { useClientSettings, useUpdateClientSettings } from "~/hooks/useSettings";
+import {
+  useClientSettings,
+  useEnvironmentServerSettings,
+  useUpdateEnvironmentSettings,
+} from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
 import { getVirtualizedScrollFadeClassName } from "../ui/scroll-area";
 import { TooltipProvider } from "../ui/tooltip";
@@ -120,6 +125,7 @@ function ModelListSeparator() {
 }
 
 export const ModelPickerContent = memo(function ModelPickerContent(props: {
+  environmentId: EnvironmentId;
   /** The instance currently selected in the composer (combobox "value"). */
   activeInstanceId: ProviderInstanceId;
   model: string;
@@ -165,7 +171,13 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const modelListRef = useRef<LegendListRef | null>(null);
   const highlightedModelKeyRef = useRef<string | null>(null);
-  const favorites = useClientSettings((s) => s.favorites ?? []);
+  const legacyClientFavorites = useClientSettings((settings) => settings.favorites);
+  const serverFavorites = useEnvironmentServerSettings(
+    props.environmentId,
+    (settings) => settings.favorites,
+  );
+  const favorites = serverFavorites ?? legacyClientFavorites;
+  const updateSettings = useUpdateEnvironmentSettings(props.environmentId);
   const activeEntry = props.instanceEntries.find(
     (entry) => entry.instanceId === props.activeInstanceId,
   );
@@ -222,7 +234,11 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   );
   const serverKeybindings = useAtomValue(primaryServerKeybindingsAtom);
   const keybindings = providedKeybindings ?? serverKeybindings;
-  const updateSettings = useUpdateClientSettings();
+  useEffect(() => {
+    if (serverFavorites === undefined && legacyClientFavorites.length > 0) {
+      updateSettings({ favorites: legacyClientFavorites });
+    }
+  }, [legacyClientFavorites, serverFavorites, updateSettings]);
 
   const focusSearchInput = useCallback(() => {
     searchInputRef.current?.focus({ preventScroll: true });

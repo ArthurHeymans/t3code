@@ -275,6 +275,13 @@ export const LoadBalancingWeights = Schema.Record(
 
 export const DiffColorScheme = Schema.Literals(["red-green", "blue-orange"]);
 
+const ModelFavorites = Schema.Array(
+  Schema.Struct({
+    provider: ProviderInstanceId,
+    model: TrimmedNonEmptyString,
+  }),
+);
+
 export const ClientSettingsSchema = Schema.Struct({
   diffColorScheme: DiffColorScheme.pipe(
     Schema.withDecodingDefault(Effect.succeed("red-green" as const)),
@@ -387,12 +394,7 @@ export const ClientSettingsSchema = Schema.Struct({
   // default instance for their kind (because `defaultInstanceIdForDriver(kind)`
   // uses the same slug). The field name is kept as `provider` for storage
   // stability; new call sites should treat the value as an instance id.
-  favorites: Schema.Array(
-    Schema.Struct({
-      provider: ProviderInstanceId,
-      model: TrimmedNonEmptyString,
-    }),
-  ).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  favorites: ModelFavorites.pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   providerModelPreferences: Schema.Record(
     ProviderInstanceId,
     Schema.Struct({
@@ -1010,6 +1012,13 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(false)),
   ),
   /**
+   * Model favorites shared by every client connected to this environment.
+   * Optional distinguishes servers that predate synced favorites from a user
+   * intentionally choosing an empty favorites list, allowing clients to
+   * migrate their legacy device-local favorites without resurrecting them.
+   */
+  favorites: Schema.optionalKey(ModelFavorites),
+  /**
    * Whether agents may drive the in-app preview browser. Turning this off
    * withholds the MCP credential, so the `t3-code` server (and with it every
    * `preview_*` tool) is never attached to a provider session, and the prompt
@@ -1319,6 +1328,7 @@ export const ServerSettingsPatch = Schema.Struct({
   enableLegacyTokenStreaming: Schema.optionalKey(Schema.Boolean),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
+  favorites: Schema.optionalKey(ModelFavorites),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   projectAgentBrowserAccessOverrides: Schema.optionalKey(
     Schema.Record(ProjectId, Schema.NullOr(Schema.Boolean)),
@@ -1430,14 +1440,7 @@ export const ClientSettingsPatch = Schema.Struct({
   fontFamilyTerminal: Schema.optionalKey(FontFamilyPreference),
   fontSmoothing: Schema.optionalKey(Schema.Boolean),
   persistComposerContextStrip: Schema.optionalKey(Schema.Boolean),
-  favorites: Schema.optionalKey(
-    Schema.Array(
-      Schema.Struct({
-        provider: ProviderInstanceId,
-        model: TrimmedNonEmptyString,
-      }),
-    ),
-  ),
+  favorites: Schema.optionalKey(ModelFavorites),
   providerModelPreferences: Schema.optionalKey(
     Schema.Record(
       ProviderInstanceId,

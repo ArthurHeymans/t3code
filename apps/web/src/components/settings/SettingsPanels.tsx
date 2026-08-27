@@ -74,6 +74,7 @@ import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
+import { usePrimaryEnvironment } from "../../state/environments";
 import {
   getCustomModelOptionsByInstance,
   resolveAppModelSelectionState,
@@ -2118,6 +2119,7 @@ export function GeneralSettingsPanel() {
   const updateSettings = useUpdatePrimarySettings();
   const navigate = useNavigate();
   const environmentId = usePrimaryEnvironmentId();
+  const environment = usePrimaryEnvironment();
   const [backgroundActivityDialogOpen, setBackgroundActivityDialogOpen] = useState(false);
   const lastEnabledProjectGroupingMode = useRef<SidebarProjectGroupingMode>(
     readLastEnabledProjectGroupingMode(),
@@ -2840,13 +2842,14 @@ export function GeneralSettingsPanel() {
             ) : null
           }
           control={
-            !hasTextGenerationProvider ? (
+            !hasTextGenerationProvider || !environment ? (
               <span className="text-sm text-muted-foreground">
                 No text generation providers available.
               </span>
             ) : (
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 <ProviderModelPicker
+                  environmentId={environment.environmentId}
                   activeInstanceId={textGenInstanceId}
                   model={textGenModel}
                   lockedProvider={null}

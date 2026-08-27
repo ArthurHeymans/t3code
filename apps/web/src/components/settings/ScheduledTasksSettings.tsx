@@ -666,6 +666,7 @@ function EnvironmentScheduledTasksSettings({
 
             <Field label="Model">
               <ProviderModelPicker
+                environmentId={environmentId}
                 activeInstanceId={activeInstanceId}
                 model={activeModel}
                 lockedProvider={null}

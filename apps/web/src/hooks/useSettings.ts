@@ -308,7 +308,11 @@ export function mergeEnvironmentSettings(
 ): UnifiedSettings {
   // Decode drops retired client keys, but older untyped persistence adapters
   // can still return them. Server-owned values must always win.
-  return { ...clientSettings, ...serverSettings };
+  return {
+    ...clientSettings,
+    ...serverSettings,
+    favorites: serverSettings.favorites ?? clientSettings.favorites,
+  };
 }
 
 function useMergedSettings<T>(
@@ -379,6 +383,16 @@ export function useLegacySidebarEnabled(): boolean {
   const settingsHydrated = useClientSettingsHydrated();
   const legacySidebarEnabled = useClientSettingsValue().legacySidebarEnabled;
   return settingsHydrated && legacySidebarEnabled;
+}
+
+/** Read server-authoritative settings for one environment without client-local overlays. */
+export function useEnvironmentServerSettings<T = ServerSettings>(
+  environmentId: EnvironmentId,
+  selector?: (settings: ServerSettings) => T,
+): T {
+  const settings =
+    useAtomValue(serverEnvironment.settingsValueAtom(environmentId)) ?? DEFAULT_SERVER_SETTINGS;
+  return useMemo(() => (selector ? selector(settings) : (settings as T)), [selector, settings]);
 }
 
 /** Read current settings for one environment, merged with client-local preferences. */

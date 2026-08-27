@@ -16,6 +16,7 @@ import {
   getCustomModelOptionsByInstance,
   resolveAppModelSelectionState,
 } from "../../modelSelection";
+import { usePrimaryEnvironment } from "../../state/environments";
 import { primaryServerProvidersAtom } from "../../state/server";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
@@ -52,6 +53,7 @@ export function SourceControlWritingSettingsSection() {
   const updateSettings = useUpdatePrimarySettings();
   const navigate = useNavigate();
   const environmentId = usePrimaryEnvironmentId();
+  const environment = usePrimaryEnvironment();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
   const customInstructionsRef = useRef<HTMLTextAreaElement>(null);
   const style = settings.sourceControlWritingStyle;
@@ -203,8 +205,9 @@ export function SourceControlWritingSettingsSection() {
                 No text generation providers available.
               </span>
             ) : null}
-            {usesDedicatedModel && canEnableDedicatedModel ? (
+            {usesDedicatedModel && canEnableDedicatedModel && environment ? (
               <ProviderModelPicker
+                environmentId={environment.environmentId}
                 activeInstanceId={activeSelection.instanceId}
                 model={activeSelection.model}
                 lockedProvider={null}

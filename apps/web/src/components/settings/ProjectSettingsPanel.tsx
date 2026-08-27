@@ -1054,6 +1054,7 @@ function ProjectDetail({
               resolvedSelection && activeEntry ? (
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <ProviderModelPicker
+                    environmentId={group.environmentId}
                     activeInstanceId={resolvedSelection.instanceId}
                     model={resolvedSelection.model}
                     lockedProvider={null}

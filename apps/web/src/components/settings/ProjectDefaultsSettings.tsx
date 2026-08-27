@@ -223,12 +223,13 @@ export function ProjectDefaultsSettings({
             ) : null
           }
           control={
-            selection && activeEntry ? (
+            selection && activeEntry && representative ? (
               <fieldset
                 disabled={disabled("defaultModelSelection")}
                 className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 disabled:opacity-50"
               >
                 <ProviderModelPicker
+                  environmentId={representative.environmentId}
                   activeInstanceId={selection.instanceId}
                   model={selection.model}
                   lockedProvider={null}
