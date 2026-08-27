@@ -413,6 +413,20 @@ describe("mergeEnvironmentSettings", () => {
     expect(settings.sidebarAutoSettleAfterDays).toBe(14);
     expect(settings.sidebarAutoSettleOnMerge).toBe(false);
   });
+
+  it("prefers environment favorites after legacy client favorites are migrated", () => {
+    const clientFavorites = [{ provider: ProviderInstanceId.make("codex"), model: "gpt-5.4" }];
+    const serverFavorites = [
+      { provider: ProviderInstanceId.make("openrouter"), model: "anthropic/claude-sonnet-4" },
+    ];
+
+    expect(
+      mergeEnvironmentSettings(
+        { ...DEFAULT_SERVER_SETTINGS, favorites: serverFavorites },
+        { ...DEFAULT_CLIENT_SETTINGS, favorites: clientFavorites },
+      ).favorites,
+    ).toBe(serverFavorites);
+  });
 });
 
 describe("onboarding completion persistence", () => {

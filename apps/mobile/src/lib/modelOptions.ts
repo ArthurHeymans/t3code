@@ -20,6 +20,7 @@ export type ModelOption = {
   readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   readonly providerIconUrl?: string | undefined;
   readonly isDefault: boolean;
+  readonly isFavorite: boolean;
   readonly isLegacy: boolean;
   readonly isUnavailable?: boolean;
   readonly capabilities: ModelCapabilities | null;
@@ -161,6 +162,9 @@ export function buildModelOptions(
   providerInstanceId?: ModelSelection["instanceId"],
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
+  const favoriteModelKeys = new Set(
+    (config?.settings?.favorites ?? []).map((favorite) => `${favorite.provider}:${favorite.model}`),
+  );
 
   for (const provider of config?.providers ?? []) {
     if (
@@ -188,6 +192,7 @@ export function buildModelOptions(
           : { supportedRuntimeModes: provider.supportedRuntimeModes }),
         ...(provider.iconUrl ? { providerIconUrl: provider.iconUrl } : {}),
         isDefault: model.isDefault === true,
+        isFavorite: favoriteModelKeys.has(key),
         isLegacy: model.isLegacy === true,
         capabilities: model.capabilities,
         selection: normalizeSelectionOptions(
@@ -238,12 +243,12 @@ export function buildModelOptions(
         providerLabel,
         providerDriver,
         isDefault: false,
+        isFavorite: favoriteModelKeys.has(key),
         isLegacy: model?.isLegacy === true,
         ...(isModelSelectionUnavailable(config, fallbackModelSelection)
           ? { isUnavailable: true }
           : {}),
-        capabilities: model?.capabilities ?? null,
-        selection: fallbackModelSelection,
+        capabilities: model?.capabilities ?? null,        selection: fallbackModelSelection,
       });
     }
   }
@@ -268,7 +273,9 @@ export function groupByProvider(options: ReadonlyArray<ModelOption>): ReadonlyAr
   return [...groups.entries()].map(([providerKey, group]) => ({
     providerKey,
     providerLabel: group.providerLabel,
-    models: group.models,
+    models: [...group.models].sort(
+      (left, right) => Number(right.isFavorite) - Number(left.isFavorite),
+    ),
   }));
 }
 

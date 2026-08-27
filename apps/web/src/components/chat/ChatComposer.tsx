@@ -5358,6 +5358,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ) : null}
       <ProviderModelPicker
         compact={false}
+        environmentId={environmentId}
         isComposerOwned
         disabled={providerCatalogPending || isSendBusy}
         {...(routeKind === "draft" && supportsMultipleModels

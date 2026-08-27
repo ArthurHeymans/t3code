@@ -743,6 +743,14 @@ describe("ClientSettings pull request merge methods", () => {
   });
 });
 
+describe("ServerSettings favorites", () => {
+  it("distinguishes legacy servers from an intentionally empty synced list", () => {
+    expect(decodeServerSettings({}).favorites).toBeUndefined();
+    expect(decodeServerSettings({ favorites: [] }).favorites).toEqual([]);
+    expect(decodeServerSettingsPatch({ favorites: [] }).favorites).toEqual([]);
+  });
+});
+
 describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   it("defaults to an empty record so legacy configs without the key still decode", () => {
     expect(DEFAULT_SERVER_SETTINGS.providerInstances).toEqual({});
