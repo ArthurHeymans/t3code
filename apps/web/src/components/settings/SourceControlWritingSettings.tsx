@@ -15,6 +15,7 @@ import {
   getCustomModelOptionsByInstance,
   resolveAppModelSelectionState,
 } from "../../modelSelection";
+import { usePrimaryEnvironment } from "../../state/environments";
 import { primaryServerProvidersAtom } from "../../state/server";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -44,6 +45,7 @@ const MODE_OPTIONS: Record<SourceControlWritingStyleMode, { label: string; descr
 export function SourceControlWritingSettingsSection() {
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
+  const environment = usePrimaryEnvironment();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
   const customInstructionsRef = useRef<HTMLTextAreaElement>(null);
   const style = settings.sourceControlWritingStyle;
@@ -174,8 +176,9 @@ export function SourceControlWritingSettingsSection() {
         description="Optional model override for change descriptions, change request titles and descriptions, and branch or bookmark names. Off uses the global text generation model."
         control={
           <div className="flex flex-wrap items-center justify-end gap-2">
-            {usesDedicatedModel ? (
+            {usesDedicatedModel && environment ? (
               <ProviderModelPicker
+                environmentId={environment.environmentId}
                 activeInstanceId={activeSelection.instanceId}
                 model={activeSelection.model}
                 lockedProvider={null}

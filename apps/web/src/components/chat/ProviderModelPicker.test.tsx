@@ -1,4 +1,9 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -34,6 +39,7 @@ function renderPicker(input: {
   const entry = providerEntry(input.instanceId, input.driver);
   return renderToStaticMarkup(
     <ProviderModelPicker
+      environmentId={EnvironmentId.make("environment-model-picker-test")}
       activeInstanceId={instanceId}
       model={input.model}
       lockedProvider={null}

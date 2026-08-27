@@ -249,6 +249,22 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
+  it.effect("persists an explicitly empty synced favorites list", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const favorite = {
+        provider: ProviderInstanceId.make("openrouter"),
+        model: "anthropic/claude-sonnet-4",
+      };
+
+      assert.deepEqual(
+        (yield* serverSettings.updateSettings({ favorites: [favorite] })).favorites,
+        [favorite],
+      );
+      assert.deepEqual((yield* serverSettings.updateSettings({ favorites: [] })).favorites, []);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("buffers changes after a subscription is acquired but before it is consumed", () =>
     Effect.scoped(
       Effect.gen(function* () {

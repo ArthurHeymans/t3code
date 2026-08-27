@@ -197,6 +197,14 @@ describe("ClientSettings sidebar", () => {
   });
 });
 
+describe("ServerSettings favorites", () => {
+  it("distinguishes legacy servers from an intentionally empty synced list", () => {
+    expect(decodeServerSettings({}).favorites).toBeUndefined();
+    expect(decodeServerSettings({ favorites: [] }).favorites).toEqual([]);
+    expect(decodeServerSettingsPatch({ favorites: [] }).favorites).toEqual([]);
+  });
+});
+
 describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   it("defaults text generation to Luna at low reasoning effort", () => {
     expect(DEFAULT_SERVER_SETTINGS.textGenerationModelSelection).toEqual({

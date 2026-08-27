@@ -19,6 +19,7 @@ export type ModelOption = {
   readonly providerDriver: string;
   readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   readonly isDefault: boolean;
+  readonly isFavorite: boolean;
   readonly isLegacy: boolean;
   readonly capabilities: ModelCapabilities | null;
   readonly selection: ModelSelection;
@@ -129,6 +130,9 @@ export function buildModelOptions(
   fallbackModelSelection: ModelSelection | null,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
+  const favoriteModelKeys = new Set(
+    (config?.settings?.favorites ?? []).map((favorite) => `${favorite.provider}:${favorite.model}`),
+  );
 
   for (const provider of config?.providers ?? []) {
     if (!provider.enabled || !provider.installed || provider.auth.status === "unauthenticated") {
@@ -149,6 +153,7 @@ export function buildModelOptions(
           ? {}
           : { supportedRuntimeModes: provider.supportedRuntimeModes }),
         isDefault: model.isDefault === true,
+        isFavorite: favoriteModelKeys.has(key),
         isLegacy: model.isLegacy === true,
         capabilities: model.capabilities,
         selection: normalizeSelectionOptions(
@@ -180,6 +185,7 @@ export function buildModelOptions(
         providerLabel,
         providerDriver: fallbackModelSelection.instanceId,
         isDefault: false,
+        isFavorite: favoriteModelKeys.has(key),
         isLegacy: false,
         capabilities: null,
         selection: fallbackModelSelection,
@@ -207,7 +213,9 @@ export function groupByProvider(options: ReadonlyArray<ModelOption>): ReadonlyAr
   return [...groups.entries()].map(([providerKey, group]) => ({
     providerKey,
     providerLabel: group.providerLabel,
-    models: group.models,
+    models: [...group.models].sort(
+      (left, right) => Number(right.isFavorite) - Number(left.isFavorite),
+    ),
   }));
 }
 

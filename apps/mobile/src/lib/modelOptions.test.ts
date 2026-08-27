@@ -102,6 +102,45 @@ describe("mobile model options", () => {
     ]);
   });
 
+  it("moves synced favorites to the front of large provider catalogs", () => {
+    const config = {
+      settings: {
+        favorites: [
+          { provider: ProviderInstanceId.make("openrouter"), model: "anthropic/claude-sonnet-4" },
+        ],
+      },
+      providers: [
+        {
+          instanceId: "openrouter",
+          driver: "opencode",
+          displayName: "OpenRouter",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "model-a", name: "Model A", isCustom: false, capabilities: null },
+            {
+              slug: "anthropic/claude-sonnet-4",
+              name: "Claude Sonnet 4",
+              isCustom: false,
+              capabilities: null,
+            },
+            { slug: "model-b", name: "Model B", isCustom: false, capabilities: null },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    expect(groupByProvider(buildModelOptions(config, null))[0]?.models).toMatchObject([
+      {
+        key: "openrouter:anthropic/claude-sonnet-4",
+        isFavorite: true,
+      },
+      { key: "openrouter:model-a", isFavorite: false },
+      { key: "openrouter:model-b", isFavorite: false },
+    ]);
+  });
+
   it("normalizes a legacy fallback selection against current capabilities", () => {
     const config = {
       providers: [

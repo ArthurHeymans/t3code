@@ -123,6 +123,11 @@ function ModelRow(props: {
           >
             {props.option.label}
           </Text>
+          {props.option.isFavorite ? (
+            <View className="rounded-md bg-subtle-strong px-1.5 py-0.5">
+              <Text className="text-3xs font-t3-bold text-foreground-muted">Favorite</Text>
+            </View>
+          ) : null}
           {props.option.isDefault ? (
             <View className="rounded-md bg-subtle-strong px-1.5 py-0.5">
               <Text className="text-3xs font-t3-bold text-foreground-muted">Default</Text>

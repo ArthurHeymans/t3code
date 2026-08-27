@@ -603,18 +603,21 @@ export function ScheduledTasksSettings() {
             </Field>
 
             <Field label="Model">
-              <ProviderModelPicker
-                activeInstanceId={activeInstanceId}
-                model={activeModel}
-                lockedProvider={null}
-                instanceEntries={instanceEntries}
-                modelOptionsByInstance={modelOptionsByInstance}
-                triggerVariant="outline"
-                triggerClassName="w-full max-w-none justify-between text-foreground/90 hover:text-foreground"
-                onInstanceModelChange={(instanceId, model) =>
-                  setDraft((current) => ({ ...current, modelKey: `${instanceId}:${model}` }))
-                }
-              />
+              {environment ? (
+                <ProviderModelPicker
+                  environmentId={environment.environmentId}
+                  activeInstanceId={activeInstanceId}
+                  model={activeModel}
+                  lockedProvider={null}
+                  instanceEntries={instanceEntries}
+                  modelOptionsByInstance={modelOptionsByInstance}
+                  triggerVariant="outline"
+                  triggerClassName="w-full max-w-none justify-between text-foreground/90 hover:text-foreground"
+                  onInstanceModelChange={(instanceId, model) =>
+                    setDraft((current) => ({ ...current, modelKey: `${instanceId}:${model}` }))
+                  }
+                />
+              ) : null}
             </Field>
 
             <div className="space-y-3">
