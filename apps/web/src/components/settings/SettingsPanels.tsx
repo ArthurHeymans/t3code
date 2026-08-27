@@ -3080,13 +3080,14 @@ export function GeneralSettingsPanel() {
               <span className="text-sm text-muted-foreground">
                 Connect an environment to choose its text generation model.
               </span>
-            ) : !hasTextGenerationProvider ? (
+            ) : !hasTextGenerationProvider || !environment ? (
               <span className="text-sm text-muted-foreground">
                 No text generation providers available.
               </span>
             ) : (
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 <ProviderModelPicker
+                  environmentId={environment.environmentId}
                   activeInstanceId={textGenInstanceId}
                   model={textGenModel}
                   lockedProvider={null}

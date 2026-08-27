@@ -297,8 +297,9 @@ export function SourceControlWritingSettingsSection() {
                   No text generation providers available.
                 </span>
               ) : null}
-              {usesDedicatedModel && canEnableDedicatedModel ? (
+              {usesDedicatedModel && canEnableDedicatedModel && environmentId ? (
                 <ProviderModelPicker
+                  environmentId={environmentId}
                   activeInstanceId={activeSelection.instanceId}
                   model={activeSelection.model}
                   lockedProvider={null}
