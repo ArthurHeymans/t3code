@@ -73,13 +73,47 @@ function messageIds(threadId: ThreadId, entryId: string) {
 function messageEvents(input: {
   readonly threadId: ThreadId;
   readonly entryId: string;
-  readonly role: "user" | "assistant";
+  readonly role: "user" | "assistant" | "custom";
   readonly text: string;
+  readonly customType?: string;
   readonly createdAt: string;
   readonly ordinal: number;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
   const ids = messageIds(input.threadId, input.entryId);
   const createdAt = DateTime.makeUnsafe(input.createdAt);
+  const baseTurnItem = {
+    id: ids.turnItemId,
+    threadId: input.threadId,
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: input.ordinal,
+    status: "completed" as const,
+    title: input.role === "custom" ? (input.customType ?? "notification") : null,
+    startedAt: createdAt,
+    completedAt: createdAt,
+    updatedAt: createdAt,
+  };
+  if (input.role === "custom") {
+    return [
+      {
+        id: ids.turnItemEventId,
+        type: "turn-item.updated",
+        threadId: input.threadId,
+        occurredAt: createdAt,
+        payload: {
+          ...baseTurnItem,
+          type: "dynamic_tool",
+          toolName: input.customType ?? "notification",
+          input: {},
+          output: input.text,
+        },
+      },
+    ];
+  }
   const message: OrchestrationV2ConversationMessage = {
     createdBy: input.role === "user" ? "user" : "agent",
     creationSource: "server",
@@ -92,22 +126,6 @@ function messageEvents(input: {
     attachments: [],
     streaming: false,
     createdAt,
-    updatedAt: createdAt,
-  };
-  const baseTurnItem = {
-    id: ids.turnItemId,
-    threadId: input.threadId,
-    runId: null,
-    nodeId: null,
-    providerThreadId: null,
-    providerTurnId: null,
-    nativeItemRef: null,
-    parentItemId: null,
-    ordinal: input.ordinal,
-    status: "completed" as const,
-    title: null,
-    startedAt: createdAt,
-    completedAt: createdAt,
     updatedAt: createdAt,
   };
   const turnItem: OrchestrationV2TurnItem =
@@ -173,9 +191,12 @@ const make = Effect.gen(function* () {
             AND stream_id = ${input.threadId}
         `;
         const existing = new Set(existingRows.map((row) => row.event_id));
-        const missing = messages.filter(
-          (message) => !existing.has(messageIds(input.threadId, message.entryId).messageEventId),
-        );
+        const missing = messages.filter((message) => {
+          const ids = messageIds(input.threadId, message.entryId);
+          return !existing.has(
+            message.role === "custom" ? ids.turnItemEventId : ids.messageEventId,
+          );
+        });
         for (const batch of chunks(missing, EVENT_BATCH_SIZE / 2)) {
           yield* Effect.forEach(
             batch,

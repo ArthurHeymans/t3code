@@ -151,6 +151,12 @@ describe("PiSessions", () => {
           text: longAssistantText,
           ordinal: 2,
         },
+        {
+          entryId: "notification",
+          role: "custom",
+          text: "Process finished",
+          ordinal: 3,
+        },
       ],
     );
   });
