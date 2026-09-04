@@ -100,6 +100,10 @@ import {
   type ProviderAdapterDriverCreateInput,
 } from "../ProviderAdapterDriver.ts";
 import { makeProviderFailure, makeProviderRetryTurnItem } from "../ProviderFailure.ts";
+import {
+  ProviderContinuationRequests,
+  type ProviderContinuationRequest,
+} from "../ProviderContinuationRequests.ts";
 import { turnScopedSelectionTransition } from "../ProviderSelectionTransition.ts";
 import {
   makePiRpcConnection,
@@ -130,8 +134,6 @@ const PI_INHERIT_MODEL_SLUG = "default";
 const STREAM_FLUSH_MS = 50;
 const PI_REQUEST_TIMEOUT_MS = 15_000;
 const PI_SKILL_DISCOVERY_TIMEOUT_MS = 4_000;
-const PI_UNSOLICITED_ACTIVITY_ERROR =
-  "Pi started agent work outside an active T3 turn. The session was stopped to prevent invisible tool execution.";
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
 const SETTLE_PROBE_RETRY_DELAY = Duration.millis(100);
 
@@ -248,6 +250,10 @@ export interface PiAdapterV2Options {
   readonly fileSystem: FileSystem.FileSystem;
   readonly idAllocator: IdAllocatorV2["Service"];
   readonly serverConfig: ServerConfig["Service"];
+  /** Sink for provider-initiated continuation requests; defaults to dropping them. */
+  readonly continuationRequests?: {
+    readonly offer: (request: ProviderContinuationRequest) => Effect.Effect<void>;
+  };
 }
 
 /** Concatenate the `text` fields of a Pi content-block array. */
@@ -363,10 +369,19 @@ interface PiThreadState {
   activeTurn: ActivePiTurn | null;
 }
 
+interface PendingPiContinuation {
+  readonly generation: number;
+  readonly events: Array<PiRpcRecord>;
+  detail: string | null;
+  offered: boolean;
+  settled: boolean;
+}
+
 // ── adapter ───────────────────────────────────────────────────
 
 export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2Shape {
   const { idAllocator } = options;
+  const continuationRequests = options.continuationRequests ?? { offer: () => Effect.void };
 
   const protocolError = (detail: string, payload?: unknown) =>
     new ProviderAdapterProtocolError({
@@ -468,10 +483,11 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
       // Keep that intent beyond turn finalization so the later stdout close is
       // not mistaken for an unexpected transport failure.
       let stopRequested = false;
-      // Pi extensions can trigger an agent turn after the owning T3 turn has
-      // settled. Until orchestration has a first-class provider-initiated run,
-      // stop that runtime before it can execute tools without a timeline owner.
-      let unsolicitedActivityDetected = false;
+      // Pi extensions can trigger work after the owning T3 turn settles. Keep
+      // those native events until orchestration creates an adapter-buffered
+      // continuation turn that can own and project them.
+      let pendingContinuation: PendingPiContinuation | null = null;
+      let nextContinuationGeneration = 1;
       let appliedModel: string | null = null;
       let appliedThinking: string | null = null;
       /** Last thread title synced into pi's session name (`/resume` listing). */
@@ -1082,6 +1098,33 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
           });
         });
 
+      const emitCustomMessage = Effect.fnUntraced(function* (
+        turn: ActivePiTurn,
+        message: PiRpcRecord,
+      ) {
+        if (recordField(message, "display") === false) return;
+        const text = contentText(message["content"]);
+        if (text.length === 0) return;
+        const emittedAt = yield* DateTime.now;
+        const customType = recordString(message, "customType") ?? "notification";
+        const nativeItemId = `custom:${turn.nextItemOrdinal}`;
+        yield* emitItemNode(turn, nativeItemId, "system", "completed", emittedAt, emittedAt);
+        yield* emit({
+          type: "turn_item.updated",
+          driver: PI_PROVIDER,
+          turnItem: {
+            ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
+            status: "completed",
+            completedAt: emittedAt,
+            title: customType,
+            type: "dynamic_tool",
+            toolName: customType,
+            input: {},
+            output: text,
+          },
+        });
+      });
+
       const handleExtensionUiRequest = Effect.fnUntraced(function* (event: PiRpcRecord) {
         const method = recordString(event, "method");
         const nativeRequestId = recordString(event, "id");
@@ -1110,6 +1153,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
               },
             },
           });
+          if (turn.promptMayBeCommandOnly && !turn.sawAgentActivity) {
+            yield* scheduleSettleProbe(turn);
+          }
           return;
         }
         if (
@@ -1447,17 +1493,105 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
         );
       };
 
+      const continuationDetail = (event: PiRpcRecord): string | null => {
+        if (
+          event["type"] === "extension_ui_request" &&
+          recordString(event, "method") === "notify"
+        ) {
+          return recordString(event, "message") ?? null;
+        }
+        if (event["type"] !== "message_end") return null;
+        const message = event["message"];
+        if (recordString(message, "role") !== "custom") return null;
+        const text = contentText(recordField(message, "content"));
+        return text.length === 0 ? null : text;
+      };
+
+      const offerPendingContinuation = (continuation: PendingPiContinuation) => {
+        const state = threadState;
+        if (state === null || continuation.offered) return Effect.void;
+        continuation.offered = true;
+        const generation = continuation.generation;
+        const isCurrent = () => pendingContinuation?.generation === generation;
+        return continuationRequests.offer({
+          threadId: state.providerThread.appThreadId ?? input.threadId,
+          providerThreadId: state.providerThread.id,
+          driver: PI_PROVIDER,
+          detail: continuation.detail,
+          delivery: "adapter_buffered",
+          dispatchIfCurrent: (effect) =>
+            sessionEventPermit.withPermits(1)(
+              Effect.suspend(() =>
+                isCurrent() ? effect.pipe(Effect.map(Option.some)) : Effect.succeed(Option.none()),
+              ),
+            ),
+          clearIfCurrent: () =>
+            sessionEventPermit.withPermits(1)(
+              Effect.sync(() => {
+                if (isCurrent()) pendingContinuation = null;
+              }),
+            ),
+        });
+      };
+
+      const bufferOutOfTurnEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        const state = threadState;
+        if (state === null) {
+          yield* Effect.logWarning(
+            "Pi emitted an out-of-turn event before a thread was registered.",
+            {
+              eventType: event["type"],
+            },
+          );
+          return;
+        }
+        const continuation =
+          pendingContinuation ??
+          ({
+            generation: nextContinuationGeneration++,
+            events: [],
+            detail: null,
+            offered: false,
+            settled: false,
+          } satisfies PendingPiContinuation);
+        pendingContinuation = continuation;
+        continuation.events.push(event);
+        continuation.detail ??= continuationDetail(event);
+        if (
+          event["type"] === "agent_settled" ||
+          (event["type"] === "message_end" &&
+            recordString(event["message"], "role") === "custom") ||
+          (event["type"] === "extension_ui_request" && recordString(event, "method") === "notify")
+        ) {
+          continuation.settled = true;
+        }
+        yield* offerPendingContinuation(continuation);
+      });
+
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
         const state = threadState;
         const turn = state?.activeTurn ?? null;
+        if (turn === null && pendingContinuation !== null) {
+          yield* bufferOutOfTurnEvent(event);
+          return;
+        }
+        if (turn === null) {
+          const eventType = event["type"];
+          const messageRole = recordString(event["message"], "role");
+          const isCustomMessage =
+            (eventType === "message_start" || eventType === "message_end") &&
+            messageRole === "custom" &&
+            recordField(event["message"], "display") !== false;
+          const isNotification =
+            eventType === "extension_ui_request" && recordString(event, "method") === "notify";
+          if (eventType === "agent_start" || isCustomMessage || isNotification) {
+            yield* bufferOutOfTurnEvent(event);
+            return;
+          }
+        }
         switch (event["type"]) {
           case "agent_start": {
-            if (turn === null) {
-              unsolicitedActivityDetected = true;
-              yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
-              yield* connection.terminate;
-              return;
-            }
+            if (turn === null) return;
             turn.sawAgentActivity = true;
             turn.settleProbeGeneration += 1;
             return;
@@ -1503,6 +1637,13 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
           case "message_end": {
             if (turn === null) return;
             const message = event["message"];
+            if (recordString(message, "role") === "custom") {
+              yield* emitCustomMessage(turn, message as PiRpcRecord);
+              if (turn.promptMayBeCommandOnly && !turn.sawAgentActivity) {
+                yield* scheduleSettleProbe(turn);
+              }
+              return;
+            }
             if (recordString(message, "role") !== "assistant") return;
             yield* completeOpenStreamItems(turn);
             if (recordString(message, "stopReason") === "error" && turn.failure === null) {
@@ -1849,10 +1990,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
                     });
                 yield* finalizeTurn(state, false);
               }
-              if (unsolicitedActivityDetected) {
-                yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
-                yield* Queue.end(events);
-              } else if (stopRequested) {
+              if (stopRequested) {
                 yield* updateProviderSession("stopped", null);
                 yield* Queue.end(events);
               } else {
@@ -2099,6 +2237,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
+        hasPendingBackgroundWork: Effect.sync(() => pendingContinuation !== null),
+        hasPendingBackgroundWorkForThread: (providerThread) =>
+          Effect.sync(
+            () =>
+              pendingContinuation !== null && threadState?.providerThread.id === providerThread.id,
+          ),
         ensureThread: (threadInput) =>
           registerThread(threadInput).pipe(
             Effect.mapError(
@@ -2139,6 +2283,8 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
                 `Pi provider thread ${turnInput.providerThread.id} already has an active turn`,
               );
             }
+            const bufferedContinuation = pendingContinuation;
+            const isProviderContinuation = turnInput.message.creationSource === "provider";
             yield* applySelection(turnInput.modelSelection);
             // Mirror the thread title into pi's session name so the session
             // stays identifiable in pi's own /resume listing. Best-effort:
@@ -2161,11 +2307,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
             // extension's before_agent_start system-prompt hook, never by
             // wrapping the user text: a wrapped first message would no
             // longer start with "/" and slash commands would stop expanding.
-            const compactCommand = parsePiCompactCommand(turnInput.message.text);
+            const compactCommand = isProviderContinuation
+              ? null
+              : parsePiCompactCommand(turnInput.message.text);
             const payload =
-              compactCommand === null
-                ? yield* resolvePromptPayload(turnInput.message.text, turnInput.message.attachments)
-                : null;
+              isProviderContinuation || compactCommand !== null
+                ? null
+                : yield* resolvePromptPayload(
+                    turnInput.message.text,
+                    turnInput.message.attachments,
+                  );
             const startedAt = yield* DateTime.now;
             const syntheticNativeTurnId = `${state.providerThread.id}:attempt:${turnInput.attemptId}`;
             const providerTurn: OrchestrationV2ProviderTurn = {
@@ -2195,7 +2346,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
               interrupted: false,
               sawAgentActivity: false,
               promptMayBeCommandOnly:
-                compactCommand !== null || (payload?.message.trimStart().startsWith("/") ?? false),
+                isProviderContinuation ||
+                compactCommand !== null ||
+                (payload?.message.trimStart().startsWith("/") ?? false),
               latestCompactionAfterTokens: null,
               settleProbeGeneration: 0,
               settleWhenIdle: false,
@@ -2211,23 +2364,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
             // and answered instead of deadlocking the caller.
             yield* Effect.gen(function* () {
               state.activeTurn = activeTurn;
-              if (compactCommand !== null) {
-                yield* connection.send(compactRpcRecord(compactCommand));
-                pendingCompactResponses.push({
-                  providerTurnId: providerTurn.id,
-                  kind: "turn_start",
-                });
-              } else if (payload !== null) {
-                yield* connection.send({
-                  type: "prompt",
-                  message: payload.message,
-                  ...(payload.images.length === 0 ? {} : { images: payload.images }),
-                });
-                pendingPromptResponses.push({
-                  providerTurnId: providerTurn.id,
-                  kind: "turn_start",
-                });
-              }
+              const continuation =
+                pendingContinuation === bufferedContinuation ? bufferedContinuation : null;
+              if (continuation !== null) pendingContinuation = null;
               yield* emit({
                 type: "provider_turn.updated",
                 driver: PI_PROVIDER,
@@ -2240,6 +2379,36 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
                 lastRunOrdinal: turnInput.runOrdinal,
               });
               yield* updateProviderSession("running", null);
+              if (continuation !== null) {
+                for (const event of continuation.events) {
+                  yield* handleSessionEvent(event);
+                }
+              }
+              if (compactCommand !== null) {
+                yield* connection.send(compactRpcRecord(compactCommand));
+                pendingCompactResponses.push({
+                  providerTurnId: providerTurn.id,
+                  kind: "turn_start",
+                });
+              } else if (payload !== null) {
+                yield* connection.send({
+                  type: "prompt",
+                  message: payload.message,
+                  ...(continuation === null || continuation.settled
+                    ? {}
+                    : { streamingBehavior: "followUp" }),
+                  ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                });
+                pendingPromptResponses.push({
+                  providerTurnId: providerTurn.id,
+                  kind: "turn_start",
+                });
+              } else if (
+                !activeTurn.sawAgentActivity &&
+                (continuation === null || continuation.settled)
+              ) {
+                yield* scheduleSettleProbe(activeTurn);
+              }
               if (outOfTurnExtensionErrors.length > 0) {
                 yield* Queue.offer(connection.events, { type: "t3.flush_extension_errors" });
               }
@@ -2678,6 +2847,7 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocatorV2;
       const serverConfig = yield* ServerConfig;
+      const continuationRequests = yield* ProviderContinuationRequests;
       return makePiAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
@@ -2686,6 +2856,7 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
         fileSystem,
         idAllocator,
         serverConfig,
+        continuationRequests,
       });
     },
     (effect, input) =>
@@ -2711,6 +2882,7 @@ export const layer: Layer.Layer<ProviderAdapterV2, never, PiAdapterV2DriverEnv> 
     const fileSystem = yield* FileSystem.FileSystem;
     const idAllocator = yield* IdAllocatorV2;
     const serverConfig = yield* ServerConfig;
+    const continuationRequests = yield* ProviderContinuationRequests;
     return makePiAdapterV2({
       instanceId: PI_DEFAULT_INSTANCE_ID,
       settings: DEFAULT_PI_SETTINGS,
@@ -2719,6 +2891,7 @@ export const layer: Layer.Layer<ProviderAdapterV2, never, PiAdapterV2DriverEnv> 
       fileSystem,
       idAllocator,
       serverConfig,
+      continuationRequests,
     });
   }),
 );
