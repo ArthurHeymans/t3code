@@ -141,8 +141,9 @@ export async function listPiSessions(
 
 export interface PiSessionTranscriptMessage {
   readonly entryId: string;
-  readonly role: "user" | "assistant";
+  readonly role: "user" | "assistant" | "custom";
   readonly text: string;
+  readonly customType?: string;
   readonly createdAt: string;
   readonly ordinal: number;
 }
@@ -190,7 +191,17 @@ export async function readPiSessionTranscript(
     const id = record["id"];
     if (typeof id !== "string") continue;
     const parentId = record["parentId"];
-    const message = record["type"] === "message" ? record["message"] : null;
+    const message =
+      record["type"] === "message"
+        ? record["message"]
+        : record["type"] === "custom_message"
+          ? {
+              role: "custom",
+              content: record["content"],
+              customType: record["customType"],
+              display: record["display"],
+            }
+          : null;
     entries.set(id, {
       id,
       parentId: typeof parentId === "string" ? parentId : null,
@@ -218,14 +229,17 @@ export async function readPiSessionTranscript(
       if (typeof entry.message !== "object" || entry.message === null) return [];
       const message = entry.message as Record<string, unknown>;
       const role = message["role"];
-      if (role !== "user" && role !== "assistant") return [];
+      if (role !== "user" && role !== "assistant" && role !== "custom") return [];
+      if (role === "custom" && message["display"] === false) return [];
       const text = textFromContent(message["content"]);
       if (text === null) return [];
+      const customType = message["customType"];
       return [
         {
           entryId: entry.id,
-          role: role as "user" | "assistant",
+          role: role as PiSessionTranscriptMessage["role"],
           text,
+          ...(role === "custom" && typeof customType === "string" ? { customType } : {}),
           createdAt: entry.timestamp ?? fallbackTimestamp,
         },
       ];

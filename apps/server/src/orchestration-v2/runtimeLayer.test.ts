@@ -1062,6 +1062,14 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
                   timestamp: "2026-01-01T00:00:02.000Z",
                   message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
                 }),
+                JSON.stringify({
+                  type: "custom_message",
+                  id: "notification-entry",
+                  parentId: "assistant-entry",
+                  timestamp: "2026-01-01T00:00:03.000Z",
+                  customType: "process-notification",
+                  content: "Process finished",
+                }),
               ].join("\n"),
             ),
           );
@@ -1088,7 +1096,7 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
 
           assert.equal(
             (yield* importer.importTranscript({ threadId, sessionPath })).importedMessageCount,
-            2,
+            3,
           );
           assert.equal(
             (yield* importer.importTranscript({ threadId, sessionPath })).importedMessageCount,
@@ -1104,7 +1112,13 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
           );
           assert.deepEqual(
             projection.visibleTurnItems.map(({ item }) => item.type),
-            ["user_message", "assistant_message"],
+            ["user_message", "assistant_message", "dynamic_tool"],
+          );
+          const notification = projection.visibleTurnItems.at(-1)?.item;
+          assert.isTrue(
+            notification?.type === "dynamic_tool" &&
+              notification.toolName === "process-notification" &&
+              notification.output === "Process finished",
           );
         }),
       (directory) => Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
