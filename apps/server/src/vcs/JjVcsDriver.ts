@@ -1,5 +1,8 @@
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -8,6 +11,11 @@ import * as Path from "effect/Path";
 import {
   VcsProcessExitError,
   VcsRepositoryDetectionError,
+  type ReviewDiffFileContentsInput,
+  type ReviewDiffFileContentsResult,
+  type ReviewDiffPreviewInput,
+  type ReviewDiffPreviewResult,
+  type ReviewDiffPreviewSource,
   type VcsCreateWorktreeInput,
   type VcsCreateWorktreeResult,
   type VcsError,
@@ -68,6 +76,8 @@ export class JjVcsDriver extends Context.Service<JjVcsDriver, JjVcsDriverShape>(
 ) {}
 
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+const REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES = 120_000;
+const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
 const CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES = 10_000_000;
 
@@ -204,6 +214,7 @@ const processCommand = (
     readonly allowNonZeroExit?: boolean;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    readonly appendTruncationMarker?: boolean;
   },
 ) =>
   process.run({
@@ -218,6 +229,9 @@ const processCommand = (
       : {}),
     ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options?.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
+    ...(options?.appendTruncationMarker !== undefined
+      ? { appendTruncationMarker: options.appendTruncationMarker }
+      : {}),
   });
 
 const jjCommand = (
@@ -253,6 +267,7 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
   const process = yield* VcsProcess.VcsProcess;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const crypto = yield* Crypto.Crypto;
   const capabilities = {
     kind: "jj" as const,
     supportsWorktrees: true as const,
@@ -540,6 +555,274 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
       };
     },
   );
+
+  const REVIEW_BASE_REF_CANDIDATES = ["main@origin", "master@origin", "main", "master"] as const;
+
+  const resolveReviewBaseRef = Effect.fn("JjVcsDriver.resolveReviewBaseRef")(function* (
+    cwd: string,
+    requestedBaseRef: string | undefined,
+  ) {
+    if (requestedBaseRef !== undefined && requestedBaseRef.length > 0) return requestedBaseRef;
+    // trunk() is the idiomatic Jujutsu base, but it falls back to the root
+    // commit when no trunk is configured. An all-zero commit means "no base".
+    const trunkCommit = yield* resolveCommit("JjVcsDriver.resolveReviewBaseRef", cwd, "trunk()");
+    if (trunkCommit !== null && !/^0+$/.test(trunkCommit)) return "trunk()";
+    for (const candidate of REVIEW_BASE_REF_CANDIDATES) {
+      const commit = yield* resolveCommit("JjVcsDriver.resolveReviewBaseRef", cwd, candidate);
+      if (commit !== null && !/^0+$/.test(commit)) return candidate;
+    }
+    return null;
+  });
+
+  const getDiffPreview: VcsDriver.VcsDriverShape["getDiffPreview"] = Effect.fn(
+    "JjVcsDriver.getDiffPreview",
+  )(function* (input: ReviewDiffPreviewInput) {
+    const repository = yield* detectRepository(input.cwd);
+    if (!repository) {
+      return {
+        cwd: input.cwd,
+        generatedAt: yield* DateTime.now,
+        sources: [],
+      } satisfies ReviewDiffPreviewResult;
+    }
+
+    const [change, bookmarks] = yield* Effect.all([
+      currentChange(input.cwd),
+      listBookmarks(input.cwd),
+    ]);
+    const currentCommit =
+      change?.commitId ?? (yield* resolveCommit("JjVcsDriver.getDiffPreview", input.cwd, "@"));
+    const headRef =
+      bookmarks.find((bookmark) => bookmark.target !== null && bookmark.target === currentCommit)
+        ?.name ?? "@";
+    const baseRef = yield* resolveReviewBaseRef(input.cwd, input.baseRef);
+
+    // In Jujutsu the working copy is a commit, so `jj diff -r @` (against its
+    // parent) is both the dirty worktree and the current change. Untracked
+    // files are already included, unlike Git which needs a separate pass.
+    const diffArgs = (revisions: ReadonlyArray<string>) => [
+      "diff",
+      "--git",
+      ...(input.ignoreWhitespace === true ? ["--ignore-all-space"] : []),
+      ...revisions,
+    ];
+    const readDiff = (operation: string, revisions: ReadonlyArray<string>) =>
+      jjCommand(process, operation, input.cwd, diffArgs(revisions), {
+        timeoutMs: 20_000,
+        maxOutputBytes: REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES,
+        appendTruncationMarker: true,
+      }).pipe(
+        Effect.map((result) => ({ diff: result.stdout, truncated: result.stdoutTruncated })),
+        Effect.orElseSucceed(() => ({ diff: "", truncated: false })),
+      );
+    const dirty = yield* readDiff("JjVcsDriver.getDiffPreview.dirty", ["-r", "@"]);
+    const base =
+      baseRef === null
+        ? { diff: "", truncated: false }
+        : yield* readDiff("JjVcsDriver.getDiffPreview.base", ["--from", baseRef, "--to", "@"]);
+
+    const hashDiff = (diff: string) =>
+      crypto.digest("SHA-256", new TextEncoder().encode(diff)).pipe(
+        Effect.map(Encoding.encodeHex),
+        Effect.mapError(
+          () =>
+            new VcsProcessExitError({
+              operation: "JjVcsDriver.getDiffPreview.hash",
+              command: "crypto.digest SHA-256",
+              cwd: input.cwd,
+              exitCode: 1,
+              detail: "Failed to hash review diff.",
+            }),
+        ),
+      );
+    const [dirtyDiffHash, baseDiffHash] = yield* Effect.all([
+      hashDiff(dirty.diff),
+      hashDiff(base.diff),
+    ]);
+
+    const sources: ReviewDiffPreviewSource[] = [
+      {
+        id: "working-tree",
+        kind: "working-tree",
+        title: "Dirty worktree",
+        baseRef: "@-",
+        headRef: "@",
+        diff: dirty.diff,
+        diffHash: dirtyDiffHash,
+        truncated: dirty.truncated,
+      },
+      {
+        id: "branch-range",
+        kind: "branch-range",
+        title: baseRef ? `Against ${baseRef}` : "Against base branch",
+        baseRef,
+        headRef,
+        diff: base.diff,
+        diffHash: baseDiffHash,
+        truncated: base.truncated,
+      },
+    ];
+
+    return {
+      cwd: input.cwd,
+      generatedAt: yield* DateTime.now,
+      sources,
+    } satisfies ReviewDiffPreviewResult;
+  });
+
+  const reviewDiffFileError = (input: ReviewDiffFileContentsInput, detail: string) =>
+    new VcsProcessExitError({
+      operation: "JjVcsDriver.getReviewDiffFileContents",
+      command: "jj file show",
+      cwd: input.cwd,
+      exitCode: 1,
+      detail,
+    });
+
+  const isPathWithinRoot = (root: string, candidate: string) => {
+    const relative = path.relative(root, candidate);
+    return (
+      relative === "" ||
+      (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    );
+  };
+
+  const readJjFileAtRevision = Effect.fn("readJjFileAtRevision")(function* (
+    input: ReviewDiffFileContentsInput,
+    repositoryRoot: string,
+    revision: string,
+    relativePath: string,
+  ) {
+    const result = yield* jjCommand(
+      process,
+      "JjVcsDriver.getReviewDiffFileContents.revision",
+      repositoryRoot,
+      ["file", "show", "-r", revision, "--", relativePath],
+      { timeoutMs: 20_000, maxOutputBytes: REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES },
+    );
+    if (result.exitCode !== 0) {
+      return yield* reviewDiffFileError(
+        input,
+        `Could not read diff file '${relativePath}' at revision '${revision}'.`,
+      );
+    }
+    if (result.stdout.includes("\0")) {
+      return yield* reviewDiffFileError(input, `Cannot expand binary file '${relativePath}'.`);
+    }
+    return result.stdout;
+  });
+
+  const readWorkingTreeReviewFile = Effect.fn("readWorkingTreeReviewFile")(function* (
+    input: ReviewDiffFileContentsInput,
+    repositoryRoot: string,
+  ) {
+    const fileError = (stage: string, detail: string, cause?: unknown) =>
+      new VcsProcessExitError({
+        operation: `JjVcsDriver.getReviewDiffFileContents.workingTree.${stage}`,
+        command: stage,
+        cwd: input.cwd,
+        exitCode: 1,
+        detail,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    const requestedPath = path.resolve(repositoryRoot, input.newPath);
+    if (!isPathWithinRoot(repositoryRoot, requestedPath)) {
+      return yield* fileError(
+        "path.resolve",
+        `Diff file '${input.newPath}' resolves outside the review workspace.`,
+      );
+    }
+
+    const [realRepositoryRoot, realTarget] = yield* Effect.all([
+      fileSystem.realPath(repositoryRoot),
+      fileSystem.realPath(requestedPath),
+    ]).pipe(
+      Effect.mapError((cause) =>
+        fileError("fs.realPath", `Could not resolve diff file '${input.newPath}'.`, cause),
+      ),
+    );
+    if (!isPathWithinRoot(realRepositoryRoot, realTarget)) {
+      return yield* fileError(
+        "fs.realPath",
+        `Diff file '${input.newPath}' resolves outside the review workspace.`,
+      );
+    }
+
+    const info = yield* fileSystem
+      .stat(realTarget)
+      .pipe(
+        Effect.mapError((cause) =>
+          fileError("fs.stat", `Could not inspect diff file '${input.newPath}'.`, cause),
+        ),
+      );
+    if (info.type !== "File") {
+      return yield* fileError("fs.stat", `Diff path '${input.newPath}' is not a file.`);
+    }
+    if (info.size > BigInt(REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES)) {
+      return yield* fileError(
+        "fs.stat",
+        `Diff file '${input.newPath}' exceeds the 1 MB expansion limit.`,
+      );
+    }
+
+    const bytes = yield* fileSystem
+      .readFile(realTarget)
+      .pipe(
+        Effect.mapError((cause) =>
+          fileError("fs.readFile", `Could not read diff file '${input.newPath}'.`, cause),
+        ),
+      );
+    if (bytes.includes(0)) {
+      return yield* fileError("fs.readFile", `Cannot expand binary file '${input.newPath}'.`);
+    }
+    return new TextDecoder("utf-8").decode(bytes);
+  });
+
+  const getDiffFileContents: VcsDriver.VcsDriverShape["getDiffFileContents"] = Effect.fn(
+    "JjVcsDriver.getReviewDiffFileContents",
+  )(function* (input: ReviewDiffFileContentsInput) {
+    const repository = yield* detectRepository(input.cwd);
+    if (!repository) {
+      return yield* reviewDiffFileError(input, "Could not resolve the Jujutsu repository root.");
+    }
+    const repositoryRoot = repository.rootPath;
+
+    if (input.sourceKind === "working-tree") {
+      const [oldContents, newContents] = yield* Effect.all(
+        [
+          input.changeType === "new"
+            ? Effect.succeed("")
+            : readJjFileAtRevision(input, repositoryRoot, input.baseRef ?? "@-", input.oldPath),
+          input.changeType === "deleted"
+            ? Effect.succeed("")
+            : readWorkingTreeReviewFile(input, repositoryRoot),
+        ],
+        { concurrency: 2 },
+      );
+      return { oldContents, newContents } satisfies ReviewDiffFileContentsResult;
+    }
+
+    if (!input.baseRef || !input.headRef) {
+      return yield* reviewDiffFileError(
+        input,
+        "Branch diff file expansion requires both base and head refs.",
+      );
+    }
+    // `jj diff --from <base> --to @` compares trees directly (no merge-base),
+    // so the file sides are exactly the base and head revisions.
+    const [oldContents, newContents] = yield* Effect.all(
+      [
+        input.changeType === "new"
+          ? Effect.succeed("")
+          : readJjFileAtRevision(input, repositoryRoot, input.baseRef, input.oldPath),
+        input.changeType === "deleted"
+          ? Effect.succeed("")
+          : readJjFileAtRevision(input, repositoryRoot, input.headRef, input.newPath),
+      ],
+      { concurrency: 2 },
+    );
+    return { oldContents, newContents } satisfies ReviewDiffFileContentsResult;
+  });
 
   const resolveCheckpointCommit = (cwd: string, checkpointRef: string) =>
     checkpointGitCommand(
@@ -859,6 +1142,8 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
     filterIgnoredPaths,
     currentChange,
     listBookmarks,
+    getDiffPreview,
+    getDiffFileContents,
     createWorktree,
     removeWorktree,
     renameWorkspace,

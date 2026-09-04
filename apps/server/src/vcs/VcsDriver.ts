@@ -8,6 +8,8 @@ import type {
   VcsListRemotesResult,
   VcsListWorkspaceFilesResult,
   VcsWorkspace,
+  ReviewDiffFileContentsInput,
+  ReviewDiffFileContentsResult,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
   VcsRepositoryIdentity,
@@ -75,6 +77,9 @@ export interface VcsDriverShape {
   readonly getDiffPreview?: (
     input: ReviewDiffPreviewInput,
   ) => Effect.Effect<ReviewDiffPreviewResult, VcsError>;
+  readonly getDiffFileContents?: (
+    input: ReviewDiffFileContentsInput,
+  ) => Effect.Effect<ReviewDiffFileContentsResult, VcsError>;
 }
 
 export class VcsDriver extends Context.Service<VcsDriver, VcsDriverShape>()("t3/vcs/VcsDriver") {}

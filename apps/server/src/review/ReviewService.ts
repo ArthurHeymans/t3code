@@ -122,11 +122,15 @@ export const make = Effect.gen(function* () {
     yield* assertWorkspaceBoundCwd("ReviewService.getDiffFileContents", input.cwd);
 
     const handle = yield* vcsRegistry.detect({ cwd: input.cwd, requestedKind: "auto" });
+    const getDriverDiffFileContents = handle?.driver.getDiffFileContents;
+    if (getDriverDiffFileContents) {
+      return yield* getDriverDiffFileContents(input);
+    }
     if (handle?.kind !== "git") {
       return yield* new VcsUnsupportedOperationError({
         operation: "ReviewService.getDiffFileContents",
         kind: handle?.kind ?? "unknown",
-        detail: "Unchanged diff expansion currently requires a Git repository.",
+        detail: "Unchanged diff expansion currently requires a Git or Jujutsu repository.",
       });
     }
 

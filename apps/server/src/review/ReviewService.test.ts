@@ -1,19 +1,25 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 
+import type { ReviewDiffPreviewResult } from "@t3tools/contracts";
+
 import { ServerConfig } from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import type * as VcsDriver from "../vcs/VcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import type { VcsDriverHandle } from "../vcs/VcsDriverRegistry.ts";
 import * as ReviewService from "./ReviewService.ts";
 
 function makeLayer(input: {
   readonly workspaceRoot: string;
   readonly baseDir: string;
   readonly detectCalls?: Array<{ readonly cwd: string }>;
+  readonly detectResult?: VcsDriverHandle | null;
 }) {
   return ReviewService.layer.pipe(
     Layer.provide(
@@ -23,7 +29,7 @@ function makeLayer(input: {
         detect: (request) =>
           Effect.sync(() => {
             input.detectCalls?.push({ cwd: request.cwd });
-            return null;
+            return input.detectResult ?? null;
           }),
       }),
     ),
@@ -105,6 +111,104 @@ describe("ReviewService", () => {
       assert.strictEqual(result.cwd, workspaceRoot);
       assert.deepStrictEqual(result.sources, []);
       assert.deepStrictEqual(detectCalls, [{ cwd: workspaceRoot }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("delegates diff preview to the detected driver", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-workspace-" });
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-base-" });
+      const generatedAt = yield* DateTime.now;
+      const preview: ReviewDiffPreviewResult = {
+        cwd: workspaceRoot,
+        generatedAt,
+        sources: [
+          {
+            id: "working-tree",
+            kind: "working-tree",
+            title: "Dirty worktree",
+            baseRef: "@-",
+            headRef: "@",
+            diff: "diff --git a/a.txt b/a.txt",
+            diffHash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            truncated: false,
+          },
+        ],
+      };
+      const detectResult = {
+        kind: "jj",
+        driver: {
+          getDiffPreview: () => Effect.succeed(preview),
+        },
+      } as unknown as VcsDriverHandle;
+
+      const result = yield* Effect.gen(function* () {
+        const review = yield* ReviewService.ReviewService;
+        return yield* review.getDiffPreview({ cwd: workspaceRoot });
+      }).pipe(Effect.provide(makeLayer({ workspaceRoot, baseDir, detectResult })));
+
+      assert.deepStrictEqual(result, preview);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("delegates diff file contents to the detected driver", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-workspace-" });
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-base-" });
+      const detectResult = {
+        kind: "jj",
+        driver: {
+          getDiffFileContents: () =>
+            Effect.succeed({ oldContents: "hello\n", newContents: "hello world\n" }),
+        },
+      } as unknown as VcsDriverHandle;
+
+      const result = yield* Effect.gen(function* () {
+        const review = yield* ReviewService.ReviewService;
+        return yield* review.getDiffFileContents({
+          cwd: workspaceRoot,
+          sourceKind: "working-tree",
+          changeType: "change",
+          baseRef: "@-",
+          headRef: "@",
+          oldPath: "a.txt",
+          newPath: "a.txt",
+        });
+      }).pipe(Effect.provide(makeLayer({ workspaceRoot, baseDir, detectResult })));
+
+      assert.deepStrictEqual(result, { oldContents: "hello\n", newContents: "hello world\n" });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reports unsupported file contents without a capable driver", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-workspace-" });
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-review-base-" });
+      const detectResult = {
+        kind: "jj",
+        driver: {} as VcsDriver.VcsDriver["Service"],
+      } as unknown as VcsDriverHandle;
+
+      const error = yield* Effect.gen(function* () {
+        const review = yield* ReviewService.ReviewService;
+        return yield* review
+          .getDiffFileContents({
+            cwd: workspaceRoot,
+            sourceKind: "working-tree",
+            changeType: "change",
+            baseRef: "@-",
+            headRef: "@",
+            oldPath: "a.txt",
+            newPath: "a.txt",
+          })
+          .pipe(Effect.flip);
+      }).pipe(Effect.provide(makeLayer({ workspaceRoot, baseDir, detectResult })));
+
+      assert.strictEqual(error._tag, "VcsUnsupportedOperationError");
+      assert.strictEqual(error.operation, "ReviewService.getDiffFileContents");
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
