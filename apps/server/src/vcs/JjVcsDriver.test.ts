@@ -226,6 +226,177 @@ describe("JjVcsDriver", () => {
     );
   });
 
+  it.effect("returns working-tree and branch-range review diffs", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-jj-review-" });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--colocate", repo]);
+        yield* runJj(repo, ["bookmark", "create", "main"]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello\n");
+        yield* runJj(repo, ["new"]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello world\n");
+        yield* fileSystem.writeFileString(path.join(repo, "b.txt"), "new file\n");
+
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const preview = yield* driver.getDiffPreview!({ cwd: repo });
+
+        assert.equal(preview.cwd, repo);
+        assert.equal(preview.sources.length, 2);
+        const workingTree = preview.sources.find((source) => source.kind === "working-tree");
+        const branchRange = preview.sources.find((source) => source.kind === "branch-range");
+        assert.equal(workingTree?.title, "Dirty worktree");
+        assert.equal(workingTree?.baseRef, "@-");
+        assert.equal(workingTree?.headRef, "@");
+        assert.include(workingTree?.diff ?? "", "b.txt");
+        assert.include(workingTree?.diff ?? "", "+hello world");
+        assert.equal(branchRange?.title, "Against main");
+        assert.equal(branchRange?.baseRef, "main");
+        assert.include(branchRange?.diff ?? "", "a.txt");
+        assert.include(branchRange?.diff ?? "", "b.txt");
+        for (const source of preview.sources) {
+          assert.match(source.diffHash, /^[0-9a-f]{64}$/);
+          assert.isFalse(source.truncated);
+        }
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("honors an explicit baseRef for review diff preview", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-jj-review-base-" });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--colocate", repo]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello\n");
+
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const preview = yield* driver.getDiffPreview!({ cwd: repo, baseRef: "@-" });
+
+        const branchRange = preview.sources.find((source) => source.kind === "branch-range");
+        assert.equal(branchRange?.title, "Against @-");
+        assert.equal(branchRange?.baseRef, "@-");
+        assert.include(branchRange?.diff ?? "", "a.txt");
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("returns empty review sources outside a repository", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const plain = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-jj-review-plain-" });
+
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const preview = yield* driver.getDiffPreview!({ cwd: plain });
+
+        assert.equal(preview.cwd, plain);
+        assert.deepStrictEqual(preview.sources, []);
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("expands working-tree review file contents", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-jj-review-files-" });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--colocate", repo]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello\n");
+        yield* fileSystem.writeFileString(path.join(repo, "gone.txt"), "gone\n");
+        yield* runJj(repo, ["new"]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello world\n");
+        yield* fileSystem.writeFileString(path.join(repo, "b.txt"), "new file\n");
+        yield* fileSystem.remove(path.join(repo, "gone.txt"));
+
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const changed = yield* driver.getDiffFileContents!({
+          cwd: repo,
+          sourceKind: "working-tree",
+          changeType: "change",
+          baseRef: "@-",
+          headRef: "@",
+          oldPath: "a.txt",
+          newPath: "a.txt",
+        });
+        assert.equal(changed.oldContents, "hello\n");
+        assert.equal(changed.newContents, "hello world\n");
+
+        const added = yield* driver.getDiffFileContents!({
+          cwd: repo,
+          sourceKind: "working-tree",
+          changeType: "new",
+          baseRef: "@-",
+          headRef: "@",
+          oldPath: "b.txt",
+          newPath: "b.txt",
+        });
+        assert.equal(added.oldContents, "");
+        assert.equal(added.newContents, "new file\n");
+
+        const deleted = yield* driver.getDiffFileContents!({
+          cwd: repo,
+          sourceKind: "working-tree",
+          changeType: "deleted",
+          baseRef: "@-",
+          headRef: "@",
+          oldPath: "gone.txt",
+          newPath: "gone.txt",
+        });
+        assert.equal(deleted.oldContents, "gone\n");
+        assert.equal(deleted.newContents, "");
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("expands branch-range review file contents", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-jj-review-range-",
+        });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--colocate", repo]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello\n");
+        yield* runJj(repo, ["bookmark", "create", "main"]);
+        yield* runJj(repo, ["new"]);
+        yield* fileSystem.writeFileString(path.join(repo, "a.txt"), "hello world\n");
+
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const contents = yield* driver.getDiffFileContents!({
+          cwd: repo,
+          sourceKind: "branch-range",
+          changeType: "change",
+          baseRef: "main",
+          headRef: "@",
+          oldPath: "a.txt",
+          newPath: "a.txt",
+        });
+        assert.equal(contents.oldContents, "hello\n");
+        assert.equal(contents.newContents, "hello world\n");
+
+        const error = yield* driver.getDiffFileContents!({
+          cwd: repo,
+          sourceKind: "branch-range",
+          changeType: "change",
+          baseRef: null,
+          headRef: "@",
+          oldPath: "a.txt",
+          newPath: "a.txt",
+        }).pipe(Effect.flip);
+        assert.strictEqual(error._tag, "VcsProcessExitError");
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
   it.effect("filters paths with the git ignore oracle", () => {
     const calls: VcsProcessInput[] = [];
 
