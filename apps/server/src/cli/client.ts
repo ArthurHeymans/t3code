@@ -221,6 +221,10 @@ interface NormalizedThreadItem {
   readonly detail: string | null;
   readonly streaming: boolean;
   readonly actionId: string | null;
+  readonly runId: string | null;
+  readonly runStatus: string | null;
+  readonly runOrdinal: number | null;
+  readonly presentation: "message" | "work";
 }
 
 interface NormalizedThreadPayload {
@@ -237,6 +241,8 @@ interface NormalizedThreadPayload {
     readonly activeRunId: string | null;
   } | null;
   readonly items: ReadonlyArray<NormalizedThreadItem>;
+  readonly attention?: ReadonlyArray<NormalizedThreadItem>;
+  readonly pendingRequestCount?: number;
   truncated: boolean;
   readonly deleted?: boolean;
   readonly error?: string;
@@ -572,6 +578,10 @@ const normalizeTurnItem = (item: OrchestrationV2TurnItem): NormalizedThreadItem 
     detail: clipText(detail),
     streaming: "streaming" in item && item.streaming === true,
     actionId: null,
+    runId: item.runId === null ? null : singleLine(item.runId, 4_000),
+    runStatus: null,
+    runOrdinal: null,
+    presentation: "message",
   });
 
   switch (item.type) {
@@ -686,10 +696,63 @@ export const normalizeThreadProjection = (
   projection: OrchestrationV2ThreadProjection,
 ): NormalizedThreadPayload => {
   const visible = projection.visibleTurnItems.slice(-MAX_THREAD_ITEMS);
+  const runs = new Map(projection.runs.map((run) => [run.id, run]));
+  const userRuns = new Map(projection.runs.map((run) => [run.userMessageId, run]));
+  // Match the web's last-assistant-per-run presentation, but only fold
+  // commentary after completion. Active assistant output remains readable.
+  const lastAssistant = new Map<string, string>();
+  for (const { item } of projection.visibleTurnItems) {
+    if (item.type === "assistant_message" && item.runId !== null) {
+      lastAssistant.set(item.runId, item.id);
+    }
+  }
+  const normalize = (item: OrchestrationV2TurnItem): NormalizedThreadItem => {
+    const run =
+      item.runId !== null
+        ? runs.get(item.runId)
+        : item.type === "user_message"
+          ? userRuns.get(item.messageId)
+          : undefined;
+    const completed = run?.status === "completed" && run.completedAt !== null;
+    const runId = item.runId ?? run?.id ?? null;
+    return {
+      ...normalizeTurnItem(item),
+      runId: runId === null ? null : singleLine(runId, 4_000),
+      runStatus: run?.status ?? null,
+      runOrdinal: run?.ordinal ?? null,
+      presentation:
+        completed &&
+        item.type === "assistant_message" &&
+        !item.streaming &&
+        lastAssistant.get(run.id) !== item.id
+          ? "work"
+          : "message",
+    };
+  };
+  const pending = projection.runtimeRequests.filter((request) => request.status === "pending");
+  const pendingIds = new Set(pending.map((request) => request.id));
+  // Attention is independent of the recent-history window. Keep this list
+  // separately bounded, and retain the full count when details are unavailable.
+  const attention = projection.visibleTurnItems
+    .filter(
+      ({ item }) =>
+        (item.type === "approval_request" || item.type === "user_input_request") &&
+        pendingIds.has(item.requestId),
+    )
+    .slice(-20)
+    .map(({ item }) => {
+      const normalized = normalize(item);
+      return {
+        ...normalized,
+        status: "waiting",
+        text: clipUtf8Bytes(normalized.text ?? "", 2_000),
+        detail: null,
+      };
+    });
   let remaining = MAX_THREAD_TEXT_CHARS;
   let clipped = projection.visibleTurnItems.length > visible.length;
   const items = visible
-    .map((row) => normalizeTurnItem(row.item))
+    .map((row) => normalize(row.item))
     .toReversed()
     .map((item) => {
       const take = (value: string | null): string | null => {
@@ -723,6 +786,8 @@ export const normalizeThreadProjection = (
         )?.id ?? null,
     },
     items,
+    attention,
+    pendingRequestCount: pending.length,
     truncated: clipped,
   };
   while (Buffer.byteLength(encodeJson(payload), "utf8") > 700_000 && items.length > 0) {
@@ -846,6 +911,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             shell: true,
             threads: true,
             mutations: true,
+            threadSections: true,
             shellResumeCompletionMarker: current.config.shellResumeCompletionMarker === true,
             threadResumeCompletionMarker: current.config.threadResumeCompletionMarker === true,
             threadSnapshotPagination: current.config.threadSnapshotPagination === true,
@@ -1248,6 +1314,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             shell: true,
             threads: true,
             mutations: true,
+            threadSections: true,
             terminal: false,
             serverEnvironmentId: connected.config.environment.environmentId,
           },
