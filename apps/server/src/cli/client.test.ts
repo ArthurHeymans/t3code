@@ -1,5 +1,16 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import { EventId, MessageId, ProjectId, RunId, ThreadId, TurnItemId } from "@t3tools/contracts";
+import {
+  EventId,
+  MessageId,
+  NodeId,
+  ProjectId,
+  RunId,
+  RuntimeRequestId,
+  ThreadId,
+  TurnItemId,
+  type OrchestrationV2Run,
+  type OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -193,6 +204,171 @@ describe("stdio client bridge", () => {
 
     expect(JSON.stringify(normalized)).not.toContain(secret);
     expect(normalized.items[0]).toMatchObject({ label: "Tool · private-tool" });
+  });
+
+  it("groups by authoritative run identity and folds only completed commentary", () => {
+    const run: OrchestrationV2Run = {
+      id: RunId.make("run-sections"),
+      threadId: v2Projection.thread.id,
+      ordinal: 1,
+      providerInstanceId: v2Projection.thread.providerInstanceId,
+      modelSelection: v2Projection.thread.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("message-user"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "completed",
+      requestedAt: v2Now,
+      startedAt: v2Now,
+      completedAt: v2Now,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    const base = {
+      threadId: v2Projection.thread.id,
+      runId: run.id,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed" as const,
+      title: null,
+      startedAt: v2Now,
+      completedAt: v2Now,
+      updatedAt: v2Now,
+    };
+    const items: OrchestrationV2TurnItem[] = [
+      {
+        ...base,
+        id: TurnItemId.make("prompt"),
+        runId: null,
+        type: "user_message",
+        messageId: run.userMessageId,
+        inputIntent: "turn_start",
+        text: "Fix it",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      },
+      {
+        ...base,
+        id: TurnItemId.make("commentary"),
+        type: "assistant_message",
+        messageId: MessageId.make("commentary"),
+        text: "Inspecting",
+        streaming: false,
+      },
+      {
+        ...base,
+        id: TurnItemId.make("answer"),
+        type: "assistant_message",
+        messageId: MessageId.make("answer"),
+        text: "Done",
+        streaming: false,
+      },
+    ];
+    const projection = {
+      ...v2Projection,
+      runs: [run],
+      visibleTurnItems: items.map((item, position) => ({
+        item,
+        position,
+        visibility: "local" as const,
+        sourceThreadId: item.threadId,
+        sourceItemId: item.id,
+      })),
+    };
+    const completed = normalizeThreadProjection(projection);
+    expect(completed.items.map((item) => item.runId)).toEqual([run.id, run.id, run.id]);
+    expect(completed.items.map((item) => item.presentation)).toEqual([
+      "message",
+      "work",
+      "message",
+    ]);
+    expect(completed.items[0]).toMatchObject({ runOrdinal: 1, runStatus: "completed" });
+    const active = normalizeThreadProjection({
+      ...projection,
+      runs: [{ ...run, status: "running", completedAt: null }],
+    });
+    expect(active.items.every((item) => item.presentation === "message")).toBe(true);
+    const interrupted = normalizeThreadProjection({
+      ...projection,
+      runs: [{ ...run, status: "interrupted" }],
+    });
+    expect(interrupted.items.every((item) => item.presentation === "message")).toBe(true);
+  });
+
+  it("retains pending attention outside the recent history window", () => {
+    const requestId = RuntimeRequestId.make("old-approval");
+    const base = {
+      threadId: v2Projection.thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed" as const,
+      title: null,
+      startedAt: v2Now,
+      completedAt: v2Now,
+      updatedAt: v2Now,
+    };
+    const visibleTurnItems = Array.from({ length: 101 }, (_, position) => {
+      const id = TurnItemId.make(`attention-item-${position}`);
+      const item: OrchestrationV2TurnItem =
+        position === 0
+          ? {
+              ...base,
+              id,
+              type: "approval_request",
+              requestId,
+              requestKind: "command",
+              prompt: "Allow the command?",
+              status: "waiting",
+            }
+          : {
+              ...base,
+              id,
+              type: "assistant_message",
+              messageId: MessageId.make(`message-${position}`),
+              text: "output",
+              streaming: false,
+            };
+      return {
+        item,
+        position,
+        visibility: "local" as const,
+        sourceThreadId: item.threadId,
+        sourceItemId: id,
+      };
+    });
+    const normalized = normalizeThreadProjection({
+      ...v2Projection,
+      visibleTurnItems,
+      runtimeRequests: [
+        {
+          id: requestId,
+          nodeId: NodeId.make("node-1"),
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "command",
+          status: "pending",
+          responseCapability: { type: "not_resumable", reason: "offline" },
+          createdAt: v2Now,
+          resolvedAt: null,
+        },
+      ],
+    });
+    expect(normalized.items.some((item) => item.actionId === requestId)).toBe(false);
+    expect(normalized.attention).toMatchObject([
+      { actionId: requestId, text: "Allow the command?" },
+    ]);
+    expect(normalized.pendingRequestCount).toBe(1);
+    expect(normalized.truncated).toBe(true);
   });
 
   it("resumes thread updates after the bounded snapshot sequence", () => {
