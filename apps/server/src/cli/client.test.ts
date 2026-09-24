@@ -10,6 +10,7 @@ import {
   TurnItemId,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
+  type ServerConfig,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
@@ -31,6 +32,7 @@ import {
 } from "../../../../packages/client-runtime/src/state/orchestrationV2TestFixtures.ts";
 import {
   bridgeSocketUrl,
+  normalizeModelCatalog,
   normalizeShellSnapshot,
   normalizeThreadProjection,
   reduceThreadProjection,
@@ -75,6 +77,68 @@ describe("stdio client bridge", () => {
     const url = new URL(bridgeSocketUrl("ws://127.0.0.1:3773/ws?wsTicket=opaque"));
     expect(url.searchParams.get("wsTicket")).toBe("opaque");
     expect(url.searchParams.get("orchestrationProtocol")).toBe("2");
+  });
+
+  it("bounds the model catalog and exposes only selectable model options", () => {
+    const providers = [
+      {
+        instanceId: "codex-work",
+        displayName: "Work",
+        driver: "codex",
+        enabled: true,
+        installed: true,
+        status: "ready",
+        models: [
+          {
+            slug: "gpt-example",
+            name: "Example",
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "effort",
+                  label: "Effort",
+                  type: "select",
+                  options: [{ id: "high", label: "High", isDefault: true }],
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ] as unknown as ServerConfig["providers"];
+    expect(normalizeModelCatalog(providers)).toEqual({
+      providers: [
+        {
+          instanceId: "codex-work",
+          name: "Work",
+          driver: "codex",
+          available: true,
+          reason: null,
+          requiresNewThreadForModelChange: false,
+          models: [
+            {
+              slug: "gpt-example",
+              name: "Example",
+              options: [
+                {
+                  id: "effort",
+                  label: "Effort",
+                  type: "select",
+                  choices: [{ id: "high", label: "High", isDefault: true }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      truncated: false,
+    });
+    const oversized = [
+      { ...providers[0]!, models: Array.from({ length: 101 }, () => providers[0]!.models[0]!) },
+    ];
+    const bounded = normalizeModelCatalog(oversized);
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.providers[0]?.models).toHaveLength(100);
   });
 
   it("normalizes the shell projection without exposing T3 schemas", () => {
@@ -302,6 +366,10 @@ describe("stdio client bridge", () => {
         status: "idle",
         provider: "codex",
         model: "gpt-5.4",
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        activeRunModel: null,
+        activeRunProvider: null,
+        hasStartedSession: false,
       },
       items: [
         {

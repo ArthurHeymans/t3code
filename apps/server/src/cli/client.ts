@@ -19,6 +19,7 @@ import {
 import { applyOrchestrationV2ProjectionEvent } from "@t3tools/client-runtime/state/orchestration-v2-projection";
 import { effectiveSettled } from "@t3tools/client-runtime/state/thread-settled";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { modelSelectionCommandType } from "@t3tools/shared/model";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -27,6 +28,7 @@ import {
   ExecutionEnvironmentDescriptor,
   IsoDateTime,
   MessageId,
+  ModelSelection,
   NonNegativeInt,
   ORCHESTRATION_V2_WS_METHODS,
   ProviderApprovalDecision,
@@ -115,6 +117,10 @@ const ThreadApprovalInput = Schema.Struct({
   requestId: RuntimeRequestId,
   decision: ProviderApprovalDecision,
 });
+const ThreadModelSelectionInput = Schema.Struct({
+  ...ThreadMutationBase,
+  modelSelection: ModelSelection,
+});
 const ThreadRuntimeModeInput = Schema.Struct({ ...ThreadMutationBase, runtimeMode: RuntimeMode });
 const ThreadInteractionModeInput = Schema.Struct({
   ...ThreadMutationBase,
@@ -129,6 +135,7 @@ const ThreadSnoozeInput = Schema.Struct({
 const decodeThreadSendInput = Schema.decodeUnknownEffect(ThreadSendInput);
 const decodeThreadInterruptInput = Schema.decodeUnknownEffect(ThreadInterruptInput);
 const decodeThreadApprovalInput = Schema.decodeUnknownEffect(ThreadApprovalInput);
+const decodeThreadModelSelectionInput = Schema.decodeUnknownEffect(ThreadModelSelectionInput);
 const decodeThreadRuntimeModeInput = Schema.decodeUnknownEffect(ThreadRuntimeModeInput);
 const decodeThreadInteractionModeInput = Schema.decodeUnknownEffect(ThreadInteractionModeInput);
 const decodeThreadSettledInput = Schema.decodeUnknownEffect(ThreadSettledInput);
@@ -224,6 +231,70 @@ interface NormalizedShellPayload {
   omittedProjectCount?: number;
 }
 
+export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
+  const catalog = {
+    providers: providers.slice(0, 32).map((provider) => ({
+      instanceId: singleLine(provider.instanceId),
+      name: singleLine(provider.displayName ?? provider.instanceId),
+      driver: singleLine(provider.driver),
+      available:
+        provider.availability !== "unavailable" &&
+        provider.enabled &&
+        provider.installed &&
+        provider.status !== "error" &&
+        provider.status !== "disabled",
+      reason:
+        provider.unavailableReason || provider.message
+          ? singleLine(provider.unavailableReason ?? provider.message ?? "")
+          : null,
+      requiresNewThreadForModelChange: provider.requiresNewThreadForModelChange === true,
+      models: provider.models.slice(0, 100).map((model) => ({
+        slug: singleLine(model.slug),
+        name: singleLine(model.name),
+        options: (model.capabilities?.optionDescriptors ?? []).slice(0, 16).map((option) =>
+          option.type === "select"
+            ? {
+                id: singleLine(option.id),
+                label: singleLine(option.label),
+                type: option.type,
+                choices: option.options.slice(0, 32).map((choice) => ({
+                  id: singleLine(choice.id),
+                  label: singleLine(choice.label),
+                  isDefault: choice.isDefault === true,
+                })),
+              }
+            : { id: singleLine(option.id), label: singleLine(option.label), type: option.type },
+        ),
+      })),
+    })),
+    truncated:
+      providers.length > 32 ||
+      providers.some(
+        (provider) =>
+          provider.models.length > 100 ||
+          provider.models.some(
+            (model) =>
+              (model.capabilities?.optionDescriptors ?? []).length > 16 ||
+              (model.capabilities?.optionDescriptors ?? []).some(
+                (option) => option.type === "select" && option.options.length > 32,
+              ),
+          ),
+      ),
+  };
+  // A catalog is a request response, not a stream; keep it below the NDJSON
+  // frame limit even if providers advertise many long option descriptors.
+  while (Buffer.byteLength(encodeJson(catalog), "utf8") > 400_000) {
+    const largest = catalog.providers.reduce<(typeof catalog.providers)[number] | null>(
+      (best, provider) => (provider.models.length > (best?.models.length ?? 0) ? provider : best),
+      null,
+    );
+    if (!largest || largest.models.length === 0) break;
+    largest.models.pop();
+    catalog.truncated = true;
+  }
+  return catalog;
+};
+
 interface NormalizedThreadItem {
   readonly id: string;
   readonly type: string;
@@ -247,6 +318,10 @@ interface NormalizedThreadPayload {
     readonly status: string;
     readonly provider: string;
     readonly model: string;
+    readonly modelSelection: ModelSelection;
+    readonly activeRunModel: string | null;
+    readonly activeRunProvider: string | null;
+    readonly hasStartedSession: boolean;
     readonly worktree: string;
     readonly worktreePath: string | null;
     readonly runtimeMode: string;
@@ -844,6 +919,9 @@ export const normalizeThreadProjection = (
 ): NormalizedThreadPayload => {
   const visible = projection.visibleTurnItems.slice(-MAX_THREAD_ITEMS);
   const runs = new Map(projection.runs.map((run) => [run.id, run]));
+  const activeRun = projection.runs.findLast((run) =>
+    ["preparing", "starting", "running", "waiting"].includes(run.status),
+  );
   const userRuns = new Map(projection.runs.map((run) => [run.userMessageId, run]));
   // Match the web's last-assistant-per-run presentation, but only fold
   // commentary after completion. Active assistant output remains readable.
@@ -920,6 +998,10 @@ export const normalizeThreadProjection = (
       status: normalizeProjectionStatus(projection),
       provider: singleLine(projection.thread.providerInstanceId),
       model: singleLine(projection.thread.modelSelection.model),
+      modelSelection: projection.thread.modelSelection,
+      activeRunModel: activeRun?.modelSelection.model ?? null,
+      activeRunProvider: activeRun?.modelSelection.instanceId ?? null,
+      hasStartedSession: projection.providerSessions.length > 0,
       worktree: singleLine(projection.thread.worktreePath ?? "root"),
       worktreePath:
         projection.thread.worktreePath === null
@@ -927,10 +1009,7 @@ export const normalizeThreadProjection = (
           : singleLine(projection.thread.worktreePath, 2_000),
       runtimeMode: projection.thread.runtimeMode,
       interactionMode: projection.thread.interactionMode,
-      activeRunId:
-        projection.runs.findLast((run) =>
-          ["preparing", "starting", "running", "waiting"].includes(run.status),
-        )?.id ?? null,
+      activeRunId: activeRun?.id ?? null,
     },
     items,
     attention,
@@ -1122,11 +1201,14 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             threads: true,
             mutations: true,
             threadSections: true,
+            modelSelection: true,
             shellResumeCompletionMarker: current.config.shellResumeCompletionMarker === true,
             threadResumeCompletionMarker: current.config.threadResumeCompletionMarker === true,
             threadSnapshotPagination: current.config.threadSnapshotPagination === true,
           },
         };
+      case "model.catalog":
+        return normalizeModelCatalog(current.config.providers);
       case "thread.send": {
         const input = yield* decodeThreadSendInput(message.input).pipe(
           Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
@@ -1202,6 +1284,21 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
           threadId: input.threadId,
           requestId: input.requestId,
           decision: input.decision,
+        });
+      }
+      case "thread.modelSelection.set": {
+        const input = yield* decodeThreadModelSelectionInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        const projection = yield* threadProjection(current, input.threadId);
+        return yield* dispatch({
+          type: modelSelectionCommandType(
+            projection.thread.providerInstanceId,
+            input.modelSelection,
+          ),
+          commandId: input.commandId,
+          threadId: input.threadId,
+          modelSelection: input.modelSelection,
         });
       }
       case "thread.runtimeMode.set": {
@@ -1543,6 +1640,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             threads: true,
             mutations: true,
             threadSections: true,
+            modelSelection: true,
             terminal: false,
             serverEnvironmentId: connected.config.environment.environmentId,
           },
