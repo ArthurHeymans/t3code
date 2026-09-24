@@ -47,6 +47,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -322,6 +323,32 @@ export const superviseSubscription = <A, E, R>(
     ),
   );
 
+export const superviseBridgeConnection = <A, CloseError, RenewError, TransitionError, R, R2>(
+  initial: A,
+  closed: (current: A) => Effect.Effect<never, CloseError>,
+  renew: (current: A) => Effect.Effect<A, RenewError, R>,
+  transition: (phase: "retrying" | "ready", current: A) => Effect.Effect<void, TransitionError, R2>,
+  retryDelay: Duration.Input = "1 second",
+) =>
+  Effect.gen(function* () {
+    let current = initial;
+    while (true) {
+      yield* Effect.exit(closed(current));
+      yield* transition("retrying", current);
+      let replacement: A | undefined;
+      while (replacement === undefined) {
+        const attempt = yield* Effect.exit(renew(current));
+        if (Exit.isSuccess(attempt)) {
+          replacement = attempt.value;
+        } else {
+          yield* Effect.sleep(retryDelay);
+        }
+      }
+      current = replacement;
+      yield* transition("ready", current);
+    }
+  });
+
 const parseEndpoint = Effect.fn("clientBridge.parseEndpoint")(function* (endpoint: string) {
   const url = yield* decodeUrl(endpoint).pipe(
     Effect.mapError((cause) => fail("invalid-endpoint", safeErrorMessage(cause))),
@@ -442,6 +469,40 @@ const connect = Effect.fn("clientBridge.connect")(function* (message: typeof Hel
     session,
     config,
   } satisfies BridgeConnection;
+});
+
+// The WebSocket ticket is short-lived. A server restart closes the socket, so
+// reconnecting the old RpcSession (or reusing its URL) cannot restore streams.
+const reconnect = Effect.fn("clientBridge.reconnect")(function* (current: BridgeConnection) {
+  const authorization = current.prepared.httpAuthorization;
+  if (authorization?._tag !== "Bearer") {
+    return yield* fail("connection-failed", "The bridge has no reusable bearer credential.");
+  }
+  const bearerToken = authorization.token;
+  const { wsBaseUrl } = yield* parseEndpoint(current.prepared.httpBaseUrl);
+  const socketUrl = bridgeSocketUrl(
+    yield* resolveRemoteWebSocketConnectionUrl({
+      httpBaseUrl: current.prepared.httpBaseUrl,
+      wsBaseUrl,
+      bearerToken,
+    }).pipe(
+      Effect.mapError((cause) =>
+        fail("websocket-ticket-failed", safeErrorMessage(cause, [bearerToken])),
+      ),
+    ),
+  );
+  const prepared = { ...current.prepared, socketUrl };
+  const sessions = yield* RpcSession.RpcSessionFactory;
+  const session = yield* sessions.connect(prepared).pipe(
+    Effect.mapError((cause) => fail("connection-failed", safeErrorMessage(cause, [bearerToken]))),
+  );
+  yield* session.ready.pipe(
+    Effect.mapError((cause) => fail("connection-failed", safeErrorMessage(cause, [bearerToken]))),
+  );
+  const config = yield* session.initialConfig.pipe(
+    Effect.mapError((cause) => fail("config-failed", safeErrorMessage(cause, [bearerToken]))),
+  );
+  return { ...current, prepared, session, config } satisfies BridgeConnection;
 });
 
 const normalizeThreadStatus = (thread: OrchestrationV2ShellSnapshot["threads"][number]): string => {
@@ -923,7 +984,25 @@ const stdioFlag = Flag.Boolean("stdio").pipe(
 
 const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   const connection = yield* Ref.make<BridgeConnection | null>(null);
+  const reconnecting = yield* Ref.make(false);
   const subscriptions = yield* Ref.make(new Map<string, Fiber.Fiber<void, unknown>>());
+
+  const monitorConnection = (initial: BridgeConnection) =>
+    superviseBridgeConnection(
+      initial,
+      (current) => current.session.closed,
+      reconnect,
+      (phase, current) =>
+        Effect.gen(function* () {
+          yield* Ref.set(reconnecting, phase === "retrying");
+          if (phase === "ready") yield* Ref.set(connection, current);
+          yield* writeRecord(
+            phase === "ready"
+              ? { kind: "state", phase }
+              : { kind: "state", phase, message: "WebSocket disconnected" },
+          );
+        }),
+    );
 
   const stopSubscription = Effect.fn("clientBridge.stopSubscription")(function* (
     subscriptionId: string,
@@ -1123,6 +1202,14 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
     current: BridgeConnection,
     message: typeof RequestMessage.Type,
   ) {
+    if (yield* Ref.get(reconnecting)) {
+      yield* writeRecord({
+        kind: "response",
+        id: message.id,
+        error: { code: "bridge-retrying", message: "WebSocket reconnecting; message was not dispatched." },
+      });
+      return;
+    }
     yield* handleRequest(current, message).pipe(
       Effect.matchCauseEffect({
         onFailure: (cause) =>
@@ -1142,11 +1229,12 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   const startShellSubscription = Effect.fn("clientBridge.startShellSubscription")(function* (
     message: typeof SubscribeMessage.Type,
   ) {
-    const current = yield* requireConnection();
+    yield* requireConnection();
     yield* stopSubscription(message.subscriptionId);
     let outputSequence = message.resumeSequence ?? 0;
-    const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeShell];
     const runOnce = Effect.gen(function* () {
+      const current = yield* requireConnection();
+      const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeShell];
       const snapshot = yield* fetchEnvironmentShellSnapshot({
         prepared: current.prepared,
         signer: Option.none(),
@@ -1246,14 +1334,15 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   const startThreadSubscription = Effect.fn("clientBridge.startThreadSubscription")(function* (
     message: typeof SubscribeMessage.Type,
   ) {
-    const current = yield* requireConnection();
+    yield* requireConnection();
     const threadId = yield* decodeThreadId(message.identity).pipe(
       Effect.mapError((cause) => fail("invalid-thread-identity", safeErrorMessage(cause))),
     );
     yield* stopSubscription(message.subscriptionId);
     let outputSequence = message.resumeSequence ?? 0;
-    const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeThread];
     const runOnce = Effect.gen(function* () {
+      const current = yield* requireConnection();
+      const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeThread];
       // Some deployed routers reject provider-derived thread IDs containing encoded
       // path separators even when the ID is escaped as one segment. Fall back to a
       // one-shot RPC snapshot, normalize it immediately, then resume from its sequence.
@@ -1333,21 +1422,24 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
     });
     const run = superviseSubscription(
       runOnce.pipe(
-        Effect.tapCause((cause) => {
-          outputSequence += 1;
-          return writeRecord({
-            kind: "snapshot",
-            subscriptionId: message.subscriptionId,
-            generation: current.generation,
-            sequence: outputSequence,
-            payload: {
-              thread: null,
-              items: [],
-              truncated: false,
-              error: safeErrorMessage(Cause.squash(cause), preparedSecrets(current.prepared)),
-            } satisfies NormalizedThreadPayload,
-          });
-        }),
+        Effect.tapCause((cause) =>
+          Effect.gen(function* () {
+            const current = yield* requireConnection();
+            outputSequence += 1;
+            yield* writeRecord({
+              kind: "snapshot",
+              subscriptionId: message.subscriptionId,
+              generation: current.generation,
+              sequence: outputSequence,
+              payload: {
+                thread: null,
+                items: [],
+                truncated: false,
+                error: safeErrorMessage(Cause.squash(cause), preparedSecrets(current.prepared)),
+              } satisfies NormalizedThreadPayload,
+            });
+          }),
+        ),
       ),
     );
     const fiber = yield* Effect.forkScoped(run);
@@ -1366,6 +1458,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         }
         const connected = yield* connect(message);
         yield* Ref.set(connection, connected);
+        yield* monitorConnection(connected).pipe(Effect.forkScoped);
         yield* writeRecord({
           kind: "ready",
           protocolVersion: PROTOCOL_VERSION,

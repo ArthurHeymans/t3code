@@ -36,6 +36,7 @@ import {
   safeErrorMessage,
   socketUrlSecrets,
   superviseSubscription,
+  superviseBridgeConnection,
   threadResumeInput,
 } from "./client.ts";
 
@@ -779,6 +780,51 @@ describe("stdio client bridge", () => {
       yield* Deferred.await(second);
       yield* Fiber.interrupt(fiber);
       expect(yield* Ref.get(attempts)).toBe(2);
+    }),
+  );
+
+  it.effect("renews a closed bridge session and watches the replacement", () =>
+    Effect.gen(function* () {
+      const firstClosed = yield* Deferred.make<never, string>();
+      const secondClosed = yield* Deferred.make<never, string>();
+      const failedRenewal = yield* Deferred.make<void>();
+      const firstRecovered = yield* Deferred.make<void>();
+      const secondDisconnected = yield* Deferred.make<void>();
+      const attempts = yield* Ref.make(0);
+      const transitions = yield* Ref.make<string[]>([]);
+      const fiber = yield* superviseBridgeConnection(
+        0,
+        (session) => (session === 0 ? Deferred.await(firstClosed) : Deferred.await(secondClosed)),
+        () =>
+          Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.succeed(failedRenewal, undefined).pipe(Effect.andThen(Effect.fail("offline")))
+                : count === 2 ? Effect.succeed(1) : Effect.never,
+            ),
+          ),
+        (phase, session) =>
+          Ref.update(transitions, (items) => [...items, `${phase}:${String(session)}`]).pipe(
+            Effect.andThen(
+              phase === "ready"
+                ? Deferred.succeed(firstRecovered, undefined)
+                : session === 1
+                  ? Deferred.succeed(secondDisconnected, undefined)
+                  : Effect.void,
+            ),
+          ),
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* Deferred.fail(firstClosed, "closed");
+      yield* Deferred.await(failedRenewal);
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(firstRecovered);
+      yield* Deferred.fail(secondClosed, "closed");
+      yield* Deferred.await(secondDisconnected);
+      yield* Fiber.interrupt(fiber);
+      expect(yield* Ref.get(transitions)).toEqual([
+        "retrying:0", "ready:1", "retrying:1",
+      ]);
     }),
   );
 
