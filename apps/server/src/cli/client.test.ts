@@ -14,6 +14,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Ref from "effect/Ref";
@@ -799,8 +800,12 @@ describe("stdio client bridge", () => {
           Ref.updateAndGet(attempts, (count) => count + 1).pipe(
             Effect.flatMap((count) =>
               count === 1
-                ? Deferred.succeed(failedRenewal, undefined).pipe(Effect.andThen(Effect.fail("offline")))
-                : count === 2 ? Effect.succeed(1) : Effect.never,
+                ? Deferred.succeed(failedRenewal, undefined).pipe(
+                    Effect.andThen(Effect.fail("offline")),
+                  )
+                : count === 2
+                  ? Effect.succeed(1)
+                  : Effect.never,
             ),
           ),
         (phase, session) =>
@@ -813,6 +818,7 @@ describe("stdio client bridge", () => {
                   : Effect.void,
             ),
           ),
+        { retryDelay: () => "1 second" },
       ).pipe(Effect.forkChild({ startImmediately: true }));
 
       yield* Deferred.fail(firstClosed, "closed");
@@ -822,9 +828,59 @@ describe("stdio client bridge", () => {
       yield* Deferred.fail(secondClosed, "closed");
       yield* Deferred.await(secondDisconnected);
       yield* Fiber.interrupt(fiber);
-      expect(yield* Ref.get(transitions)).toEqual([
-        "retrying:0", "ready:1", "retrying:1",
-      ]);
+      expect(yield* Ref.get(transitions)).toEqual(["retrying:0", "ready:1", "retrying:1"]);
+    }),
+  );
+
+  it.effect("backs off reconnect attempts and stops on revoked credentials", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0);
+      const first = yield* Deferred.make<void>();
+      const second = yield* Deferred.make<void>();
+      const third = yield* Deferred.make<void>();
+      const fiber = yield* superviseBridgeConnection(
+        0,
+        () => Effect.fail("closed"),
+        () =>
+          Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+            Effect.tap((count) =>
+              count === 1
+                ? Deferred.succeed(first, undefined)
+                : count === 2
+                  ? Deferred.succeed(second, undefined)
+                  : Deferred.succeed(third, undefined),
+            ),
+            Effect.andThen(Effect.fail("offline")),
+          ),
+        () => Effect.void,
+        { retryDelay: (attempt) => Duration.seconds(attempt) },
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(first);
+      yield* TestClock.adjust(Duration.millis(999));
+      expect(yield* Ref.get(attempts)).toBe(1);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Deferred.await(second);
+      yield* TestClock.adjust(Duration.millis(1999));
+      expect(yield* Ref.get(attempts)).toBe(2);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Deferred.await(third);
+      yield* Fiber.interrupt(fiber);
+
+      const terminalAttempts = yield* Ref.make(0);
+      const error = yield* Effect.flip(
+        superviseBridgeConnection(
+          0,
+          () => Effect.fail("closed"),
+          () =>
+            Ref.update(terminalAttempts, (count) => count + 1).pipe(
+              Effect.andThen(Effect.fail("authentication-failed")),
+            ),
+          () => Effect.void,
+          { shouldRetry: (cause) => cause !== "authentication-failed" },
+        ),
+      );
+      expect(error).toBe("authentication-failed");
+      expect(yield* Ref.get(terminalAttempts)).toBe(1);
     }),
   );
 
