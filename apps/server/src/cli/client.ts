@@ -6,6 +6,7 @@ import {
   resolveRemoteWebSocketConnectionUrl,
 } from "@t3tools/client-runtime/authorization";
 import {
+  appendOrchestrationProtocol,
   BearerConnectionTarget,
   type PreparedConnection,
 } from "@t3tools/client-runtime/connection";
@@ -67,7 +68,7 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_LINE_BYTES = 900_000;
 const MAX_ERROR_CHARS = 1000;
 const MAX_SHELL_PROJECTS = 50;
-const MAX_SHELL_THREADS = 500;
+const MAX_SHELL_THREADS = 2_000;
 const MAX_DISPLAY_CHARS = 500;
 const MAX_THREAD_ITEMS = 100;
 const MAX_THREAD_TEXT_CHARS = 256_000;
@@ -171,6 +172,9 @@ interface BridgeConnection {
   readonly config: ServerConfig;
 }
 
+export const bridgeSocketUrl = (socketUrl: string): string =>
+  appendOrchestrationProtocol(socketUrl);
+
 export const socketUrlSecrets = (socketUrl: string): ReadonlyArray<string> => {
   const ticket = URL.parse(socketUrl)?.searchParams.get("wsTicket");
   return ticket === null || ticket === undefined || ticket.length === 0 ? [] : [ticket];
@@ -209,6 +213,9 @@ interface NormalizedShellProject {
 interface NormalizedShellPayload {
   readonly projects: ReadonlyArray<NormalizedShellProject>;
   truncated: boolean;
+  omittedSettledCount?: number;
+  omittedOtherCount?: number;
+  omittedProjectCount?: number;
 }
 
 interface NormalizedThreadItem {
@@ -392,13 +399,15 @@ const connect = Effect.fn("clientBridge.connect")(function* (message: typeof Hel
   const { httpBaseUrl, wsBaseUrl } = yield* parseEndpoint(message.environment.endpoint);
   const descriptor = yield* fetchEnvironmentDescriptor(httpBaseUrl);
   const bearerToken = yield* readAccessToken(httpBaseUrl);
-  const socketUrl = yield* resolveRemoteWebSocketConnectionUrl({
-    httpBaseUrl,
-    wsBaseUrl,
-    bearerToken,
-  }).pipe(
-    Effect.mapError((cause) =>
-      fail("websocket-ticket-failed", safeErrorMessage(cause, [bearerToken])),
+  const socketUrl = bridgeSocketUrl(
+    yield* resolveRemoteWebSocketConnectionUrl({
+      httpBaseUrl,
+      wsBaseUrl,
+      bearerToken,
+    }).pipe(
+      Effect.mapError((cause) =>
+        fail("websocket-ticket-failed", safeErrorMessage(cause, [bearerToken])),
+      ),
     ),
   );
   const target = new BearerConnectionTarget({
@@ -490,18 +499,59 @@ export const normalizeShellSnapshot = (
   snapshot: OrchestrationV2ShellSnapshot,
   now = DateTime.formatIso(DateTime.nowUnsafe()),
 ): NormalizedShellPayload => {
-  let remainingThreads = MAX_SHELL_THREADS;
-  const includedProjects = snapshot.projects.slice(0, MAX_SHELL_PROJECTS);
-  const includedProjectIds = new Set(includedProjects.map((project) => project.id));
-  const includedThreadCount = snapshot.threads.filter(
-    (thread) => includedProjectIds.has(thread.projectId) && shellThreadHasProjection(thread),
-  ).length;
+  const candidates = snapshot.threads
+    .filter(shellThreadHasProjection)
+    .map((thread) => ({ thread, settled: threadIsSettled(thread, now) }));
+  const byId = new Map(candidates.map((candidate) => [candidate.thread.id, candidate]));
+  const working = (thread: (typeof candidates)[number]["thread"]) =>
+    ["running", "waiting-approval"].includes(normalizeThreadStatus(thread));
+  // A working agent must not lose its parent to the settled-thread budget.
+  const workingAncestors = new Set<string>();
+  for (const { thread } of candidates) {
+    if (!working(thread)) continue;
+    let parentId = thread.lineage.parentThreadId;
+    while (parentId !== null && !workingAncestors.has(parentId)) {
+      workingAncestors.add(parentId);
+      parentId = byId.get(parentId)?.thread.lineage.parentThreadId ?? null;
+    }
+  }
+  const priority = ({ thread, settled }: (typeof candidates)[number]) =>
+    working(thread) || workingAncestors.has(thread.id) ? 0 : settled ? 2 : 1;
+  const projectPriority = new Map<string, number>();
+  for (const candidate of candidates) {
+    const id = candidate.thread.projectId;
+    projectPriority.set(id, Math.min(projectPriority.get(id) ?? 3, priority(candidate)));
+  }
+  const rankedProjects = snapshot.projects
+    .map((project, index) => ({ project, index }))
+    .sort(
+      (a, b) =>
+        (projectPriority.get(a.project.id) ?? 3) - (projectPriority.get(b.project.id) ?? 3) ||
+        a.index - b.index,
+    );
+  const projectIds = new Set(
+    rankedProjects.slice(0, MAX_SHELL_PROJECTS).map(({ project }) => project.id),
+  );
+  const includedProjects = snapshot.projects.filter((project) => projectIds.has(project.id));
+  const selected = candidates
+    .filter(({ thread }) => projectIds.has(thread.projectId))
+    .sort(
+      (a, b) =>
+        priority(a) - priority(b) ||
+        (priority(a) === 2
+          ? DateTime.toEpochMillis(b.thread.updatedAt) - DateTime.toEpochMillis(a.thread.updatedAt)
+          : 0),
+    )
+    .slice(0, MAX_SHELL_THREADS);
+  const selectedIds = new Set(selected.map(({ thread }) => thread.id));
   const payload: NormalizedShellPayload = {
-    projects: includedProjects.map((project) => {
-      const threads = snapshot.threads
-        .filter((thread) => thread.projectId === project.id && shellThreadHasProjection(thread))
-        .slice(0, remainingThreads)
-        .map((thread) => ({
+    projects: includedProjects.map((project) => ({
+      id: project.id,
+      name: singleLine(project.repositoryIdentity?.displayName ?? project.title),
+      root: singleLine(project.workspaceRoot, 2_000),
+      threads: candidates
+        .filter(({ thread }) => thread.projectId === project.id && selectedIds.has(thread.id))
+        .map(({ thread, settled }) => ({
           id: thread.id,
           title: singleLine(thread.title),
           status: normalizeThreadStatus(thread),
@@ -509,32 +559,45 @@ export const normalizeShellSnapshot = (
           model: singleLine(thread.modelSelection.model),
           worktree: singleLine(thread.worktreePath ?? "root"),
           path: singleLine(thread.worktreePath ?? project.workspaceRoot, 2_000),
-          settled: threadIsSettled(thread, now),
+          settled,
           parentThreadId: thread.lineage.parentThreadId,
           relationshipToParent: thread.lineage.relationshipToParent,
           additions: 0,
           deletions: 0,
-        }));
-      remainingThreads -= threads.length;
-      return {
-        id: project.id,
-        name: singleLine(project.repositoryIdentity?.displayName ?? project.title),
-        root: singleLine(project.workspaceRoot, 2_000),
-        threads,
-      };
-    }),
-    truncated:
-      snapshot.projects.length > includedProjects.length || includedThreadCount > MAX_SHELL_THREADS,
+        })),
+    })),
+    truncated: false,
   };
+  // Count selection is not the only bound: evict the oldest settled rows first
+  // when long display names make the encoded projection exceed the byte budget.
   while (Buffer.byteLength(encodeJson(payload), "utf8") > 700_000) {
-    payload.truncated = true;
-    const project = payload.projects.findLast((candidate) => candidate.threads.length > 0);
-    if (project !== undefined) {
-      (project.threads as NormalizedShellThread[]).pop();
-      continue;
+    const victim = selected.pop();
+    if (victim !== undefined) {
+      const project = payload.projects.find(({ id }) => id === victim.thread.projectId);
+      const index = project?.threads.findIndex(({ id }) => id === victim.thread.id) ?? -1;
+      if (project !== undefined && index >= 0) {
+        (project.threads as NormalizedShellThread[]).splice(index, 1);
+      }
+    } else {
+      const projectId = rankedProjects.findLast(({ project }) =>
+        payload.projects.some(({ id }) => id === project.id),
+      )?.project.id;
+      if (projectId === undefined) break;
+      const index = payload.projects.findIndex(({ id }) => id === projectId);
+      (payload.projects as NormalizedShellProject[]).splice(index, 1);
     }
-    (payload.projects as NormalizedShellProject[]).pop();
-    if (payload.projects.length === 0) break;
+  }
+  const visibleProjects = new Set(payload.projects.map(({ id }) => id));
+  const visibleThreads = new Set(
+    payload.projects.flatMap(({ threads }) => threads.map(({ id }) => id)),
+  );
+  const omitted = candidates.filter(({ thread }) => !visibleThreads.has(thread.id));
+  const omittedProjects = snapshot.projects.length - visibleProjects.size;
+  if (omitted.length > 0 || omittedProjects > 0) {
+    payload.truncated = true;
+    payload.omittedSettledCount = omitted.filter(({ settled }) => settled).length;
+    payload.omittedOtherCount = omitted.length - payload.omittedSettledCount;
+    payload.omittedProjectCount = omittedProjects;
   }
   return payload;
 };

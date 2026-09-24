@@ -12,6 +12,7 @@ import {
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -28,6 +29,7 @@ import {
   v2ShellSnapshot,
 } from "../../../../packages/client-runtime/src/state/orchestrationV2TestFixtures.ts";
 import {
+  bridgeSocketUrl,
   normalizeShellSnapshot,
   normalizeThreadProjection,
   reduceThreadProjection,
@@ -67,6 +69,12 @@ const runBridge = (input: string) =>
   );
 
 describe("stdio client bridge", () => {
+  it("negotiates the orchestration protocol on its websocket URL", () => {
+    const url = new URL(bridgeSocketUrl("ws://127.0.0.1:3773/ws?wsTicket=opaque"));
+    expect(url.searchParams.get("wsTicket")).toBe("opaque");
+    expect(url.searchParams.get("orchestrationProtocol")).toBe("2");
+  });
+
   it("normalizes the shell projection without exposing T3 schemas", () => {
     const normalized = normalizeShellSnapshot(v2ShellSnapshot, NOW);
 
@@ -108,6 +116,144 @@ describe("stdio client bridge", () => {
 
     expect(normalized.projects).toHaveLength(50);
     expect(normalized.truncated).toBe(true);
+  });
+
+  it("keeps a shell with more than 500 ordinary threads complete", () => {
+    const threads = Array.from({ length: 600 }, (_, index) => {
+      const id = ThreadId.make(`thread-${String(index)}`);
+      return {
+        ...v2ShellSnapshot.threads[0]!,
+        id,
+        lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
+      };
+    });
+    const normalized = normalizeShellSnapshot({ ...v2ShellSnapshot, threads });
+
+    expect(normalized.projects[0]?.threads).toHaveLength(600);
+    expect(normalized.truncated).toBe(false);
+  });
+
+  it("reserves shell capacity for working threads and their parents before old settled threads", () => {
+    const base = v2ShellSnapshot.threads[0]!;
+    const settled = Array.from({ length: 2_005 }, (_, index) => {
+      const id = ThreadId.make(`settled-${String(index)}`);
+      return {
+        ...base,
+        id,
+        lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
+        settledOverride: "settled" as const,
+        settledAt: base.updatedAt,
+        updatedAt: DateTime.add(base.updatedAt, { seconds: index }),
+      };
+    });
+    const parentId = ThreadId.make("settled-parent");
+    const agentId = ThreadId.make("working-agent");
+    const normalized = normalizeShellSnapshot(
+      {
+        ...v2ShellSnapshot,
+        threads: [
+          ...settled,
+          {
+            ...base,
+            id: parentId,
+            lineage: { rootThreadId: parentId, parentThreadId: null, relationshipToParent: null },
+            settledOverride: "settled",
+            settledAt: base.updatedAt,
+          },
+          {
+            ...base,
+            id: agentId,
+            status: "running",
+            activeRunId: RunId.make("active-run"),
+            lineage: {
+              rootThreadId: parentId,
+              parentThreadId: parentId,
+              relationshipToParent: "subagent",
+            },
+          },
+        ],
+      },
+      NOW,
+    );
+    const threads = normalized.projects[0]!.threads;
+
+    expect(threads).toHaveLength(2_000);
+    expect(threads.some(({ id }) => id === agentId)).toBe(true);
+    expect(threads.some(({ id }) => id === parentId)).toBe(true);
+    expect(threads.some(({ id }) => id === "settled-0")).toBe(false);
+    expect(threads.some(({ id }) => id === "settled-2004")).toBe(true);
+    expect(normalized).toMatchObject({
+      truncated: true,
+      omittedSettledCount: 7,
+      omittedOtherCount: 0,
+      omittedProjectCount: 0,
+    });
+  });
+
+  it("evicts settled threads before working threads at the byte limit", () => {
+    const base = v2ShellSnapshot.threads[0]!;
+    const threads = Array.from({ length: 220 }, (_, index) => {
+      const id = ThreadId.make(`thread-${String(index)}-${"x".repeat(3_500)}`);
+      return {
+        ...base,
+        id,
+        lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
+        settledOverride: "settled" as const,
+        settledAt: base.updatedAt,
+      };
+    });
+    const activeId = ThreadId.make("working-thread");
+    const normalized = normalizeShellSnapshot(
+      {
+        ...v2ShellSnapshot,
+        threads: [
+          ...threads,
+          {
+            ...base,
+            id: activeId,
+            status: "running",
+            activeRunId: RunId.make("active-run"),
+            lineage: { rootThreadId: activeId, parentThreadId: null, relationshipToParent: null },
+          },
+        ],
+      },
+      NOW,
+    );
+
+    expect(normalized.projects[0]?.threads.some(({ id }) => id === activeId)).toBe(true);
+    expect(normalized.omittedSettledCount).toBeGreaterThan(0);
+    expect(normalized.omittedOtherCount).toBe(0);
+    expect(Buffer.byteLength(JSON.stringify(normalized), "utf8")).toBeLessThanOrEqual(700_000);
+  });
+
+  it("includes working projects beyond the project count cap", () => {
+    const base = v2ShellSnapshot.threads[0]!;
+    const projects = Array.from({ length: 51 }, (_, index) => ({
+      ...v2Project,
+      id: ProjectId.make(`project-${String(index)}`),
+    }));
+    const threads = projects.map((project, index) => {
+      const id = ThreadId.make(`thread-${String(index)}`);
+      return {
+        ...base,
+        id,
+        projectId: project.id,
+        lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
+        ...(index === 50
+          ? { status: "running" as const, activeRunId: RunId.make("active-run") }
+          : { settledOverride: "settled" as const, settledAt: base.updatedAt }),
+      };
+    });
+    const normalized = normalizeShellSnapshot({ ...v2ShellSnapshot, projects, threads }, NOW);
+
+    expect(normalized.projects).toHaveLength(50);
+    expect(normalized.projects.some(({ id }) => id === projects[50]!.id)).toBe(true);
+    expect(normalized).toMatchObject({
+      truncated: true,
+      omittedSettledCount: 1,
+      omittedOtherCount: 0,
+      omittedProjectCount: 1,
+    });
   });
 
   it("normalizes a safe, bounded thread timeline", () => {
