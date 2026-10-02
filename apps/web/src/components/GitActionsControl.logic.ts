@@ -3,7 +3,11 @@ import type {
   GitStackedAction,
   VcsStatusResult,
 } from "@t3tools/contracts";
-import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
+import {
+  hasVcsRemoteStatus,
+  isTemporaryWorktreeBranch,
+  supportsVcsWorkflowActions,
+} from "@t3tools/shared/git";
 import {
   DEFAULT_CHANGE_REQUEST_TERMINOLOGY,
   getChangeRequestTerminology,
@@ -49,6 +53,7 @@ export interface GitActionResultToastTiming {
 }
 
 export type DefaultBranchConfirmableAction =
+  | "commit"
   | "push"
   | "create_pr"
   | "commit_push"
@@ -165,7 +170,8 @@ export function buildMenuItems(
   isBusy: boolean,
   hasPrimaryRemote = true,
 ): GitActionMenuItem[] {
-  if (!gitStatus) return [];
+  if (!gitStatus || !supportsVcsWorkflowActions(gitStatus.kind, gitStatus.supportsWorkflowActions))
+    return [];
   const terminology = resolveChangeRequestTerminology(gitStatus);
 
   const hasBranch = gitStatus.refName !== null;
@@ -176,12 +182,14 @@ export function buildMenuItems(
   const canPushWithoutUpstream = hasPrimaryRemote && !gitStatus.hasUpstream;
   const canCommit = !isBusy && hasChanges;
   const canPush =
+    hasVcsRemoteStatus(gitStatus) &&
     !isBusy &&
     hasBranch &&
     !isBehind &&
     gitStatus.aheadCount > 0 &&
     (gitStatus.hasUpstream || canPushWithoutUpstream);
   const canCreatePr =
+    hasVcsRemoteStatus(gitStatus) &&
     !isBusy &&
     hasBranch &&
     !hasChanges &&
@@ -259,13 +267,29 @@ export function resolveQuickAction(
   const isBehind = gitStatus.behindCount > 0;
   const isDiverged = isAhead && isBehind;
   const terminology = resolveChangeRequestTerminology(gitStatus);
+  if (!supportsVcsWorkflowActions(gitStatus.kind, gitStatus.supportsWorkflowActions))
+    return {
+      label: "Commit",
+      disabled: true,
+      kind: "show_hint",
+      hint: "This repository does not support source-control actions.",
+    };
+  if (gitStatus.kind === "jj" && !hasBranch && hasChanges)
+    return { label: "Commit change", disabled: false, kind: "run_action", action: "commit" };
+  if (!hasVcsRemoteStatus(gitStatus))
+    return hasChanges
+      ? { label: "Commit", disabled: false, kind: "run_action", action: "commit" }
+      : { label: "Push", disabled: true, kind: "show_hint", hint: "Remote status is unavailable." };
 
   if (!hasBranch) {
     return {
       label: "Commit",
       disabled: true,
       kind: "show_hint",
-      hint: `Create and checkout a ref before pushing or opening a ${terminology.singular}.`,
+      hint:
+        gitStatus.kind === "jj"
+          ? "Create or select an unambiguous bookmark before publishing."
+          : `Create and checkout a ref before pushing or opening a ${terminology.singular}.`,
     };
   }
 
@@ -335,7 +359,7 @@ export function resolveQuickAction(
 
   if (isBehind) {
     return {
-      label: "Pull",
+      label: gitStatus.kind === "jj" ? "Fetch" : "Pull",
       disabled: false,
       kind: "run_pull",
     };
@@ -389,9 +413,11 @@ export function resolveQuickAction(
 export function requiresDefaultBranchConfirmation(
   action: GitStackedAction,
   isDefaultRef: boolean,
+  vcsKind?: VcsStatusResult["kind"],
 ): boolean {
   if (!isDefaultRef) return false;
   return (
+    (action === "commit" && vcsKind === "jj") ||
     action === "push" ||
     action === "create_pr" ||
     action === "commit_push" ||
@@ -409,6 +435,13 @@ export function resolveDefaultBranchActionDialogCopy(input: {
   const suffix = ` on "${branchLabel}". You can continue on this ref or create a feature ref and run the same action there.`;
   const terminology = input.terminology ?? DEFAULT_CHANGE_REQUEST_TERMINOLOGY;
 
+  if (input.action === "commit") {
+    return {
+      title: "Commit to default bookmark?",
+      description: `This action will commit changes and advance the default bookmark${suffix}`,
+      continueLabel: `Commit to ${branchLabel}`,
+    };
+  }
   if (input.action === "push" || input.action === "commit_push") {
     if (input.includesCommit) {
       return {

@@ -11,6 +11,8 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 
 import * as ProcessRunner from "../processRunner.ts";
+import * as Option from "effect/Option";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
 const DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY = 512;
 // Background sweeps resolve every project each minute. A long TTL keeps them
@@ -144,6 +146,32 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
   options: RepositoryIdentityResolverOptions = {},
 ) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  const vcs = Option.getOrNull(yield* Effect.serviceOption(VcsDriverRegistry.VcsDriverRegistry));
+  const detect = (cwd: string) =>
+    vcs ? vcs.detect({ cwd }).pipe(Effect.orElseSucceed(() => null)) : Effect.succeed(null);
+  const resolveRoot = Effect.fnUntraced(function* (cwd: string) {
+    const handle = yield* detect(cwd);
+    return handle?.kind === "jj"
+      ? handle.repository.rootPath
+      : yield* resolveRepositoryIdentityCacheKey(cwd).pipe(
+          Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+        );
+  });
+  const resolveIdentity = Effect.fnUntraced(function* (cwd: string) {
+    const handle = yield* detect(cwd);
+    if (handle?.kind === "jj") {
+      const inventory = yield* handle.driver
+        .listRemotes(cwd)
+        .pipe(Effect.orElseSucceed(() => null));
+      const remote = inventory
+        ? pickPrimaryRemote(new Map(inventory.remotes.map((remote) => [remote.name, remote.url])))
+        : null;
+      return remote ? buildRepositoryIdentity({ ...remote, rootPath: cwd }) : null;
+    }
+    return yield* resolveRepositoryIdentityFromCacheKey(cwd).pipe(
+      Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+    );
+  });
   const cacheCapacity = options.cacheCapacity ?? DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY;
   const refine = options.refine ?? Effect.succeed;
   // Git errors and timeouts resolve to null, so they use the negative TTL like
@@ -157,18 +185,14 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
       onFailure: () => Duration.zero,
     });
 
-  const repositoryRootCache = yield* Cache.makeWith<string, string | null>(
-    (cwd) =>
-      resolveRepositoryIdentityCacheKey(cwd).pipe(
-        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
-      ),
-    { capacity: cacheCapacity, timeToLive },
-  );
+  const repositoryRootCache = yield* Cache.makeWith<string, string | null>(resolveRoot, {
+    capacity: cacheCapacity,
+    timeToLive,
+  });
 
   const repositoryIdentityCache = yield* Cache.makeWith<string, RepositoryIdentity | null>(
     (cacheKey) =>
-      resolveRepositoryIdentityFromCacheKey(cacheKey).pipe(
-        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+      resolveIdentity(cacheKey).pipe(
         Effect.filterOrElse(
           (identity): identity is null => identity === null,
           (identity) => refine(identity).pipe(Effect.orElseSucceed(() => identity)),

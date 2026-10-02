@@ -86,8 +86,7 @@ it("does not commit running state when inherited background routing cannot be re
     Effect.succeed({ committed: true, storedEvents: [] } as never),
   );
   const startRootRun = vi.fn(() => Effect.void);
-  const pruneWorktrees = vi.fn(() => Effect.void);
-  const createWorktree = vi.fn(() => Effect.succeed({} as never));
+  const recoverWorktree = vi.fn(() => Effect.void);
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -95,7 +94,7 @@ it("does not commit running state when inherited background routing cannot be re
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
         Layer.succeed(FileSystem.FileSystem, { exists: () => Effect.succeed(false) } as never),
-        Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
+        Layer.mock(GitWorkflow.GitWorkflowService)({ recoverWorktree }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () =>
             Effect.succeed(
@@ -141,8 +140,7 @@ it("does not commit running state when inherited background routing cannot be re
 
     expect(error._tag).toBe("ProviderTurnStartError");
     expect(projectionReadCount).toBe(2);
-    expect(pruneWorktrees).toHaveBeenCalledWith({ cwd: "/tmp/provider-turn-start-project" });
-    expect(createWorktree).toHaveBeenCalledWith({
+    expect(recoverWorktree).toHaveBeenCalledWith({
       cwd: "/tmp/provider-turn-start-project",
       refName: "feature/restore",
       path: "/tmp/missing-provider-turn-start-worktree",

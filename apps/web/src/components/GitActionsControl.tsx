@@ -1193,7 +1193,10 @@ export default function GitActionsControl({
   const isRepo = gitStatus?.isRepo ?? true;
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
   const gitStatusForActions = gitStatus;
-  const vcsActionPresentation = resolveVcsActionPresentation(gitStatus?.kind);
+  const vcsActionPresentation = resolveVcsActionPresentation(
+    gitStatus?.kind,
+    gitStatus?.supportsWorkflowActions,
+  );
 
   const allFiles = gitStatusForActions?.workingTree.files ?? [];
   const selectedFiles = allFiles.filter((f) => !excludedFiles.has(f.path));
@@ -1201,6 +1204,7 @@ export default function GitActionsControl({
   const noneSelected = selectedFiles.length === 0;
 
   const initAction = useVcsInitAction(sourceControlScope);
+  const jjInitAction = useVcsInitAction(sourceControlScope, "jj");
   const runImmediateGitAction = useGitStackedAction(sourceControlScope);
   const pullAction = useVcsPullAction(sourceControlScope);
   const isGitActionRunning = useSourceControlActionRunning(
@@ -1314,10 +1318,11 @@ export default function GitActionsControl({
         (action === "commit" || !!actionStatus?.hasWorkingTreeChanges || featureBranch);
       if (
         !skipDefaultBranchPrompt &&
-        requiresDefaultBranchConfirmation(action, actionIsDefaultBranch) &&
+        requiresDefaultBranchConfirmation(action, actionIsDefaultBranch, actionStatus?.kind) &&
         actionBranch
       ) {
         if (
+          action !== "commit" &&
           action !== "push" &&
           action !== "create_pr" &&
           action !== "commit_push" &&
@@ -1345,7 +1350,8 @@ export default function GitActionsControl({
         actionId,
         action,
         ...(commitMessage ? { commitMessage } : {}),
-        ...(featureBranch ? { featureBranch } : {}),
+        featureBranch,
+        ...(skipDefaultBranchPrompt && !featureBranch ? { confirmedDefaultRef: true } : {}),
         ...(filePaths ? { filePaths } : {}),
         // A pull request the action opens is linked to the thread it ran beside. Drafts
         // have no server thread yet, so there is nothing to link to.
@@ -1508,7 +1514,7 @@ export default function GitActionsControl({
           toastManager.add(
             stackedThreadToast({
               type: "error",
-              title: "Pull failed",
+              title: gitStatusForActions?.kind === "jj" ? "Fetch failed" : "Pull failed",
               description: error instanceof Error ? error.message : "An error occurred.",
               timeout: errorToastTiming.timeout,
               ...(threadToastData !== undefined ? { data: threadToastData } : {}),
@@ -1518,10 +1524,17 @@ export default function GitActionsControl({
         }
 
         const pullResult = result.value;
-        const title = pullResult.status === "pulled" ? "Pulled" : "Already up to date";
+        const title =
+          pullResult.status === "pulled"
+            ? gitStatusForActions?.kind === "jj"
+              ? "Fetched"
+              : "Pulled"
+            : "Already up to date";
         const description =
           pullResult.status === "pulled"
-            ? `Updated ${pullResult.refName} from ${pullResult.upstreamRef ?? "upstream"}`
+            ? gitStatusForActions?.kind === "jj"
+              ? `Fetched bookmark updates from ${pullResult.upstreamRef ?? "the remote"}`
+              : `Updated ${pullResult.refName} from ${pullResult.upstreamRef ?? "upstream"}`
             : `${pullResult.refName} is already synchronized.`;
         if (isPanel) {
           setInlineSuccess({ title, description, scopeKey: successScopeKey });
@@ -1616,11 +1629,16 @@ export default function GitActionsControl({
     [gitCwd, openInPreferredEditor, threadToastData],
   );
 
-  const canPublishRepository = isRepo && gitStatusForActions !== null && !hasPrimaryRemote;
+  const canPublishRepository =
+    isRepo &&
+    gitStatusForActions !== null &&
+    !hasPrimaryRemote &&
+    vcsActionPresentation.supportsGitWorkflowActions;
+  const canInitializeJj = serverConfig?.environment.capabilities.jujutsuWorkflows === true;
 
-  const initializeGit = () => {
+  const initializeRepository = (kind: "git" | "jj") => {
     void (async () => {
-      const result = await initAction.run();
+      const result = await (kind === "jj" ? jjInitAction : initAction).run();
       if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
         return;
       }
@@ -1628,13 +1646,15 @@ export default function GitActionsControl({
       toastManager.add(
         stackedThreadToast({
           type: "error",
-          title: "Git initialization failed",
+          title: "Repository initialization failed",
           description: error instanceof Error ? error.message : "An error occurred.",
           ...(threadToastData !== undefined ? { data: threadToastData } : {}),
         }),
       );
     })();
   };
+  const initializeGit = () => initializeRepository("git");
+  const initializeJJ = () => initializeRepository("jj");
   const gitItems = (
     <>
       {gitActionMenuItems.map((item) => {
@@ -1707,7 +1727,9 @@ export default function GitActionsControl({
       ) : null}
       {gitStatusForActions?.refName === null && (
         <p className="px-2 py-1.5 text-xs text-warning">
-          Detached HEAD: create and check out a branch to enable push and pull request actions.
+          {gitStatusForActions.kind === "jj"
+            ? "Create or select an unambiguous bookmark before publishing."
+            : "Detached HEAD: create and check out a branch to enable push and pull request actions."}
         </p>
       )}
       {gitStatusForActions &&
@@ -1727,17 +1749,29 @@ export default function GitActionsControl({
     <>
       {presentation === "menu" ? (
         !isRepo ? (
-          <MenuItem
-            density={presentation === "menu" ? "touch" : "default"}
+          <>
+            <MenuItem
+              density={presentation === "menu" ? "touch" : "default"}
 
-            disabled={initAction.isPending}
-            onClick={initializeGit}
-          >
-            <GitBranchPlusIcon className="size-4" />
-            <MenuItemLabel>
-              {initAction.isPending ? "Initializing..." : "Initialize Git"}
-            </MenuItemLabel>
-          </MenuItem>
+              disabled={initAction.isPending}
+              onClick={initializeGit}
+            >
+              <GitBranchPlusIcon className="size-4" />
+              <MenuItemLabel>
+                {initAction.isPending ? "Initializing..." : "Initialize Git"}
+              </MenuItemLabel>
+            </MenuItem>
+            {canInitializeJj ? (
+              <MenuItem
+                density="touch"
+                disabled={initAction.isPending || jjInitAction.isPending}
+                onClick={initializeJJ}
+              >
+                <GitBranchPlusIcon className="size-4" />
+                <MenuItemLabel>Initialize JJ</MenuItemLabel>
+              </MenuItem>
+            ) : null}
+          </>
         ) : (
           <>
             <MenuItem
@@ -1765,26 +1799,41 @@ export default function GitActionsControl({
             >
               <MenuSubTrigger density="touch" disabled={isGitActionRunning}>
                 <SourceControlIcon className="size-4" />
-                <MenuItemLabel>Git actions</MenuItemLabel>
+                <MenuItemLabel>Source-control actions</MenuItemLabel>
               </MenuSubTrigger>
               <MenuSubPopup>{gitItems}</MenuSubPopup>
             </MenuSub>
           </>
         )
       ) : !isRepo ? (
-        <ThreadDetailsControl
-          size="xs"
-          variant={isPanel ? "ghost" : "outline"}
-          part="row"
-          panel={isPanel}
-          disabled={initAction.isPending}
-          onClick={initializeGit}
-        >
-          <GitBranchPlusIcon className="size-3.5" aria-hidden />
-          <span className="ml-0.5">
-            {initAction.isPending ? "Initializing..." : "Initialize Git"}
-          </span>
-        </ThreadDetailsControl>
+        <>
+          <ThreadDetailsControl
+            size="xs"
+            variant={isPanel ? "ghost" : "outline"}
+            part="row"
+            panel={isPanel}
+            disabled={initAction.isPending}
+            onClick={initializeGit}
+          >
+            <GitBranchPlusIcon className="size-3.5" aria-hidden />
+            <span className="ml-0.5">
+              {initAction.isPending ? "Initializing..." : "Initialize Git"}
+            </span>
+          </ThreadDetailsControl>
+          {canInitializeJj ? (
+            <ThreadDetailsControl
+              size="xs"
+              variant={isPanel ? "ghost" : "outline"}
+              part="row"
+              panel={isPanel}
+              disabled={initAction.isPending || jjInitAction.isPending}
+              onClick={initializeJJ}
+            >
+              <GitBranchPlusIcon className="size-3.5" aria-hidden />
+              <span className="ml-0.5">Initialize JJ</span>
+            </ThreadDetailsControl>
+          ) : null}
+        </>
       ) : compact &&
         !gitActionProgress &&
         !visibleInlineSuccess ? null : !vcsActionPresentation.supportsGitWorkflowActions ? (

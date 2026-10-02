@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { Effect, FileSystem, Layer, Path, PlatformError } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { CheckpointRef, type VcsError } from "@t3tools/contracts";
+import { parseTurnDiffFilesFromNumstat } from "../checkpointing/Diffs.ts";
 import type { VcsProcessInput, VcsProcessOutput } from "./VcsProcess.ts";
 import { VcsProcess, layer as VcsProcessLayer } from "./VcsProcess.ts";
 import * as JjVcsDriver from "./JjVcsDriver.ts";
@@ -127,7 +128,7 @@ describe("JjVcsDriver", () => {
         });
         assert.isTrue(
           (yield* driver.listWorkspaces(repo)).some(
-            (workspace) => workspace.name === "feature-test" && workspace.path === workspacePath,
+            (workspace) => workspace.name.startsWith("t3-") && workspace.path === workspacePath,
           ),
         );
 
@@ -174,6 +175,358 @@ describe("JjVcsDriver", () => {
     ).pipe(Effect.provide(JjContractLayer)),
   );
 
+  it.effect("reads merge-change stats and creates a workspace on both stable parents", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-merge-status-" });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+        yield* fs.writeFileString(path.join(repo, "a.txt"), "a\n");
+        yield* runJj(repo, ["commit", "-m", "parent A"]);
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const first = (yield* driver.execute({
+          cwd: repo,
+          operation: "test",
+          args: ["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+        })).stdout.trim();
+        yield* runJj(repo, ["new", "root()"]);
+        yield* fs.writeFileString(path.join(repo, "b.txt"), "b\n");
+        yield* runJj(repo, ["commit", "-m", "parent B"]);
+        const second = (yield* driver.execute({
+          cwd: repo,
+          operation: "test",
+          args: ["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+        })).stdout.trim();
+        yield* runJj(repo, ["new", first, second]);
+        assert.isFalse((yield* driver.localStatus(repo)).hasWorkingTreeChanges);
+        yield* fs.writeFileString(path.join(repo, "merge.txt"), "merged edit\n");
+        assert.deepStrictEqual((yield* driver.localStatus(repo)).workingTree.files, [
+          { path: "merge.txt", insertions: 1, deletions: 0 },
+        ]);
+        const workspace = path.join(root, "workspace");
+        yield* driver.createWorktree({ cwd: repo, refName: "@", path: workspace });
+        assert.isTrue(yield* fs.exists(path.join(workspace, "a.txt")));
+        assert.isTrue(yield* fs.exists(path.join(workspace, "b.txt")));
+        assert.isFalse(yield* fs.exists(path.join(workspace, "merge.txt")));
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("scopes checkpoint summaries and restore to a non-colocated thread directory", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-checkpoint-scope-" });
+        const repo = path.join(root, "repo");
+        yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+        const cwd = path.join(repo, "thread");
+        yield* fs.makeDirectory(cwd);
+        yield* fs.writeFileString(path.join(cwd, "a file.txt"), "before\n");
+        yield* fs.writeFileString(path.join(repo, "sibling.txt"), "before\n");
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        const from = CheckpointRef.make("refs/t3/checkpoints/scoped/0");
+        const to = CheckpointRef.make("refs/t3/checkpoints/scoped/1");
+        yield* driver.checkpoints!.captureCheckpoint({ cwd, checkpointRef: from });
+        yield* fs.writeFileString(path.join(cwd, "a file.txt"), "after\n");
+        yield* fs.writeFileString(path.join(repo, "sibling.txt"), "sibling edit\n");
+        yield* driver.checkpoints!.captureCheckpoint({ cwd, checkpointRef: to });
+        const summary = yield* driver.checkpoints!.diffCheckpoints({
+          cwd,
+          fromCheckpointRef: from,
+          toCheckpointRef: to,
+          ignoreWhitespace: false,
+          format: "numstat",
+        });
+        assert.deepStrictEqual(parseTurnDiffFilesFromNumstat(summary), [
+          { path: "thread/a file.txt", additions: 1, deletions: 1 },
+        ]);
+        assert.isTrue(yield* driver.checkpoints!.restoreCheckpoint({ cwd, checkpointRef: from }));
+        assert.equal(yield* fs.readFileString(path.join(cwd, "a file.txt")), "before\n");
+        assert.equal(yield* fs.readFileString(path.join(repo, "sibling.txt")), "sibling edit\n");
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect(
+    "retains checkpoint objects and refuses a shadowed, unindexed revision after pruning",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-checkpoint-gc-" });
+          yield* runJj(root, ["git", "init", "--no-colocate"]);
+          const driver = yield* JjVcsDriver.makeVcsDriverShape();
+          const from = CheckpointRef.make("refs/t3/checkpoints/gc/0");
+          const to = CheckpointRef.make("refs/t3/checkpoints/gc/1");
+          yield* fs.writeFileString(path.join(root, "file.txt"), "before\n");
+          yield* driver.checkpoints!.captureCheckpoint({ cwd: root, checkpointRef: from });
+          yield* fs.writeFileString(path.join(root, "file.txt"), "after\n");
+          yield* driver.checkpoints!.captureCheckpoint({ cwd: root, checkpointRef: to });
+          const savedId = (yield* driver.readGitBackend({
+            cwd: root,
+            operation: "checkpoint shadow test",
+            args: ["rev-parse", from],
+          })).stdout.trim();
+          yield* runJj(root, ["bookmark", "create", savedId, "-r", "@"]);
+          assert.isTrue(
+            yield* driver.checkpoints!.restoreCheckpoint({ cwd: root, checkpointRef: from }),
+          );
+          assert.equal(yield* fs.readFileString(path.join(root, "file.txt")), "before\n");
+          assert.isTrue(
+            yield* driver.checkpoints!.restoreCheckpoint({ cwd: root, checkpointRef: to }),
+          );
+          yield* runJj(root, ["op", "abandon", "..@-"]);
+          yield* runJj(root, ["debug", "reindex"]);
+          yield* runJj(root, ["util", "gc", "--expire", "now"]);
+          assert.isTrue(
+            yield* driver.checkpoints!.hasCheckpointRef({ cwd: root, checkpointRef: from }),
+          );
+          assert.deepEqual(
+            parseTurnDiffFilesFromNumstat(
+              yield* driver.checkpoints!.diffCheckpoints({
+                cwd: root,
+                fromCheckpointRef: from,
+                toCheckpointRef: to,
+                ignoreWhitespace: false,
+                format: "numstat",
+              }),
+            ),
+            [{ path: "file.txt", additions: 1, deletions: 1 }],
+          );
+          const error = yield* driver
+            .checkpoints!.restoreCheckpoint({ cwd: root, checkpointRef: from })
+            .pipe(Effect.flip);
+          assert.include(error.message, "cannot resolve this retained checkpoint");
+          assert.equal(yield* fs.readFileString(path.join(root, "file.txt")), "after\n");
+        }),
+      ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("detaches metadata before deleting files so refresh cannot rewrite the bookmark", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-delete-race-" });
+        const repo = path.join(root, "repo");
+        const workspace = path.join(root, "workspace");
+        yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+        yield* fs.writeFileString(path.join(repo, "file.txt"), "keep\n");
+        yield* runJj(repo, ["commit", "-m", "initial"]);
+        let refreshAttempted = false;
+        const driver = yield* JjVcsDriver.makeVcsDriverShape().pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fs,
+            remove: (target, options) =>
+              target === workspace
+                ? Effect.gen(function* () {
+                    assert.isFalse(yield* fs.exists(path.join(workspace, ".jj")));
+                    yield* fs.remove(path.join(workspace, "file.txt"));
+                    assert.equal(
+                      (yield* runJj(workspace, [
+                        "log",
+                        "-r",
+                        "@",
+                        "--no-graph",
+                        "-T",
+                        "commit_id",
+                      ]).pipe(Effect.exit))._tag,
+                      "Failure",
+                    );
+                    refreshAttempted = true;
+                    yield* fs.remove(target, options);
+                  })
+                : fs.remove(target, options),
+          }),
+        );
+        yield* driver.createWorktree({
+          cwd: repo,
+          refName: "@-",
+          newRefName: "review/delete",
+          path: workspace,
+        });
+        const before = (yield* driver.listBookmarks(repo)).find(
+          (bookmark) => bookmark.name === "review/delete" && bookmark.remoteName === null,
+        )?.target;
+        assert.isString(before);
+        yield* driver.removeWorktree({ cwd: repo, path: workspace });
+        assert.isTrue(refreshAttempted);
+        assert.equal(
+          (yield* driver.listBookmarks(repo)).find(
+            (bookmark) => bookmark.name === "review/delete" && bookmark.remoteName === null,
+          )?.target,
+          before,
+        );
+        yield* driver.removeWorktree({ cwd: repo, path: workspace });
+        const collision = path.join(root, "collision");
+        assert.equal(
+          (yield* driver
+            .createWorktree({
+              cwd: repo,
+              refName: "@-",
+              newRefName: "review/delete",
+              path: collision,
+            })
+            .pipe(Effect.exit))._tag,
+          "Failure",
+        );
+        assert.isFalse(yield* fs.exists(collision));
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect(
+    "protects unrelated directories, the primary repository, and ignored workspace files",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-removal-" });
+          const repo = path.join(root, "repo");
+          const workspace = path.join(root, "workspace");
+          const unrelated = path.join(root, "unrelated");
+          yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+          yield* fs.writeFileString(path.join(repo, ".gitignore"), "local.bin\n");
+          yield* runJj(repo, ["commit", "-m", "ignore local data"]);
+          const driver = yield* JjVcsDriver.makeVcsDriverShape();
+          yield* driver.createWorktree({ cwd: repo, refName: "@-", path: workspace });
+          yield* fs.makeDirectory(unrelated);
+          yield* fs.writeFileString(path.join(unrelated, "keep.txt"), "keep\n");
+          assert.isTrue(
+            (yield* Effect.exit(driver.removeWorktree({ cwd: repo, path: unrelated, force: true })))
+              ._tag === "Failure",
+          );
+          assert.isTrue(
+            (yield* Effect.exit(driver.removeWorktree({ cwd: repo, path: repo, force: true })))
+              ._tag === "Failure",
+          );
+          assert.isFalse(yield* driver.hasUntrackedFiles(workspace));
+          yield* fs.writeFileString(path.join(workspace, "local.bin"), "ignored\n");
+          assert.isTrue(yield* driver.hasUntrackedFiles(workspace));
+          assert.isTrue(
+            (yield* Effect.exit(driver.removeWorktree({ cwd: repo, path: workspace })))._tag ===
+              "Failure",
+          );
+          assert.isTrue(yield* fs.exists(path.join(workspace, "local.bin")));
+          assert.isTrue(yield* fs.exists(path.join(unrelated, "keep.txt")));
+          yield* driver.removeWorktree({ cwd: repo, path: workspace, force: true });
+          assert.isFalse(yield* fs.exists(workspace));
+          assert.isTrue(yield* fs.exists(repo));
+          yield* driver.createWorktree({ cwd: repo, refName: "@-", path: workspace });
+          yield* fs.remove(workspace, { recursive: true });
+          const other = path.join(root, "other");
+          yield* runJj(root, ["git", "init", "--no-colocate", other]);
+          yield* driver.createWorktree({ cwd: other, refName: "@", path: workspace });
+          yield* fs.writeFileString(path.join(workspace, "belongs-to-other.txt"), "keep\n");
+          assert.equal(
+            (yield* Effect.exit(driver.validateWorktreePath({ cwd: repo, path: workspace })))._tag,
+            "Failure",
+          );
+          assert.equal(
+            (yield* Effect.exit(driver.removeWorktree({ cwd: repo, path: workspace, force: true })))
+              ._tag,
+            "Failure",
+          );
+          assert.equal(
+            yield* fs.readFileString(path.join(workspace, "belongs-to-other.txt")),
+            "keep\n",
+          );
+        }),
+      ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("isolates workspace bases and recovers a missing workspace's snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-recover-" });
+        const repo = path.join(root, "repo");
+        const workspace = path.join(root, "workspace");
+        yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+        yield* fs.writeFileString(path.join(repo, "base.txt"), "base\n");
+        yield* runJj(repo, ["commit", "-m", "base"]);
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        yield* driver.createWorktree({
+          cwd: repo,
+          refName: "@",
+          newRefName: "feature/recover",
+          path: workspace,
+        });
+        yield* fs.writeFileString(path.join(repo, "root-only.txt"), "root\n");
+        yield* driver.currentChange(repo);
+        assert.isFalse(yield* fs.exists(path.join(workspace, "root-only.txt")));
+        yield* fs.writeFileString(path.join(workspace, "saved.txt"), "saved\n");
+        const saved = yield* driver.currentChange(workspace);
+        yield* fs.remove(workspace, { recursive: true });
+        yield* driver.recoverWorktree({ cwd: repo, path: workspace, refName: "feature/recover" });
+        assert.equal(yield* fs.readFileString(path.join(workspace, "saved.txt")), "saved\n");
+        assert.equal((yield* driver.currentChange(workspace))?.changeId, saved?.changeId);
+        assert.isTrue((yield* driver.localStatus(workspace)).hasWorkingTreeChanges);
+        assert.isFalse(
+          (yield* driver.listRefs({ cwd: repo })).refs.some((ref) => ref.kind === "workspace"),
+        );
+        assert.isTrue(
+          (yield* driver.listRefs({ cwd: repo, includeWorkspaces: true })).refs.some(
+            (ref) => ref.kind === "workspace" && ref.worktreePath === workspace,
+          ),
+        );
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("resumes a clean bookmarked workspace after automatic removal", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-cleanup-resume-" });
+        const repo = path.join(root, "repo");
+        const workspace = path.join(root, "workspace");
+        yield* runJj(root, ["git", "init", "--no-colocate", repo]);
+        yield* fs.writeFileString(path.join(repo, "base.txt"), "base\n");
+        yield* runJj(repo, ["commit", "-m", "base"]);
+        const driver = yield* JjVcsDriver.makeVcsDriverShape();
+        yield* driver.createWorktree({
+          cwd: repo,
+          refName: "@-",
+          newRefName: "feature/resume",
+          path: workspace,
+        });
+        const original = yield* driver.currentChange(workspace);
+        yield* driver.removeWorktree({ cwd: repo, path: workspace, force: false });
+        yield* driver.recoverWorktree({ cwd: repo, path: workspace, refName: "feature/resume" });
+        assert.equal((yield* driver.currentChange(workspace))?.changeId, original?.changeId);
+        assert.equal(yield* fs.readFileString(path.join(workspace, "base.txt")), "base\n");
+        assert.isFalse((yield* driver.localStatus(workspace)).hasWorkingTreeChanges);
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
+  it.effect("never falls back to Git when JJ metadata exists but its executable is missing", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-missing-cli-" });
+        yield* runJj(root, ["git", "init", "--colocate"]);
+        const process = yield* VcsProcess;
+        const driver = yield* JjVcsDriver.makeVcsDriverShape().pipe(
+          Effect.provideService(VcsProcess, {
+            run: (input) => process.run({ ...input, command: path.join(root, "missing-jj") }),
+          }),
+        );
+        assert.equal((yield* Effect.exit(driver.detectRepository(root)))._tag, "Failure");
+        assert.equal((yield* Effect.exit(driver.isInsideWorkTree(root)))._tag, "Failure");
+      }),
+    ).pipe(Effect.provide(JjContractLayer)),
+  );
+
   it.effect("detects repository identity with jj root", () => {
     const calls: VcsProcessInput[] = [];
 
@@ -209,7 +562,13 @@ describe("JjVcsDriver", () => {
       const result = yield* driver.listWorkspaceFiles("/repo");
 
       assert.deepStrictEqual(result.paths, ["README.md", "src/index.ts"]);
-      assert.deepStrictEqual(observedInput?.args, ["--no-pager", "file", "list"]);
+      assert.deepStrictEqual(observedInput?.args, [
+        "--no-pager",
+        "file",
+        "list",
+        "-T",
+        'path ++ "\\0"',
+      ]);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

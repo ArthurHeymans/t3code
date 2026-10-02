@@ -295,6 +295,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<VcsProcess.VcsProcessOutput, GitHubCliError>;
 
     readonly listOpenPullRequests: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly headSelector: string;
       readonly limit?: number;
@@ -302,6 +303,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<ReadonlyArray<GitHubPullRequestSummary>, GitHubCliError>;
 
     readonly getPullRequest: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly reference: string;
       readonly rateLimitHost?: string;
@@ -319,6 +321,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<GitHubRepositoryCloneUrls, GitHubCliError>;
 
     readonly createPullRequest: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly baseBranch: string;
       readonly headSelector: string;
@@ -327,6 +330,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<void, GitHubCliError>;
 
     readonly getDefaultBranch: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly rateLimitHost?: string;
     }) => Effect.Effect<string | null, GitHubCliError>;
@@ -571,6 +575,7 @@ export const make = Effect.gen(function* () {
           String(input.limit ?? 1),
           "--json",
           "number,title,url,baseRefName,headRefName,state,isDraft,mergedAt,closedAt,isCrossRepository,headRepository,headRepositoryOwner",
+          ...(input.repository ? ["--repo", input.repository] : []),
         ],
       }).pipe(
         Effect.map((result) => result.stdout.trim()),
@@ -605,6 +610,7 @@ export const make = Effect.gen(function* () {
           input.reference,
           "--json",
           "number,title,url,baseRefName,headRefName,state,isDraft,mergedAt,closedAt,updatedAt,isCrossRepository,headRepository,headRepositoryOwner",
+          ...(input.repository ? ["--repo", input.repository] : []),
         ],
       }).pipe(
         Effect.map((result) => result.stdout.trim()),
@@ -669,13 +675,22 @@ export const make = Effect.gen(function* () {
           input.title,
           "--body-file",
           input.bodyFile,
+          ...(input.repository ? ["--repo", input.repository] : []),
         ],
       }).pipe(Effect.asVoid),
     getDefaultBranch: (input) =>
       execute({
         cwd: input.cwd,
         ...(input.rateLimitHost === undefined ? {} : { rateLimitHost: input.rateLimitHost }),
-        args: ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        args: [
+          "repo",
+          "view",
+          ...(input.repository ? [input.repository] : []),
+          "--json",
+          "defaultBranchRef",
+          "--jq",
+          ".defaultBranchRef.name",
+        ],
       }).pipe(
         Effect.map((value) => {
           const trimmed = value.stdout.trim();

@@ -47,12 +47,12 @@ function makeLayer(input: {
 }
 
 describe("GitWorkflowService", () => {
-  it.effect("reports a non-Git VCS repository as not a Git repository", () =>
+  it.effect("recognizes Jujutsu as a repository for shared workspace workflows", () =>
     Effect.gen(function* () {
       const workflow = yield* GitWorkflowService.GitWorkflowService;
       const isRepository = yield* workflow.isRepository("/jj-repo");
 
-      assert.equal(isRepository, false);
+      assert.equal(isRepository, true);
     }).pipe(
       Effect.provide(
         makeLayer({
@@ -161,7 +161,9 @@ describe("GitWorkflowService", () => {
           localStatus,
         }),
       ),
-      Layer.provide(Layer.mock(GitManager.GitManager)({})),
+      Layer.provide(
+        Layer.mock(GitManager.GitManager)({ remoteStatus: () => Effect.succeed(null) }),
+      ),
       Layer.provide(ServerConfigTestLayer),
     );
 

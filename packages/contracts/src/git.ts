@@ -81,6 +81,8 @@ const GitRunStackedActionToast = Schema.Struct({
 export type GitRunStackedActionToast = typeof GitRunStackedActionToast.Type;
 
 export const VcsRef = Schema.Struct({
+  /** Workspaces name a working copy; they are not publishable bookmarks. */
+  kind: Schema.optional(Schema.Literals(["branch", "bookmark", "workspace"])),
   name: TrimmedNonEmptyStringSchema,
   isRemote: Schema.optional(Schema.Boolean),
   remoteName: Schema.optional(TrimmedNonEmptyStringSchema),
@@ -122,6 +124,8 @@ export const GitRunStackedActionInput = Schema.Struct({
   action: GitStackedAction,
   commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
   featureBranch: Schema.optional(Schema.Boolean),
+  /** Explicit consent to advance the default bookmark, not a branch-creation preference. */
+  confirmedDefaultRef: Schema.optional(Schema.Boolean),
   filePaths: Schema.optional(
     Schema.Array(TrimmedNonEmptyStringSchema).check(Schema.isMinLength(1)),
   ),
@@ -137,6 +141,8 @@ export const VcsListRefsInput = Schema.Struct({
   cursor: Schema.optional(NonNegativeInt),
   includeMatchingRemoteRefs: Schema.optional(Schema.Boolean),
   refKind: Schema.optional(Schema.Literals(["all", "local", "remote"])),
+  /** Explicit inventory consumers only; workspace revisions are not bookmark bases. */
+  includeWorkspaces: Schema.optional(Schema.Boolean),
   refresh: Schema.optional(Schema.Boolean),
   limit: Schema.optional(
     PositiveInt.check(Schema.isLessThanOrEqualTo(GIT_LIST_BRANCHES_MAX_LIMIT)),
@@ -221,9 +227,16 @@ const VcsStatusLocalShape = {
   kind: VcsDriverKind,
   isRepo: Schema.Boolean,
   sourceControlProvider: Schema.optional(SourceControlProviderInfo),
+  supportsWorkflowActions: Schema.optional(Schema.Boolean),
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  jj: Schema.optional(
+    Schema.Struct({
+      changeId: TrimmedNonEmptyStringSchema,
+      bookmarks: Schema.Array(TrimmedNonEmptyStringSchema),
+    }),
+  ),
   hasWorkingTreeChanges: Schema.Boolean,
   workingTree: Schema.Struct({
     files: Schema.Array(
@@ -239,6 +252,7 @@ const VcsStatusLocalShape = {
 };
 
 const VcsStatusRemoteShape = {
+  remoteStatusAvailable: Schema.optional(Schema.Boolean),
   hasUpstream: Schema.Boolean,
   aheadCount: NonNegativeInt,
   behindCount: NonNegativeInt,

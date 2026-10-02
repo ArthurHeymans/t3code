@@ -295,7 +295,7 @@ export function useSelectedThreadGitActions() {
   const onPullSelectedThreadBranch = useCallback(async () => {
     await runSelectedThreadGitMutation(
       "pull",
-      "Pulling latest changes",
+      "Fetching remote changes",
       async ({ thread, cwd }) => {
         const result = await pull({
           environmentId: thread.environmentId,
@@ -304,13 +304,15 @@ export function useSelectedThreadGitActions() {
         if (AsyncResult.isFailure(result)) {
           return result;
         }
-        await refreshSelectedThreadGitStatus({ quiet: true, cwd });
+        const status = await refreshSelectedThreadGitStatus({ quiet: true, cwd });
         showGitActionResult({
           type: "success",
           title:
             result.value.status === "skipped_up_to_date"
               ? "Already up to date"
-              : `Pulled latest on ${result.value.refName}`,
+              : status?.kind === "jj"
+                ? "Fetched remote bookmarks"
+                : `Pulled latest on ${result.value.refName}`,
         });
         return result;
       },
@@ -328,7 +330,8 @@ export function useSelectedThreadGitActions() {
             actionId,
             action: input.action,
             ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-            ...(input.featureBranch ? { featureBranch: input.featureBranch } : {}),
+            featureBranch: input.featureBranch ?? false,
+            ...(input.confirmedDefaultRef === true ? { confirmedDefaultRef: true } : {}),
             ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
             // A pull request the action opens is linked to the thread it ran beside.
             threadId: thread.id,

@@ -1,4 +1,5 @@
 import type { VcsDriverKind } from "@t3tools/contracts";
+import { supportsVcsWorkflowActions } from "@t3tools/shared/git";
 
 export interface VcsTerms {
   readonly systemName: string;
@@ -45,9 +46,10 @@ export function resolveVcsTerms(kind: VcsDriverKind | null | undefined): VcsTerm
 
 export function resolveVcsActionPresentation(
   kind: VcsDriverKind | null | undefined,
+  supportsWorkflowActions?: boolean,
 ): VcsActionPresentation {
   const terms = resolveVcsTerms(kind);
-  const supportsGitWorkflowActions = kind === undefined || kind === null || kind === "git";
+  const supportsGitWorkflowActions = supportsVcsWorkflowActions(kind, supportsWorkflowActions);
 
   return {
     supportsGitWorkflowActions,

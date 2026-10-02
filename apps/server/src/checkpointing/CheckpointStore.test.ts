@@ -95,13 +95,13 @@ function buildLargeText(lineCount = 5_000): string {
 }
 
 it.layer(TestLayer)("CheckpointStore.layer", (it) => {
-  describe("isGitRepository", () => {
+  describe("supportsCheckpoints", () => {
     it.effect("returns false when no Git repository is detected", () =>
       Effect.gen(function* () {
         const tmp = yield* makeTmpDir();
         const checkpointStore = yield* CheckpointStore.CheckpointStore;
 
-        expect(yield* checkpointStore.isGitRepository(tmp)).toBe(false);
+        expect(yield* checkpointStore.supportsCheckpoints(tmp)).toBe(false);
       }),
     );
 
@@ -111,10 +111,40 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
         yield* initRepoWithCommit(tmp);
         const checkpointStore = yield* CheckpointStore.CheckpointStore;
 
-        expect(yield* checkpointStore.isGitRepository(tmp)).toBe(true);
+        expect(yield* checkpointStore.supportsCheckpoints(tmp)).toBe(true);
       }),
     );
   });
+
+  it.effect(
+    "recognizes checkpoint capability in non-colocated roots and secondary jj workspaces",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* makeTmpDir("checkpoint-jj-eligibility-");
+        const process = yield* VcsProcess.VcsProcess;
+        const repo = NodePath.join(root, "repo");
+        const workspace = NodePath.join(root, "workspace");
+        yield* process.run({
+          command: "jj",
+          operation: "CheckpointStore.test.jj",
+          cwd: root,
+          args: ["git", "init", "--no-colocate", repo],
+        });
+        yield* process.run({
+          command: "jj",
+          operation: "CheckpointStore.test.jj",
+          cwd: repo,
+          args: ["workspace", "add", workspace],
+        });
+        const store = yield* CheckpointStore.CheckpointStore;
+        expect(yield* store.supportsCheckpoints(repo)).toBe(true);
+        expect(yield* store.supportsCheckpoints(workspace)).toBe(true);
+        const ref = checkpointRefForThreadTurn(ThreadId.make("jj-secondary"), 0);
+        yield* writeTextFile(NodePath.join(workspace, "file.txt"), "checkpoint\n");
+        yield* store.captureCheckpoint({ cwd: workspace, checkpointRef: ref });
+        expect(yield* store.hasCheckpointRef({ cwd: workspace, checkpointRef: ref })).toBe(true);
+      }),
+  );
 
   it.effect("detects a nested workspace without its own .git entry", () =>
     Effect.gen(function* () {
@@ -124,7 +154,7 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
       const nested = NodePath.join(tmp, "packages", "nested");
       yield* fileSystem.makeDirectory(nested, { recursive: true });
       const checkpointStore = yield* CheckpointStore.CheckpointStore;
-      expect(yield* checkpointStore.isGitRepository(nested)).toBe(true);
+      expect(yield* checkpointStore.supportsCheckpoints(nested)).toBe(true);
     }),
   );
   describe("diffCheckpoints", () => {

@@ -39,6 +39,7 @@ import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as GitLabCli from "../sourceControl/GitLabCli.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubSourceControlProvider from "../sourceControl/GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "../sourceControl/GitLabSourceControlProvider.ts";
@@ -610,6 +611,7 @@ function runStackedAction(
     actionId?: string;
     commitMessage?: string;
     featureBranch?: boolean;
+    confirmedDefaultRef?: boolean;
     filePaths?: readonly string[];
   },
   options?: Parameters<GitManager.GitManager["Service"]["runStackedAction"]>[1],
@@ -638,6 +640,7 @@ function preparePullRequestThread(
 }
 
 function makeManager(input?: {
+  withJj?: boolean;
   ghScenario?: FakeGhScenario;
   sourceControlProvider?: SourceControlProvider["Service"];
   textGeneration?: Partial<FakeGitTextGeneration>;
@@ -714,6 +717,9 @@ function makeManager(input?: {
       },
     ),
     vcsDriverLayer,
+    ...(input?.withJj
+      ? [JjVcsDriver.layer.pipe(Layer.provide(VcsProcess.layer), Layer.provide(NodeServices.layer))]
+      : []),
     serverSettingsLayer,
   ).pipe(Layer.provideMerge(sourceControlRegistryLayer), Layer.provideMerge(NodeServices.layer));
   // Built into the test's scope: the manager reads these stores after this returns.
@@ -3157,6 +3163,46 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       );
       expect(statusStdout).toContain("b.txt");
       expect(statusStdout).not.toContain("a.txt");
+    }),
+  );
+
+  it.effect("requires separate default-bookmark consent despite featureBranch false", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir("t3code-jj-consent-");
+      const jj = (args: readonly string[]) =>
+        Effect.sync(() =>
+          NodeChildProcess.execFileSync(
+            "jj",
+            ["--config", 'user.name="Test"', "--config", 'user.email="test@example.com"', ...args],
+            { cwd, encoding: "utf8" },
+          ).trim(),
+        );
+      yield* jj(["git", "init", "--no-colocate"]);
+      NodeFS.writeFileSync(NodePath.join(cwd, "file.txt"), "initial\n");
+      yield* jj(["commit", "-m", "initial"]);
+      yield* jj(["bookmark", "create", "main", "-r", "@-"]);
+      const before = yield* jj(["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+      NodeFS.writeFileSync(NodePath.join(cwd, "file.txt"), "edited\n");
+      const { manager } = yield* makeManager({ withJj: true });
+      const denied = yield* runStackedAction(manager, {
+        cwd,
+        action: "commit",
+        featureBranch: false,
+        commitMessage: "unconfirmed",
+      }).pipe(Effect.flip);
+      expect(denied.message).toContain("explicitly commit to the default bookmark");
+      expect(yield* jj(["log", "-r", "main", "--no-graph", "-T", "commit_id"])).toBe(before);
+      const result = yield* runStackedAction(manager, {
+        cwd,
+        action: "commit",
+        featureBranch: false,
+        confirmedDefaultRef: true,
+        commitMessage: "confirmed",
+      });
+      expect(result.commit.status).toBe("created");
+      expect(yield* jj(["log", "-r", "main", "--no-graph", "-T", "description.first_line()"])).toBe(
+        "confirmed",
+      );
     }),
   );
 

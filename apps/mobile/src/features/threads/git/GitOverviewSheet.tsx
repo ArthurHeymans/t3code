@@ -134,6 +134,7 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
   const runActionWithPrompt = useCallback(
     async (input: GitActionRequestInput) => {
       const confirmableAction =
+        input.action === "commit" ||
         input.action === "push" ||
         input.action === "create_pr" ||
         input.action === "commit_push" ||
@@ -145,7 +146,7 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
         branchName &&
         confirmableAction &&
         !input.featureBranch &&
-        requiresDefaultBranchConfirmation(input.action, isDefaultRef)
+        requiresDefaultBranchConfirmation(input.action, isDefaultRef, gitStatus.data?.kind)
       ) {
         navigation.navigate("GitConfirm", {
           environmentId: String(environmentId),
@@ -153,7 +154,9 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
           confirmAction: confirmableAction,
           branchName,
           includesCommit: String(
-            input.action === "commit_push" || input.action === "commit_push_pr",
+            input.action === "commit" ||
+              input.action === "commit_push" ||
+              input.action === "commit_push_pr",
           ),
         });
         return;

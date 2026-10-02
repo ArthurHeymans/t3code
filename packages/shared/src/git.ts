@@ -332,6 +332,18 @@ export function detectSourceControlProviderFromGitRemoteUrl(
   return detectSourceControlProviderFromRemoteUrl(remoteUrl);
 }
 
+/** Shared by web, desktop menus, and mobile; unknown drivers fail closed. */
+export function supportsVcsWorkflowActions(
+  kind: VcsStatusLocalResult["kind"] | null | undefined,
+  supportsWorkflowActions?: boolean,
+): boolean {
+  return kind === "git" || (kind === "jj" && supportsWorkflowActions === true);
+}
+
+export function hasVcsRemoteStatus(status: VcsStatusResult): boolean {
+  return status.remoteStatusAvailable !== false;
+}
+
 const EMPTY_GIT_STATUS_REMOTE: VcsStatusRemoteResult = {
   hasUpstream: false,
   aheadCount: 0,
@@ -347,11 +359,15 @@ export function mergeGitStatusParts(
   return {
     ...local,
     ...(remote ?? EMPTY_GIT_STATUS_REMOTE),
+    ...(remote === null && local.isRepo ? { remoteStatusAvailable: false } : {}),
   };
 }
 
 function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
   return {
+    ...(status.remoteStatusAvailable === undefined
+      ? {}
+      : { remoteStatusAvailable: status.remoteStatusAvailable }),
     hasUpstream: status.hasUpstream,
     aheadCount: status.aheadCount,
     behindCount: status.behindCount,
@@ -366,12 +382,16 @@ function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
   return {
     kind: status.kind,
     isRepo: status.isRepo,
+    ...(status.supportsWorkflowActions === undefined
+      ? {}
+      : { supportsWorkflowActions: status.supportsWorkflowActions }),
     ...(status.sourceControlProvider
       ? { sourceControlProvider: status.sourceControlProvider }
       : {}),
     hasPrimaryRemote: status.hasPrimaryRemote,
     isDefaultRef: status.isDefaultRef,
     refName: status.refName,
+    ...(status.jj === undefined ? {} : { jj: status.jj }),
     hasWorkingTreeChanges: status.hasWorkingTreeChanges,
     workingTree: status.workingTree,
   };

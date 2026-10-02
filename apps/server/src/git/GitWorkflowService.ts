@@ -37,12 +37,18 @@ import * as GitManager from "./GitManager.ts";
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
+import { jjRef } from "../vcs/jjExpressions.ts";
+import * as JjGitWorkflowAdapter from "../vcs/JjGitWorkflowAdapter.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
 export class GitWorkflowService extends Context.Service<
   GitWorkflowService,
   {
     readonly isRepository: (cwd: string) => Effect.Effect<boolean, GitManagerServiceError>;
+    readonly validateWorktreePath: (input: {
+      readonly cwd: string;
+      readonly path: string;
+    }) => Effect.Effect<void, GitCommandError>;
     readonly hasCommit: (input: {
       readonly cwd: string;
       readonly refName: string;
@@ -104,6 +110,11 @@ export class GitWorkflowService extends Context.Service<
     readonly removeWorktree: (
       input: VcsRemoveWorktreeInput,
     ) => Effect.Effect<void, GitCommandError>;
+    readonly recoverWorktree: (input: {
+      readonly cwd: string;
+      readonly path: string;
+      readonly refName: string;
+    }) => Effect.Effect<void, GitCommandError>;
     readonly pruneWorktrees: (input: {
       readonly cwd: string;
     }) => Effect.Effect<void, GitCommandError>;
@@ -177,92 +188,11 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const ensureGit = Effect.fn("GitWorkflowService.ensureGit")(function* (
-    operation: string,
-    cwd: string,
-  ) {
-    const handle = yield* registry.resolve({ cwd }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new GitManagerError({
-            operation,
-            cwd,
-            detail: "Failed to resolve the VCS driver for this Git workflow.",
-            cause,
-          }),
-      ),
-    );
-    if (handle.kind !== "git") {
-      return yield* new GitManagerError({
-        operation,
-        cwd,
-        detail: `The ${operation} workflow currently supports Git repositories only; detected ${handle.kind}. (${cwd})`,
-      });
-    }
-  });
-
-  const ensureGitCommand = Effect.fn("GitWorkflowService.ensureGitCommand")(function* (
-    operation: string,
-    cwd: string,
-  ) {
-    const handle = yield* registry.resolve({ cwd }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new GitCommandError({
-            operation,
-            command: "vcs-route",
-            cwd,
-            detail: "Failed to resolve the VCS driver for this Git command.",
-            cause,
-          }),
-      ),
-    );
-    if (handle.kind !== "git") {
-      return yield* new GitCommandError({
-        operation,
-        command: "vcs-route",
-        cwd,
-        detail: `The ${operation} command currently supports Git repositories only; detected ${handle.kind}.`,
-      });
-    }
-  });
-
-  const detectGitRepositoryForCommand = Effect.fn(
-    "GitWorkflowService.detectGitRepositoryForCommand",
-  )(function* (operation: string, cwd: string) {
-    const handle = yield* registry.detect({ cwd }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new GitCommandError({
-            operation,
-            command: "vcs-route",
-            cwd,
-            detail: "Failed to detect a VCS repository for this Git command.",
-            cause,
-          }),
-      ),
-    );
-    if (!handle) {
-      return false;
-    }
-    if (handle.kind !== "git") {
-      return yield* new GitCommandError({
-        operation,
-        command: "vcs-route",
-        cwd,
-        detail: `The ${operation} command currently supports Git repositories only; detected ${handle.kind}.`,
-      });
-    }
-    return true;
-  });
-
-  const routeGitManager =
-    <Input extends { readonly cwd: string }, Output>(
-      operation: string,
-      run: (input: Input) => Effect.Effect<Output, GitManagerServiceError>,
-    ) =>
-    (input: Input) =>
-      ensureGit(operation, input.cwd).pipe(Effect.andThen(run(input)));
+  const commands = JjGitWorkflowAdapter.make(jj, git, (cwd) =>
+    resolveDriverForCommand("GitWorkflowService.route", cwd).pipe(
+      Effect.map((handle) => handle.kind === "jj"),
+    ),
+  );
 
   const detectForStatus = Effect.fn("GitWorkflowService.detectForStatus")(function* (
     operation: string,
@@ -309,7 +239,9 @@ export const make = Effect.gen(function* () {
     "GitWorkflowService.remoteStatus",
   )(function* (input, options) {
     const handle = yield* detectForStatus("GitWorkflowService.remoteStatus", input.cwd);
-    return handle?.kind === "git" ? yield* gitManager.remoteStatus(input, options) : null;
+    return handle?.kind === "git" || handle?.kind === "jj"
+      ? yield* gitManager.remoteStatus(input, options)
+      : null;
   });
 
   const status: GitWorkflowService["Service"]["status"] = Effect.fn("GitWorkflowService.status")(
@@ -320,16 +252,34 @@ export const make = Effect.gen(function* () {
       }
       if (handle.kind === "git") return yield* gitManager.status(input);
       if (handle.kind === "jj") {
-        return mergeGitStatusParts(yield* jjLocalStatus(input.cwd), null);
+        return mergeGitStatusParts(yield* jjLocalStatus(input.cwd), yield* remoteStatus(input));
       }
       return mergeGitStatusParts(nonGitLocalStatus(handle.kind, true), null);
     },
   );
 
   return GitWorkflowService.of({
+    validateWorktreePath: (input) =>
+      resolveDriverForCommand("GitWorkflowService.validateWorktreePath", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind !== "jj"
+            ? Effect.void
+            : jj
+                .validateWorktreePath(input)
+                .pipe(
+                  Effect.mapError(
+                    mapVcsCommandError(
+                      "GitWorkflowService.validateWorktreePath",
+                      "jj workspace list",
+                      input.cwd,
+                    ),
+                  ),
+                ),
+        ),
+      ),
     isRepository: (cwd) =>
       registry.detect({ cwd }).pipe(
-        Effect.map((handle) => handle?.kind === "git"),
+        Effect.map((handle) => handle !== null),
         Effect.mapError(
           (cause) =>
             new GitManagerError({
@@ -341,43 +291,74 @@ export const make = Effect.gen(function* () {
         ),
       ),
     hasCommit: (input) =>
-      ensureGitCommand("GitWorkflowService.hasCommit", input.cwd).pipe(
-        Effect.andThen(
-          git.execute({
-            operation: "GitWorkflowService.hasCommit",
-            cwd: input.cwd,
-            args: ["rev-parse", "--verify", `${input.refName}^{commit}`],
-            allowNonZeroExit: true,
-          }),
+      resolveDriverForCommand("GitWorkflowService.hasCommit", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind === "jj"
+            ? jj
+                .execute({
+                  cwd: input.cwd,
+                  operation: "GitWorkflowService.hasCommit",
+                  args: ["log", "-r", jjRef(input.refName), "--no-graph", "-T", "commit_id"],
+                  allowNonZeroExit: true,
+                })
+                .pipe(
+                  Effect.map(
+                    (result) =>
+                      result.exitCode === 0 && /^[a-f0-9]{40,64}$/.test(result.stdout.trim()),
+                  ),
+                  Effect.mapError(
+                    mapVcsCommandError("GitWorkflowService.hasCommit", "jj log", input.cwd),
+                  ),
+                )
+            : git
+                .execute({
+                  operation: "GitWorkflowService.hasCommit",
+                  cwd: input.cwd,
+                  args: ["rev-parse", "--verify", `${input.refName}^{commit}`],
+                  allowNonZeroExit: true,
+                })
+                .pipe(Effect.map((result) => result.exitCode === 0)),
         ),
-        Effect.map((result) => result.exitCode === 0),
       ),
+
     status,
     localStatus,
     remoteStatus,
     invalidateLocalStatus: gitManager.invalidateLocalStatus,
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
-    pullCurrentBranch: (cwd) =>
-      ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
-        Effect.andThen(git.pullCurrentBranch(cwd)),
-      ),
-    runStackedAction: (input, options) =>
-      ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
-        Effect.andThen(gitManager.runStackedAction(input, options)),
-      ),
-    resolvePullRequest: routeGitManager(
-      "GitWorkflowService.resolvePullRequest",
-      gitManager.resolvePullRequest,
-    ),
-    preparePullRequestThread: routeGitManager(
-      "GitWorkflowService.preparePullRequestThread",
-      gitManager.preparePullRequestThread,
-    ),
+    pullCurrentBranch: commands.pullCurrentBranch,
+    runStackedAction: gitManager.runStackedAction,
+    resolvePullRequest: gitManager.resolvePullRequest,
+    preparePullRequestThread: gitManager.preparePullRequestThread,
     listRefs: (input) =>
-      detectGitRepositoryForCommand("GitWorkflowService.listRefs", input.cwd).pipe(
-        Effect.flatMap((isGitRepository) =>
-          isGitRepository ? git.listRefs(input) : Effect.succeed(nonRepositoryListRefs()),
+      registry.detect({ cwd: input.cwd }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GitCommandError({
+              cwd: input.cwd,
+              operation: "GitWorkflowService.listRefs",
+              command: "vcs-route",
+              detail: "Failed to detect a VCS repository for this Git command.",
+              cause,
+            }),
+        ),
+        Effect.flatMap((handle) =>
+          !handle
+            ? Effect.succeed(nonRepositoryListRefs())
+            : handle.kind === "jj"
+              ? jj
+                  .listRefs(input)
+                  .pipe(
+                    Effect.mapError(
+                      mapVcsCommandError(
+                        "GitWorkflowService.listRefs",
+                        "jj bookmark/workspace list",
+                        input.cwd,
+                      ),
+                    ),
+                  )
+              : git.listRefs(input),
         ),
       ),
     createWorktree: (input, options) =>
@@ -413,8 +394,10 @@ export const make = Effect.gen(function* () {
           handle.kind === "jj"
             ? Effect.all([jj.listBookmarks(cwd), jj.listWorkspaces(cwd)]).pipe(
                 Effect.map(([bookmarks, workspaces]) => [
-                  ...bookmarks.map((bookmark) => bookmark.name),
-                  ...workspaces.map((workspace) => workspace.name),
+                  ...bookmarks
+                    .filter((bookmark) => bookmark.remoteName === null)
+                    .map((bookmark) => bookmark.name),
+                  ...workspaces.map((workspace) => `${workspace.name}@`),
                 ]),
                 Effect.mapError(
                   mapVcsCommandError(
@@ -442,12 +425,47 @@ export const make = Effect.gen(function* () {
         ),
       ),
     remoteExists: (input) =>
-      ensureGitCommand("GitWorkflowService.remoteExists", input.cwd).pipe(
-        Effect.andThen(git.remoteExists(input)),
+      resolveDriverForCommand("GitWorkflowService.remoteExists", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind === "jj"
+            ? jj.listRemotes(input.cwd).pipe(
+                Effect.map((result) =>
+                  result.remotes.some((remote) => remote.name === input.remoteName),
+                ),
+                Effect.mapError(
+                  mapVcsCommandError(
+                    "GitWorkflowService.remoteExists",
+                    "jj git remote list",
+                    input.cwd,
+                  ),
+                ),
+              )
+            : git.remoteExists(input),
+        ),
       ),
     remoteBranchExists: (input) =>
-      ensureGitCommand("GitWorkflowService.remoteBranchExists", input.cwd).pipe(
-        Effect.andThen(git.remoteBranchExists(input)),
+      resolveDriverForCommand("GitWorkflowService.remoteBranchExists", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind === "jj"
+            ? jj.listBookmarks(input.cwd).pipe(
+                Effect.map((bookmarks) =>
+                  bookmarks.some(
+                    (bookmark) =>
+                      bookmark.name === input.refName &&
+                      bookmark.remoteName === input.remoteName &&
+                      bookmark.target !== null,
+                  ),
+                ),
+                Effect.mapError(
+                  mapVcsCommandError(
+                    "GitWorkflowService.remoteBranchExists",
+                    "jj bookmark list",
+                    input.cwd,
+                  ),
+                ),
+              )
+            : git.remoteBranchExists(input),
+        ),
       ),
     resolveRemoteTrackingCommit: (input) =>
       resolveDriverForCommand("GitWorkflowService.resolveRemoteTrackingCommit", input.cwd).pipe(
@@ -485,35 +503,80 @@ export const make = Effect.gen(function* () {
             : git.removeWorktree(input),
         ),
       ),
+    recoverWorktree: (input) =>
+      resolveDriverForCommand("GitWorkflowService.recoverWorktree", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind === "jj"
+            ? jj
+                .recoverWorktree(input)
+                .pipe(
+                  Effect.mapError(
+                    mapVcsCommandError(
+                      "GitWorkflowService.recoverWorktree",
+                      "jj workspace add",
+                      input.cwd,
+                    ),
+                  ),
+                )
+            : git
+                .pruneWorktrees({ cwd: input.cwd })
+                .pipe(Effect.andThen(git.createWorktree(input)), Effect.asVoid),
+        ),
+      ),
     pruneWorktrees: (input) =>
-      ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
-        Effect.andThen(git.pruneWorktrees(input)),
+      resolveDriverForCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          handle.kind === "jj"
+            ? jj
+                .pruneWorktrees(input.cwd)
+                .pipe(
+                  Effect.mapError(
+                    mapVcsCommandError(
+                      "GitWorkflowService.pruneWorktrees",
+                      "jj workspace forget",
+                      input.cwd,
+                    ),
+                  ),
+                )
+            : git.pruneWorktrees(input),
+        ),
       ),
     deleteLocalBranch: (input) =>
       resolveDriverForCommand("GitWorkflowService.deleteLocalBranch", input.cwd).pipe(
         Effect.flatMap((handle) =>
-          handle.kind === "jj" ? Effect.void : git.deleteLocalBranch(input),
+          handle.kind === "jj"
+            ? jj
+                .execute({
+                  cwd: input.cwd,
+                  operation: "GitWorkflowService.deleteLocalBranch",
+                  args: ["bookmark", "delete", "--", `exact:${input.refName}`],
+                })
+                .pipe(
+                  Effect.asVoid,
+                  Effect.mapError(
+                    mapVcsCommandError(
+                      "GitWorkflowService.deleteLocalBranch",
+                      "jj bookmark delete",
+                      input.cwd,
+                    ),
+                  ),
+                )
+            : git.deleteLocalBranch(input),
         ),
       ),
-    createRef: (input) =>
-      ensureGitCommand("GitWorkflowService.createRef", input.cwd).pipe(
-        Effect.andThen(git.createRef(input)),
-      ),
-    switchRef: (input) =>
-      ensureGitCommand("GitWorkflowService.switchRef", input.cwd).pipe(
-        Effect.andThen(Effect.scoped(git.switchRef(input))),
-      ),
+    createRef: commands.createRef,
+    switchRef: (input) => Effect.scoped(commands.switchRef(input)),
     renameBranch: (input) =>
       resolveDriverForCommand("GitWorkflowService.renameBranch", input.cwd).pipe(
         Effect.flatMap((handle) =>
           handle.kind === "jj"
             ? jj
-                .renameWorkspace({ cwd: input.cwd, newName: input.newBranch })
+                .renameBookmark(input)
                 .pipe(
                   Effect.mapError(
                     mapVcsCommandError(
                       "GitWorkflowService.renameBranch",
-                      "jj workspace rename",
+                      "jj bookmark rename",
                       input.cwd,
                     ),
                   ),

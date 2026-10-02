@@ -1,5 +1,5 @@
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { Platform, Pressable, ScrollView, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -22,7 +22,8 @@ type GitCommitSheetProps = StaticScreenProps<{
   readonly threadId: string;
 }>;
 
-export function GitCommitSheet(_props: GitCommitSheetProps) {
+export function GitCommitSheet(props: GitCommitSheetProps) {
+  const { environmentId, threadId } = props.route.params;
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -42,6 +43,8 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
 
   const busy = gitState.gitOperationLabel !== null;
   const isDefaultRef = gitStatus.data?.isDefaultRef ?? false;
+  const vcsKind = gitStatus.data?.kind;
+  const refName = gitStatus.data?.refName;
   const allFiles = gitStatus.data?.workingTree?.files ?? [];
 
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
@@ -55,19 +58,28 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
   const selectedDeletions = selectedFiles.reduce((sum, file) => sum + file.deletions, 0);
   const selectedFilePreview = selectedFiles.slice(0, 3);
 
-  const runCommitAction = useCallback(
-    async (featureBranch: boolean) => {
-      const commitMessage = dialogCommitMessage.trim();
-      navigation.goBack();
-      await gitActions.onRunSelectedThreadGitAction({
-        action: "commit",
-        featureBranch,
+  const runCommitAction = async (featureBranch: boolean) => {
+    const commitMessage = dialogCommitMessage.trim();
+    if (!featureBranch && isDefaultRef && vcsKind === "jj") {
+      navigation.navigate("GitConfirm", {
+        environmentId,
+        threadId,
+        confirmAction: "commit",
+        branchName: refName ?? "",
+        includesCommit: "true",
         ...(commitMessage ? { commitMessage } : {}),
-        ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path) } : {}),
+        ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path).join(",") } : {}),
       });
-    },
-    [allSelected, dialogCommitMessage, gitActions, navigation, selectedFiles],
-  );
+      return;
+    }
+    navigation.goBack();
+    await gitActions.onRunSelectedThreadGitAction({
+      action: "commit",
+      featureBranch,
+      ...(commitMessage ? { commitMessage } : {}),
+      ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path) } : {}),
+    });
+  };
 
   return (
     <View

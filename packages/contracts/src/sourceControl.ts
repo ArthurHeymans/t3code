@@ -74,6 +74,7 @@ export const SourceControlCloneRepositoryInput = Schema.Struct({
   repository: Schema.optional(TrimmedNonEmptyString),
   remoteUrl: Schema.optional(TrimmedNonEmptyString),
   destinationPath: TrimmedNonEmptyString,
+  vcsKind: Schema.optional(Schema.Literals(["git", "jj"])),
   protocol: Schema.optional(SourceControlCloneProtocol),
 });
 export type SourceControlCloneRepositoryInput = typeof SourceControlCloneRepositoryInput.Type;

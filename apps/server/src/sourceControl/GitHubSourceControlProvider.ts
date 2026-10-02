@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 
 import * as GitHubCli from "./GitHubCli.ts";
+import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { findAuthenticatedGitHubAccount, parseGitHubAuthStatus } from "./gitHubAuthStatus.ts";
 import { decodeGitHubPullRequestListJson } from "./gitHubPullRequests.ts";
 import * as SourceControlProvider from "./SourceControlProvider.ts";
@@ -117,16 +118,26 @@ export const discovery = {
     "Install the GitHub command-line tool (`gh`) via https://cli.github.com/ or your package manager (for example `brew install gh`).",
 } satisfies SourceControlCliDiscoverySpec;
 
+function explicitRepository(
+  context: SourceControlProvider.SourceControlProviderContext | undefined,
+) {
+  if (context?.explicitRepository !== true) return {};
+  const repositoryPath = normalizeGitRemoteUrl(context.remoteUrl).split("/").slice(-2).join("/");
+  return { repository: `${new URL(context.provider.baseUrl).host}/${repositoryPath}` };
+}
+
 export const make = Effect.gen(function* () {
   const github = yield* GitHubCli.GitHubCli;
 
   const listChangeRequests: SourceControlProvider.SourceControlProvider["Service"]["listChangeRequests"] =
     (input) => {
+      const repository = explicitRepository(input.context);
       if (input.state === "open") {
         return github
           .listOpenPullRequests({
             cwd: input.cwd,
             headSelector: input.headSelector,
+            ...repository,
             ...(input.context === undefined
               ? {}
               : { rateLimitHost: new URL(input.context.provider.baseUrl).host }),
@@ -169,6 +180,7 @@ export const make = Effect.gen(function* () {
             String(input.limit ?? 20),
             "--json",
             "number,title,url,baseRefName,headRefName,state,isDraft,mergedAt,closedAt,updatedAt,isCrossRepository,headRepository,headRepositoryOwner",
+            ...(repository.repository ? ["--repo", repository.repository] : []),
           ],
         })
         .pipe(
@@ -276,6 +288,7 @@ export const make = Effect.gen(function* () {
       github
         .getPullRequest({
           ...input,
+          ...explicitRepository(input.context),
           ...(input.context === undefined
             ? {}
             : { rateLimitHost: new URL(input.context.provider.baseUrl).host }),
@@ -305,6 +318,7 @@ export const make = Effect.gen(function* () {
           headSelector: input.headSelector,
           title: input.title,
           bodyFile: input.bodyFile,
+          ...explicitRepository(input.context),
         })
         .pipe(
           Effect.mapError(
@@ -360,6 +374,7 @@ export const make = Effect.gen(function* () {
       github
         .getDefaultBranch({
           ...input,
+          ...explicitRepository(input.context),
           ...(input.context === undefined
             ? {}
             : { rateLimitHost: new URL(input.context.provider.baseUrl).host }),

@@ -36,6 +36,45 @@ function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
   };
 }
 
+describe("Jujutsu workflow actions", () => {
+  it("allows committing an unbookmarked change but never offers publishing it", () => {
+    const local = status({
+      kind: "jj",
+      supportsWorkflowActions: true,
+      refName: null,
+      hasWorkingTreeChanges: true,
+    });
+    const quick = resolveQuickAction(local, false);
+    assert.equal(quick.kind, "run_action");
+    if (quick.kind === "run_action") assert.equal(quick.action, "commit");
+    const menu = buildMenuItems(local, false);
+    assert.isFalse(menu.find((item) => item.id === "commit")?.disabled);
+    assert.isTrue(menu.find((item) => item.id === "push")?.disabled);
+    assert.isTrue(menu.find((item) => item.id === "pr")?.disabled);
+  });
+
+  it("does not mistake unavailable remote data for publishing permission", () => {
+    const local = status({
+      kind: "jj",
+      supportsWorkflowActions: true,
+      hasWorkingTreeChanges: true,
+      aheadCount: 3,
+      remoteStatusAvailable: false,
+    });
+    const quick = resolveQuickAction(local, false);
+    if (quick.kind !== "run_action") assert.fail("Local commit should remain available");
+    assert.equal(quick.action, "commit");
+    assert.isTrue(buildMenuItems(local, false).find((item) => item.id === "push")?.disabled);
+    assert.isTrue(resolveQuickAction({ ...local, hasWorkingTreeChanges: false }, false).disabled);
+  });
+
+  it("requires the server's native workflow capability", () => {
+    const legacy = status({ kind: "jj", hasWorkingTreeChanges: true });
+    assert.isTrue(resolveQuickAction(legacy, false).disabled);
+    assert.deepEqual(buildMenuItems(legacy, false), []);
+  });
+});
+
 describe("git action progress presentation", () => {
   it("keeps the phase on the first row and hook output on the second", () => {
     assert.deepEqual(
@@ -963,6 +1002,8 @@ describe("when: ref has no upstream configured", () => {
 describe("requiresDefaultBranchConfirmation", () => {
   it("requires confirmation for push actions on default ref", () => {
     assert.isFalse(requiresDefaultBranchConfirmation("commit", true));
+    assert.isTrue(requiresDefaultBranchConfirmation("commit", true, "jj"));
+    assert.isFalse(requiresDefaultBranchConfirmation("commit", false, "jj"));
     assert.isTrue(requiresDefaultBranchConfirmation("push", true));
     assert.isTrue(requiresDefaultBranchConfirmation("create_pr", true));
     assert.isTrue(requiresDefaultBranchConfirmation("commit_push", true));

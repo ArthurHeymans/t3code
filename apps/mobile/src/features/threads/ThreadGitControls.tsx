@@ -116,7 +116,10 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const threadId = props.threadId;
   const { gitStatus, gitOperationLabel, onPull, onRunAction } = props;
 
-  const currentBranchLabel = gitStatus?.refName ?? props.currentBranch ?? "Detached HEAD";
+  const currentBranchLabel =
+    gitStatus?.refName ??
+    props.currentBranch ??
+    (gitStatus?.kind === "jj" ? "Working-copy change" : "Detached HEAD");
   const busy = gitOperationLabel !== null;
   const isRepo = gitStatus?.isRepo ?? true;
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
@@ -127,10 +130,10 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
       isRepo
         ? resolveQuickAction(gitStatus, busy, isDefaultRef, hasPrimaryRemote)
         : {
-            label: "Git unavailable",
+            label: "Source control unavailable",
             disabled: true,
             kind: "show_hint" as const,
-            hint: "This workspace is not a git repository.",
+            hint: "This workspace is not a supported repository.",
           },
     [busy, gitStatus, hasPrimaryRemote, isDefaultRef, isRepo],
   );
@@ -164,6 +167,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const runActionWithPrompt = useCallback(
     async (input: GitActionRequestInput) => {
       const confirmableAction =
+        input.action === "commit" ||
         input.action === "push" ||
         input.action === "create_pr" ||
         input.action === "commit_push" ||
@@ -175,7 +179,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
         branchName &&
         confirmableAction &&
         !input.featureBranch &&
-        requiresDefaultBranchConfirmation(input.action, isDefaultRef)
+        requiresDefaultBranchConfirmation(input.action, isDefaultRef, gitStatus?.kind)
       ) {
         navigation.navigate("GitConfirm", {
           environmentId: String(environmentId),
@@ -183,7 +187,9 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
           confirmAction: confirmableAction,
           branchName,
           includesCommit: String(
-            input.action === "commit_push" || input.action === "commit_push_pr",
+            input.action === "commit" ||
+              input.action === "commit_push" ||
+              input.action === "commit_push_pr",
           ),
         });
         return;

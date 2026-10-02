@@ -25,6 +25,8 @@ export interface SourceControlProviderContext {
   readonly provider: SourceControlProviderInfo;
   readonly remoteName: string;
   readonly remoteUrl: string;
+  /** JJ workspaces need explicit host targeting instead of Git discovery by gh. */
+  readonly explicitRepository?: boolean;
   /** An explicit web authority can disambiguate Forgejo logins sharing an SSH alias. */
   readonly requestedHost?: string;
 }

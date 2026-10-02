@@ -316,7 +316,11 @@ const RepositoryIdentityResolverLayerLive = Layer.effect(
       }),
     });
   }),
-).pipe(Layer.provide(SourceControlProviderRegistryLayerLive), Layer.provide(ProcessRunner.layer));
+).pipe(
+  Layer.provide(SourceControlProviderRegistryLayerLive),
+  Layer.provide(VcsDriverRegistryLayerLive),
+  Layer.provide(ProcessRunner.layer),
+);
 
 const PullRequestServiceLive = PullRequestService.layer.pipe(
   Layer.provide(PullRequestProviderRegistry.layer),
@@ -328,6 +332,8 @@ const PullRequestServiceLive = PullRequestService.layer.pipe(
 );
 
 const GitManagerLayerLive = GitManager.layer.pipe(
+  Layer.provideMerge(JjVcsDriver.layer),
+  Layer.provideMerge(VcsDriverRegistryLayerLive),
   // Per-project git settings resolve the acting thread's project.
   Layer.provide(Layer.merge(ProjectionStoreV2.layer, ProjectStore.layer)),
   Layer.provideMerge(ProjectSetupScriptRunnerLayerLive),
@@ -351,6 +357,8 @@ const GitWorkflowLayerLive = GitWorkflowService.layer.pipe(
 );
 
 const SourceControlRepositoryServiceLayerLive = SourceControlRepositoryService.layer.pipe(
+  Layer.provideMerge(JjVcsDriver.layer),
+  Layer.provideMerge(VcsDriverRegistryLayerLive),
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
 );

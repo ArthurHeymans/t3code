@@ -88,6 +88,7 @@ interface EnvironmentOption {
   readonly connectionErrorTraceId: string | null;
   /** Server runs clones in the background and streams progress; older servers block. */
   readonly supportsCloneTracking: boolean;
+  readonly supportsJujutsuWorkflows: boolean;
 }
 
 const environmentOptionOrder = Order.mapInput(
@@ -410,6 +411,7 @@ function useEnvironmentOptions(): ReadonlyArray<EnvironmentOption> {
         connectionError: runtime?.connectionError ?? null,
         connectionErrorTraceId: runtime?.connectionErrorTraceId ?? null,
         supportsCloneTracking: config?.environment.capabilities.projectCloneTracking === true,
+        supportsJujutsuWorkflows: config?.environment.capabilities.jujutsuWorkflows === true,
       };
     });
     return Arr.sort(
@@ -1231,6 +1233,7 @@ export function AddProjectDestinationScreen(props: {
   const environment = useEnvironmentFromParam(props.environmentId);
   const createProject = useCreateProject(environment);
   const remoteUrl = stringParam(props.remoteUrl);
+  const [cloneWithJj, setCloneWithJj] = useState(false);
   const repositoryTitle = stringParam(props.repositoryTitle);
   // A lookup derives this from "owner/repo", a pasted clone URL from its own
   // last segment. Older links without the param keep the browsed folder.
@@ -1271,6 +1274,7 @@ export function AddProjectDestinationScreen(props: {
           createdAt: new Date().toISOString(),
           remoteUrl,
           destinationPath: resolved.path,
+          ...(cloneWithJj && environment.supportsJujutsuWorkflows ? { vcsKind: "jj" } : {}),
         },
       });
       if (AsyncResult.isFailure(startResult)) {
@@ -1305,6 +1309,7 @@ export function AddProjectDestinationScreen(props: {
       input: {
         remoteUrl,
         destinationPath: resolved.path,
+        ...(cloneWithJj && environment.supportsJujutsuWorkflows ? { vcsKind: "jj" } : {}),
       },
     });
     if (AsyncResult.isFailure(cloneResult)) {
@@ -1317,6 +1322,7 @@ export function AddProjectDestinationScreen(props: {
     }
     setIsSubmitting(false);
   }, [
+    cloneWithJj,
     cloneRepository,
     createProject,
     environment,
@@ -1346,6 +1352,20 @@ export function AddProjectDestinationScreen(props: {
             onChangeText={setPathInput}
             onSubmit={() => void submitPath()}
           />
+          {environment.supportsJujutsuWorkflows ? (
+            <MaterialListRow
+              title="Use Jujutsu"
+              subtitle="Clone as a colocated JJ repository"
+              trailing={
+                <ThemedSwitch
+                  accessibilityLabel="Use Jujutsu"
+                  value={cloneWithJj}
+                  onValueChange={setCloneWithJj}
+                />
+              }
+              onPress={() => setCloneWithJj((value) => !value)}
+            />
+          ) : null}
           <PrimaryActionButton
             label="Clone project"
             disabled={isBrowseNavigating || isSubmitting || !remoteUrl}

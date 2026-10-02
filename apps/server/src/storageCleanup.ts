@@ -28,6 +28,10 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
+import * as GitWorkflow from "./git/GitWorkflowService.ts";
+import * as JjVcsDriver from "./vcs/JjVcsDriver.ts";
+import * as JjGitWorkflowAdapter from "./vcs/JjGitWorkflowAdapter.ts";
+import { jjCommit } from "./vcs/jjExpressions.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -80,6 +84,29 @@ function sameProjectWorktreePolicies(left: ServerSettings, right: ServerSettings
 }
 
 /** Live sessions keep their cwd even when no turn is currently running. */
+export const storageCleanupJjIntegrated = (
+  jj: Pick<JjVcsDriver.JjVcsDriverShape, "execute">,
+  cwd: string,
+  baseCommitId: string,
+) =>
+  jj
+    .execute({
+      operation: "StorageCleanup.integratedChange",
+      cwd,
+      args: [
+        "log",
+        "--ignore-working-copy",
+        "-r",
+        `coalesce(@ & ~(empty() & description(exact:"")), @-) ~ ::(${jjCommit(baseCommitId)})`,
+        "--no-graph",
+        "--limit",
+        "1",
+        "-T",
+        'commit_id ++ "\\n"',
+      ],
+    })
+    .pipe(Effect.map((result) => !result.stdoutTruncated && result.stdout.trim() === ""));
+
 export function storageCleanupThreadIdle(thread: OrchestrationV2ThreadShell, now: number): boolean {
   return (
     thread.branch !== null &&
@@ -113,6 +140,8 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const sql = yield* SqlClient.SqlClient;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const workflow = yield* GitWorkflow.GitWorkflowService;
+  const jj = Option.getOrNull(yield* Effect.serviceOption(JjVcsDriver.JjVcsDriver));
   const gitManager = yield* GitManager.GitManager;
   const terminals = yield* TerminalManager.TerminalManager;
   const fs = yield* FileSystem.FileSystem;
@@ -225,18 +254,39 @@ export const make = Effect.gen(function* () {
         if (!inside(root, worktreePath) || !(yield* fs.exists(worktreePath))) return;
         if ((yield* fs.realPath(worktreePath)) !== worktreePath) return;
         if (yield* containsProjectRoot(worktreePath, [project, ...snapshot.projects])) return;
-        // A linked worktree has a .git file. Never remove a main checkout.
-        if ((yield* fs.stat(path.join(worktreePath, ".git"))).type !== "File") return;
-        const status = yield* git.statusDetailsLocal(worktreePath);
-        if (!status.isRepo || status.branch !== thread.branch || status.hasWorkingTreeChanges)
+        const status = yield* workflow.localStatus({ cwd: worktreePath });
+        if (!status.isRepo || status.refName !== thread.branch || status.hasWorkingTreeChanges)
           return;
-        const head = yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" });
-        const ignored = yield* git.execute({
-          operation: "StorageCleanup.ignoredFiles",
-          cwd: worktreePath,
-          args: ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
-          maxOutputBytes: 64 * 1024,
-        });
+        const native = status.kind === "jj" ? jj : null;
+        if (status.kind !== "git" && native === null) return;
+        // Both drivers use a file marker for secondary checkouts. A directory
+        // marker belongs to the primary repository and must never be removed.
+        const marker = native
+          ? path.join(worktreePath, ".jj", "repo")
+          : path.join(worktreePath, ".git");
+        if (!(yield* fs.exists(marker)) || (yield* fs.stat(marker)).type !== "File") return;
+        const core = native
+          ? JjGitWorkflowAdapter.make(native, git, () => Effect.succeed(true))
+          : git;
+        const head = native
+          ? (yield* native.currentChange(worktreePath))?.commitId
+          : (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha;
+        if (!head) return;
+        const ignored = native
+          ? { stdout: "", stdoutTruncated: false }
+          : yield* git.execute({
+              operation: "StorageCleanup.ignoredFiles",
+              cwd: worktreePath,
+              args: [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+              ],
+              maxOutputBytes: 64 * 1024,
+            });
         // Ignored files can contain secrets or local datasets. Dependency installs
         // are reproducible; every other ignored path prevents automatic removal.
         if (
@@ -253,31 +303,46 @@ export const make = Effect.gen(function* () {
         let eligible = deleted || old;
         if (!eligible && (settings.worktreeUnchanged || settings.worktreeOnMerge)) {
           const repositoryCwd = path.resolve(project.workspaceRoot);
-          const remote = yield* git.resolvePrimaryRemoteName(repositoryCwd);
-          const branch = yield* git.resolveDefaultBranchName(repositoryCwd, remote);
+          const remote = yield* core.resolvePrimaryRemoteName(repositoryCwd);
+          const branch = yield* core.resolveDefaultBranchName(repositoryCwd, remote);
           if (branch === null) return;
           const defaultRef = `refs/remotes/${remote}/${branch}`;
           const refreshed = refreshedDefaultRefs.get(repositoryCwd) ?? new Set<string>();
           if (!refreshed.has(defaultRef)) {
-            yield* git.fetchRemoteTrackingBranch({
-              cwd: repositoryCwd,
-              remoteName: remote,
-              remoteBranch: branch,
-            });
+            if (native)
+              yield* workflow.fetchRemote({
+                cwd: repositoryCwd,
+                remoteName: remote,
+                refName: branch,
+              });
+            else
+              yield* git.fetchRemoteTrackingBranch({
+                cwd: repositoryCwd,
+                remoteName: remote,
+                remoteBranch: branch,
+              });
             refreshed.add(defaultRef);
             refreshedDefaultRefs.set(repositoryCwd, refreshed);
           }
-          const base = yield* git.resolveCommit({
-            cwd: worktreePath,
-            revision: defaultRef,
-          });
-          const ancestor = yield* git.execute({
-            operation: "StorageCleanup.integratedBranch",
-            cwd: worktreePath,
-            args: ["merge-base", "--is-ancestor", head.commitSha, base.commitSha],
-            allowNonZeroExit: true,
-          });
-          if (ancestor.exitCode !== 0) return;
+          if (native) {
+            const base = yield* workflow.resolveRemoteTrackingCommit({
+              cwd: repositoryCwd,
+              refName: branch,
+              fallbackRemoteName: remote,
+            });
+            // An empty JJ working copy is a child of the published change,
+            // not a new user commit. Every merged parent must be integrated.
+            if (!(yield* storageCleanupJjIntegrated(native, worktreePath, base.commitSha))) return;
+          } else {
+            const base = yield* git.resolveCommit({ cwd: worktreePath, revision: defaultRef });
+            const ancestor = yield* git.execute({
+              operation: "StorageCleanup.integratedBranch",
+              cwd: worktreePath,
+              args: ["merge-base", "--is-ancestor", head, base.commitSha],
+              allowNonZeroExit: true,
+            });
+            if (ancestor.exitCode !== 0) return;
+          }
           eligible = settings.worktreeUnchanged;
           if (!eligible && settings.worktreeOnMerge && thread.branch !== null) {
             const pullRequest = yield* gitManager.branchPullRequest(
@@ -333,24 +398,36 @@ export const make = Effect.gen(function* () {
           })
         )
           return;
-        const finalStatus = yield* git.statusDetailsLocal(worktreePath);
+        const finalStatus = yield* workflow.localStatus({ cwd: worktreePath });
         if (
           !finalStatus.isRepo ||
-          finalStatus.branch !== thread.branch ||
+          finalStatus.refName !== thread.branch ||
           finalStatus.hasWorkingTreeChanges
         )
           return;
         if (
-          (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha !==
-          head.commitSha
+          (native
+            ? (yield* native.currentChange(worktreePath))?.commitId
+            : (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha) !==
+          head
         )
           return;
-        const finalIgnored = yield* git.execute({
-          operation: "StorageCleanup.ignoredFiles",
-          cwd: worktreePath,
-          args: ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
-          maxOutputBytes: 64 * 1024,
-        });
+        if (native && (yield* native.hasUntrackedFiles(worktreePath))) return;
+        const finalIgnored = native
+          ? { stdout: "", stdoutTruncated: false }
+          : yield* git.execute({
+              operation: "StorageCleanup.ignoredFiles",
+              cwd: worktreePath,
+              args: [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+              ],
+              maxOutputBytes: 64 * 1024,
+            });
         if (
           finalIgnored.stdoutTruncated ||
           finalIgnored.stdout
@@ -369,10 +446,14 @@ export const make = Effect.gen(function* () {
           )
         )
           return;
-        yield* git.removeWorktree({ cwd: project.workspaceRoot, path: worktreePath, force: false });
+        yield* workflow.removeWorktree({
+          cwd: project.workspaceRoot,
+          path: worktreePath,
+          force: false,
+        });
         yield* gitManager.invalidateStatus(project.workspaceRoot);
-        // Preserve branch and path: ProviderCommandReactor recreates the checkout
-        // from that branch when the thread is resumed.
+        // Preserve branch and path: turn startup recreates the checkout from
+        // the saved branch/bookmark when the thread is resumed.
         yield* Effect.logInfo("storage cleanup removed worktree", { threadId: thread.id });
       }).pipe(
         (effect) => withWorkspaceLease(worktreePath, effect),

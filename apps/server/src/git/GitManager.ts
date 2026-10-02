@@ -70,6 +70,11 @@ import { detachStackFrame } from "./detachStackFrame.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
+import { jjCommit } from "../vcs/jjExpressions.ts";
+import * as JjGitWorkflowAdapter from "../vcs/JjGitWorkflowAdapter.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as ServerConfig from "../config.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import { detectPrTemplate } from "../sourceControl/PrTemplateDetection.ts";
 import type { ChangeRequest } from "@t3tools/contracts";
@@ -696,7 +701,42 @@ function toPullRequestHeadRemoteInfo(pr: {
 }
 
 export const make = Effect.gen(function* () {
-  const gitCore = yield* GitVcsDriver.GitVcsDriver;
+  const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+  const jj = Option.getOrNull(yield* Effect.serviceOption(JjVcsDriver.JjVcsDriver));
+  const registry = Option.getOrNull(
+    yield* Effect.serviceOption(VcsDriverRegistry.VcsDriverRegistry),
+  );
+  const config = Option.getOrNull(yield* Effect.serviceOption(ServerConfig.ServerConfig));
+  const isJj = (cwd: string) =>
+    registry
+      ? registry.detect({ cwd }).pipe(
+          Effect.map((handle) => handle?.kind === "jj"),
+          Effect.mapError(
+            (cause) =>
+              new GitCommandError({
+                cwd,
+                operation: "GitManager.route",
+                command: "vcs-route",
+                detail: "Could not resolve the repository driver.",
+                cause,
+              }),
+          ),
+        )
+      : jj
+        ? jj.isInsideWorkTree(cwd).pipe(
+            Effect.mapError(
+              (cause) =>
+                new GitCommandError({
+                  cwd,
+                  operation: "GitManager.route",
+                  command: "jj root",
+                  detail: "Could not detect Jujutsu workspace.",
+                  cause,
+                }),
+            ),
+          )
+        : Effect.succeed(false);
+  const gitCore = jj ? JjGitWorkflowAdapter.make(jj, gitDriver, isJj) : gitDriver;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
@@ -742,21 +782,36 @@ export const make = Effect.gen(function* () {
     }).pipe(Effect.orElseSucceed(() => ""));
 
   const readRecentCommitSubjects = (cwd: string) =>
-    gitCore
-      .execute({
-        operation: "GitManager.readRecentCommitSubjects",
-        cwd,
-        args: ["log", "-n", "20", "--no-merges", "--pretty=format:%s"],
-      })
-      .pipe(
-        Effect.map((result) =>
-          result.stdout
-            .split("\n")
-            .map((line) => line.trim())
-            .filter((line) => line.length > 0),
-        ),
-        Effect.orElseSucceed(() => []),
-      );
+    Effect.gen(function* () {
+      // A non-colocated backend may have an unborn Git HEAD. Repository style
+      // comes from the JJ history of this workspace, not that storage detail.
+      const result =
+        jj && (yield* isJj(cwd))
+          ? yield* jj.execute({
+              cwd,
+              operation: "GitManager.readRecentCommitSubjects",
+              args: [
+                "log",
+                "--ignore-working-copy",
+                "-r",
+                "ancestors(@-) ~ merges()",
+                "--limit",
+                "20",
+                "--no-graph",
+                "-T",
+                'description.first_line() ++ "\\n"',
+              ],
+            })
+          : yield* gitCore.execute({
+              operation: "GitManager.readRecentCommitSubjects",
+              cwd,
+              args: ["log", "-n", "20", "--no-merges", "--pretty=format:%s"],
+            });
+      return result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    }).pipe(Effect.orElseSucceed(() => []));
 
   const resolveStylePolicy = (cwd: string, settings: SourceControlTextGenerationSettings) =>
     Effect.gen(function* () {
@@ -1900,6 +1955,7 @@ export const make = Effect.gen(function* () {
     filePaths?: readonly string[],
     progressReporter?: GitActionProgressReporter,
     actionId?: string,
+    allowDefaultRef = false,
   ) {
     const emit = (event: GitActionProgressPayload) =>
       progressReporter && actionId
@@ -1985,6 +2041,9 @@ export const make = Effect.gen(function* () {
         : null;
     const { commitSha } = yield* gitCore.commit(cwd, suggestion.subject, suggestion.body, {
       timeoutMs: COMMIT_TIMEOUT_MS,
+      refName: branch,
+      allowDefaultRef,
+      ...(filePaths ? { filePaths } : {}),
       ...(commitProgress ? { progress: commitProgress } : {}),
     });
     if (currentHookName !== null) {
@@ -2146,6 +2205,49 @@ export const make = Effect.gen(function* () {
     "branchPullRequest",
   )(function* ({ cwd, branch }, options) {
     const cacheCwd = yield* normalizeStatusCacheKey(cwd);
+    if (jj && (yield* isJj(cacheCwd))) {
+      const bookmarks = yield* jj.listBookmarks(cacheCwd).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GitManagerError({
+              cwd,
+              operation: "branchPullRequest",
+              detail: "Could not list bookmarks.",
+              cause,
+            }),
+        ),
+      );
+      const remoteName = yield* gitCore.readConfigValue(cacheCwd, `branch.${branch}.remote`).pipe(
+        Effect.flatMap((configured) =>
+          configured ? Effect.succeed(configured) : gitCore.resolvePrimaryRemoteName(cacheCwd),
+        ),
+        Effect.orElseSucceed(() => null),
+      );
+      if (remoteName === null) return null;
+      const published = bookmarks.find(
+        (bookmark) =>
+          bookmark.name === branch &&
+          bookmark.remoteName === remoteName &&
+          bookmark.target !== null,
+      );
+      if (!published) return null;
+      const defaultBranch = yield* gitCore.resolveDefaultBranchName(cacheCwd, remoteName);
+      const key = prLookupCacheKey(cacheCwd, {
+        branch,
+        upstreamRef: `${remoteName}/${branch}`,
+        defaultBranch,
+      });
+      if (options?.refresh) yield* Cache.invalidate(prLookupCache, key);
+      const { latest } = yield* getPrLookup(key);
+      return latest
+        ? {
+            ...toStatusPr(latest),
+            closedAt: latest.closedAt ?? null,
+            mergedAt: latest.mergedAt ?? null,
+            repositoryKey: pullRequestRepositoryKey(latest.url),
+          }
+        : null;
+    }
     const remotes = yield* gitCore.execute({
       operation: "GitManager.branchPullRequest.remotes",
       cwd: cacheCwd,
@@ -2360,6 +2462,238 @@ export const make = Effect.gen(function* () {
         reference: normalizedReference,
       });
       const pullRequest = toResolvedPullRequest(pullRequestSummary);
+
+      if (jj && (yield* isJj(input.cwd))) {
+        const native = (args: readonly string[]) =>
+          jj
+            .execute({
+              cwd: input.cwd,
+              operation: "GitManager.preparePullRequestThread.jj",
+              args,
+              timeoutMs: 60_000,
+              env: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    cwd: input.cwd,
+                    operation: "preparePullRequestThread",
+                    detail: "Could not prepare the Jujutsu pull-request workspace.",
+                    cause,
+                  }),
+              ),
+            );
+        let remoteName = yield* gitCore.resolvePrimaryRemoteName(input.cwd);
+        const headRepository = resolveHeadRepositoryNameWithOwner({
+          ...pullRequest,
+          ...toPullRequestHeadRemoteInfo(pullRequestSummary),
+        });
+        if (headRepository) {
+          const urls = yield* (yield* sourceControlProvider(input.cwd)).getRepositoryCloneUrls({
+            cwd: input.cwd,
+            repository: headRepository,
+          });
+          const url = shouldPreferSshRemote(
+            yield* gitCore.readConfigValue(input.cwd, `remote.${remoteName}.url`),
+          )
+            ? urls.sshUrl
+            : urls.url;
+          const remotes = yield* jj.listRemotes(input.cwd).pipe(
+            Effect.mapError(
+              (cause) =>
+                new GitManagerError({
+                  cwd: input.cwd,
+                  operation: "preparePullRequestThread",
+                  detail: "Could not inspect remotes.",
+                  cause,
+                }),
+            ),
+          );
+          const existing = remotes.remotes.find(
+            (remote) => normalizeGitRemoteUrl(remote.url) === normalizeGitRemoteUrl(url),
+          );
+          remoteName =
+            existing?.name ??
+            `t3-pr-${pullRequest.number}-${(yield* randomUUIDv4(input.cwd)).slice(0, 8)}`;
+          if (!existing) yield* native(["git", "remote", "add", "--", remoteName, url]);
+        }
+        yield* native([
+          "git",
+          "fetch",
+          "--remote",
+          remoteName,
+          "--branch",
+          `exact:${pullRequest.headBranch}`,
+        ]);
+        const target = yield* jj
+          .resolveRemoteTrackingCommit({
+            cwd: input.cwd,
+            refName: pullRequest.headBranch,
+            fallbackRemoteName: remoteName,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new GitManagerError({
+                  cwd: input.cwd,
+                  operation: "preparePullRequestThread",
+                  detail: "Pull-request head bookmark is unavailable.",
+                  cause,
+                }),
+            ),
+          );
+        const headBookmark = resolvePullRequestWorktreeLocalBranchName({
+          ...pullRequest,
+          ...toPullRequestHeadRemoteInfo(pullRequestSummary),
+        });
+        const localBookmark = (yield* jj.listBookmarks(input.cwd).pipe(
+          Effect.mapError(
+            (cause) =>
+              new GitManagerError({
+                cwd: input.cwd,
+                operation: "preparePullRequestThread",
+                detail: "Could not inspect the local head bookmark.",
+                cause,
+              }),
+          ),
+        )).find((bookmark) => bookmark.name === headBookmark && bookmark.remoteName === null);
+        if (localBookmark && localBookmark.target !== target.commitSha)
+          // Without --allow-backwards, JJ only permits a safe fast-forward.
+          yield* native([
+            "bookmark",
+            "move",
+            "--to",
+            jjCommit(target.commitSha),
+            "--",
+            `exact:${headBookmark}`,
+          ]);
+        if (!localBookmark)
+          yield* native([
+            "bookmark",
+            "create",
+            "-r",
+            jjCommit(target.commitSha),
+            "--",
+            headBookmark,
+          ]);
+        // Tracking uses matching local/remote names in JJ. A fork's namespaced
+        // review bookmark must not retarget the repository's own main bookmark.
+        if (headBookmark === pullRequest.headBranch)
+          yield* native([
+            "bookmark",
+            "track",
+            "--",
+            `exact:${pullRequest.headBranch}@${remoteName}`,
+          ]);
+        if (input.mode === "local") {
+          // jj new preserves the existing working-copy change, unlike host CLI checkout --force.
+          yield* native(["new", jjCommit(target.commitSha), "-m", ""]);
+          return {
+            pullRequest,
+            branch: headBookmark,
+            worktreePath: null,
+            isOnPullRequestHead: true,
+          };
+        }
+        if (!config)
+          return yield* new GitManagerError({
+            cwd: input.cwd,
+            operation: "preparePullRequestThread",
+            detail: "Workspace destination is not configured.",
+          });
+        const destination = path.join(
+          config.worktreesDir,
+          path.basename(input.cwd),
+          `pr-${pullRequest.number}`,
+        );
+        if (
+          yield* fileSystem
+            .exists(destination)
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    cwd: input.cwd,
+                    operation: "preparePullRequestThread",
+                    detail: "Could not inspect the PR workspace destination.",
+                    cause,
+                  }),
+              ),
+            )
+        ) {
+          yield* jj
+            .validateWorktreePath({ cwd: input.cwd, path: destination })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    cwd: input.cwd,
+                    operation: "preparePullRequestThread",
+                    detail: "The existing PR workspace does not belong to this repository.",
+                    cause,
+                  }),
+              ),
+            );
+          const status = yield* jj
+            .localStatus(destination)
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    cwd: destination,
+                    operation: "preparePullRequestThread",
+                    detail: "Could not inspect the existing PR workspace.",
+                    cause,
+                  }),
+              ),
+            );
+          const parents = yield* jj
+            .execute({
+              cwd: destination,
+              operation: "preparePullRequestThread",
+              args: ["log", "--ignore-working-copy", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    cwd: destination,
+                    operation: "preparePullRequestThread",
+                    detail: "Could not inspect the existing PR workspace parents.",
+                    cause,
+                  }),
+              ),
+            );
+          return {
+            pullRequest,
+            branch: headBookmark,
+            worktreePath: destination,
+            isOnPullRequestHead:
+              !status.hasWorkingTreeChanges && parents.stdout.trim() === target.commitSha,
+          };
+        }
+        const created = yield* jj
+          .createWorktree({ cwd: input.cwd, refName: headBookmark, path: destination })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new GitManagerError({
+                  cwd: input.cwd,
+                  operation: "preparePullRequestThread",
+                  detail: "Could not create the Jujutsu workspace.",
+                  cause,
+                }),
+            ),
+          );
+        yield* maybeRunSetupScript(created.worktree.path);
+        return {
+          pullRequest,
+          branch: headBookmark,
+          worktreePath: created.worktree.path,
+          isOnPullRequestHead: true,
+        };
+      }
 
       if (input.mode === "local") {
         yield* (yield* sourceControlProvider(input.cwd)).checkoutChangeRequest({
@@ -2631,7 +2965,9 @@ export const make = Effect.gen(function* () {
     const resolvedBranch = resolveAutoFeatureBranchName(existingBranchNames, preferredBranch);
 
     yield* gitCore.createRef({ cwd, refName: resolvedBranch });
-    yield* Effect.scoped(gitCore.switchRef({ cwd, refName: resolvedBranch }));
+    if (!(yield* isJj(cwd))) {
+      yield* Effect.scoped(gitCore.switchRef({ cwd, refName: resolvedBranch }));
+    }
 
     return {
       branchStep: { status: "created" as const, name: resolvedBranch },
@@ -2776,6 +3112,7 @@ export const make = Effect.gen(function* () {
                   input.filePaths,
                   options?.progressReporter,
                   progress.actionId,
+                  input.confirmedDefaultRef === true,
                 ),
               ),
             )

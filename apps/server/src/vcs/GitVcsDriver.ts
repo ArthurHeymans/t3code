@@ -169,6 +169,11 @@ export interface GitCommitProgress {
 }
 
 export interface GitCommitOptions {
+  /** JJ splits these paths; Git has already staged them in prepareCommitContext. */
+  readonly filePaths?: readonly string[];
+  readonly refName?: string | null;
+  /** Explicitly requested the existing default bookmark rather than a feature. */
+  readonly allowDefaultRef?: boolean;
   readonly timeoutMs?: number;
   readonly progress?: GitCommitProgress;
 }
@@ -553,11 +558,17 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     ).pipe(Effect.map((result) => result.exitCode === 0 && result.stdout.trim() === "true"));
 
   const listWorkspaces: VcsDriver.VcsDriver["Service"]["listWorkspaces"] = (cwd) =>
-    gitCommand(vcsProcess, "GitVcsDriver.listWorkspaces", cwd, ["worktree", "list", "--porcelain", "-z"], {
-      allowNonZeroExit: true,
-      timeoutMs: 5_000,
-      maxOutputBytes: 256 * 1024,
-    }).pipe(
+    gitCommand(
+      vcsProcess,
+      "GitVcsDriver.listWorkspaces",
+      cwd,
+      ["worktree", "list", "--porcelain", "-z"],
+      {
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 256 * 1024,
+      },
+    ).pipe(
       Effect.map((result) => {
         if (result.exitCode !== 0) return [];
         const workspaces: Array<{ name: string; path: string; current: boolean }> = [];
@@ -577,7 +588,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         for (const field of result.stdout.split("\0")) {
           if (field === "") flush();
           else if (field.startsWith("worktree ")) workspacePath = field.slice("worktree ".length);
-          else if (field.startsWith("branch refs/heads/")) refName = field.slice("branch refs/heads/".length);
+          else if (field.startsWith("branch refs/heads/"))
+            refName = field.slice("branch refs/heads/".length);
         }
         flush();
         return workspaces;

@@ -4,6 +4,8 @@ import type {
   VcsStatusResult,
 } from "@t3tools/contracts";
 
+import { hasVcsRemoteStatus, supportsVcsWorkflowActions } from "@t3tools/shared/git";
+
 export type GitActionIconName = "commit" | "push" | "pr";
 
 export type GitDialogAction = "commit" | "push" | "create_pr";
@@ -32,6 +34,7 @@ export interface DefaultBranchActionDialogCopy {
 }
 
 export type DefaultBranchConfirmableAction =
+  | "commit"
   | "push"
   | "create_pr"
   | "commit_push"
@@ -39,7 +42,7 @@ export type DefaultBranchConfirmableAction =
 
 export type GitActionRequestInput = Pick<
   GitRunStackedActionInput,
-  "action" | "commitMessage" | "featureBranch" | "filePaths"
+  "action" | "commitMessage" | "featureBranch" | "confirmedDefaultRef" | "filePaths"
 >;
 
 export function buildMenuItems(
@@ -48,6 +51,7 @@ export function buildMenuItems(
   hasOriginRemote = true,
 ): GitActionMenuItem[] {
   if (!gitStatus) return [];
+  if (!supportsVcsWorkflowActions(gitStatus.kind, gitStatus.supportsWorkflowActions)) return [];
 
   const hasBranch = gitStatus.refName !== null;
   const hasChanges = gitStatus.hasWorkingTreeChanges;
@@ -56,6 +60,7 @@ export function buildMenuItems(
   const canPushWithoutUpstream = hasOriginRemote && !gitStatus.hasUpstream;
   const canCommit = !isBusy && hasChanges;
   const canPush =
+    hasVcsRemoteStatus(gitStatus) &&
     !isBusy &&
     hasBranch &&
     !hasChanges &&
@@ -63,6 +68,7 @@ export function buildMenuItems(
     gitStatus.aheadCount > 0 &&
     (gitStatus.hasUpstream || canPushWithoutUpstream);
   const canCreatePr =
+    hasVcsRemoteStatus(gitStatus) &&
     !isBusy &&
     hasBranch &&
     !hasChanges &&
@@ -127,19 +133,35 @@ export function resolveQuickAction(
     };
   }
 
+  if (!supportsVcsWorkflowActions(gitStatus.kind, gitStatus.supportsWorkflowActions))
+    return {
+      label: "Commit",
+      disabled: true,
+      kind: "show_hint",
+      hint: "This repository does not support source-control actions.",
+    };
   const hasBranch = gitStatus.refName !== null;
   const hasChanges = gitStatus.hasWorkingTreeChanges;
   const hasOpenPr = gitStatus.pr?.state === "open";
   const isAhead = gitStatus.aheadCount > 0;
   const isBehind = gitStatus.behindCount > 0;
   const isDiverged = isAhead && isBehind;
+  if (gitStatus.kind === "jj" && !hasBranch && hasChanges)
+    return { label: "Commit change", disabled: false, kind: "run_action", action: "commit" };
+  if (!hasVcsRemoteStatus(gitStatus))
+    return hasChanges
+      ? { label: "Commit", disabled: false, kind: "run_action", action: "commit" }
+      : { label: "Push", disabled: true, kind: "show_hint", hint: "Remote status is unavailable." };
 
   if (!hasBranch) {
     return {
       label: "Commit",
       disabled: true,
       kind: "show_hint",
-      hint: "Create and checkout a branch before pushing or opening a PR.",
+      hint:
+        gitStatus.kind === "jj"
+          ? "Create or select an unambiguous bookmark before publishing."
+          : "Create and checkout a branch before pushing or opening a PR.",
     };
   }
 
@@ -208,7 +230,7 @@ export function resolveQuickAction(
 
   if (isBehind) {
     return {
-      label: "Pull",
+      label: gitStatus.kind === "jj" ? "Fetch" : "Pull",
       disabled: false,
       kind: "run_pull",
     };
@@ -267,9 +289,12 @@ export function getGitActionDisabledReason(input: {
     return "Commit is currently unavailable.";
   }
 
+  if (!hasVcsRemoteStatus(gitStatus)) return "Remote status is unavailable.";
   if (item.id === "push") {
     if (!hasBranch) {
-      return "Detached HEAD: checkout a branch before pushing.";
+      return gitStatus.kind === "jj"
+        ? "Choose an unambiguous bookmark before pushing."
+        : "Detached HEAD: checkout a branch before pushing.";
     }
     if (hasChanges) {
       return "Commit or stash local changes before pushing.";
@@ -290,7 +315,9 @@ export function getGitActionDisabledReason(input: {
     return "View PR is currently unavailable.";
   }
   if (!hasBranch) {
-    return "Detached HEAD: checkout a branch before creating a PR.";
+    return gitStatus.kind === "jj"
+      ? "Choose an unambiguous bookmark before creating a PR."
+      : "Detached HEAD: checkout a branch before creating a PR.";
   }
   if (hasChanges) {
     return "Commit local changes before creating a PR.";
@@ -310,9 +337,11 @@ export function getGitActionDisabledReason(input: {
 export function requiresDefaultBranchConfirmation(
   action: GitStackedAction,
   isDefaultBranch: boolean,
+  vcsKind?: VcsStatusResult["kind"],
 ): boolean {
   if (!isDefaultBranch) return false;
   return (
+    (action === "commit" && vcsKind === "jj") ||
     action === "push" ||
     action === "create_pr" ||
     action === "commit_push" ||
@@ -327,6 +356,14 @@ export function resolveDefaultBranchActionDialogCopy(input: {
 }): DefaultBranchActionDialogCopy {
   const branchLabel = input.branchName;
   const suffix = ` on "${branchLabel}". You can continue on this branch or create a feature branch and run the same action there.`;
+
+  if (input.action === "commit") {
+    return {
+      title: "Commit to default bookmark?",
+      description: `This action will commit changes and advance the default bookmark${suffix}`,
+      continueLabel: `Commit to ${branchLabel}`,
+    };
+  }
 
   if (input.action === "push" || input.action === "commit_push") {
     if (input.includesCommit) {

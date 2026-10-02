@@ -8,10 +8,17 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import { GitCommandError, SourceControlProviderError } from "@t3tools/contracts";
+import {
+  GitCommandError,
+  SourceControlProviderError,
+  VcsRepositoryDetectionError,
+} from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import type * as SourceControlProvider from "./SourceControlProvider.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 import * as SourceControlRepositoryService from "./SourceControlRepositoryService.ts";
@@ -58,8 +65,33 @@ function makeLayer(input: {
   readonly provider?: SourceControlProvider.SourceControlProvider["Service"];
   readonly git?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
   readonly fileSystem?: FileSystem.FileSystem;
+  readonly jj?: JjVcsDriver.JjVcsDriverShape;
 }) {
+  const native = input.jj;
   const serviceLayer = SourceControlRepositoryService.layer.pipe(
+    Layer.provide(
+      native
+        ? Layer.mergeAll(
+            Layer.succeed(JjVcsDriver.JjVcsDriver, native),
+            Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+              resolve: ({ cwd }) =>
+                native.detectRepository(cwd).pipe(
+                  Effect.flatMap((repository) =>
+                    repository
+                      ? Effect.succeed({ kind: "jj" as const, repository, driver: native })
+                      : Effect.fail(
+                          new VcsRepositoryDetectionError({
+                            cwd,
+                            operation: "test",
+                            detail: "Not a JJ repository.",
+                          }),
+                        ),
+                  ),
+                ),
+            }),
+          )
+        : Layer.empty,
+    ),
     Layer.provide(
       Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
         resolveLink: () => undefined,
@@ -95,6 +127,139 @@ function makeLayer(input: {
       )
     : serviceLayer.pipe(Layer.provideMerge(NodeServices.layer));
 }
+
+const nativeLayer = VcsProcess.layer.pipe(Layer.provideMerge(NodeServices.layer));
+
+it.effect("clones into a colocated JJ repository when requested", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-clone-" });
+      const source = path.join(root, "source"),
+        destination = path.join(root, "clone");
+      const process = yield* VcsProcess.VcsProcess;
+      const command = (cwd: string, args: readonly string[]) =>
+        process.run({ cwd, command: "jj", operation: "test", args });
+      yield* command(root, ["git", "init", "--colocate", source]);
+      yield* fs.writeFileString(path.join(source, "file.txt"), "source\n");
+      yield* command(source, ["commit", "-m", "source"]);
+      const jj = yield* JjVcsDriver.makeVcsDriverShape();
+      yield* Effect.gen(function* () {
+        const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+        const result = yield* service.cloneRepository({
+          remoteUrl: source,
+          destinationPath: destination,
+          vcsKind: "jj",
+        });
+        assert.equal(result.cwd, destination);
+        assert.equal(yield* fs.readFileString(path.join(destination, "file.txt")), "source\n");
+        assert.isTrue(yield* fs.exists(path.join(destination, ".git")));
+        assert.isTrue(yield* jj.isInsideWorkTree(destination));
+        assert.equal((yield* jj.localStatus(destination)).kind, "jj");
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            jj,
+            git: {
+              execute: (input) =>
+                process
+                  .run({
+                    cwd: input.cwd,
+                    args: input.args,
+                    operation: input.operation,
+                    command: "git",
+                    ...(input.env ? { env: input.env } : {}),
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new GitCommandError({
+                          cwd: input.cwd,
+                          operation: input.operation,
+                          command: "git",
+                          detail: "Clone failed.",
+                          cause,
+                        }),
+                    ),
+                  ),
+            },
+          }),
+        ),
+      );
+    }),
+  ).pipe(Effect.provide(nativeLayer)),
+);
+
+it.effect("publishes a committed JJ bookmark without invoking Git mutations", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-publish-" });
+      const repo = path.join(root, "repo"),
+        remote = path.join(root, "remote.git");
+      const process = yield* VcsProcess.VcsProcess;
+      yield* process.run({
+        cwd: root,
+        command: "jj",
+        operation: "test",
+        args: ["git", "init", "--no-colocate", repo],
+      });
+      yield* process.run({
+        cwd: root,
+        command: "git",
+        operation: "test",
+        args: ["init", "--bare", remote],
+      });
+      const jj = yield* JjVcsDriver.makeVcsDriverShape();
+      yield* fs.writeFileString(path.join(repo, "file.txt"), "published\n");
+      yield* jj.execute({ cwd: repo, operation: "test", args: ["commit", "-m", "publishable"] });
+      yield* jj.execute({
+        cwd: repo,
+        operation: "test",
+        args: ["bookmark", "create", "feature/publish", "-r", "@-"],
+      });
+      const provider = makeProvider({
+        createRepository: () => Effect.succeed({ ...CLONE_URLS, url: remote }),
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+        const result = yield* service.publishRepository({
+          cwd: repo,
+          provider: "github",
+          repository: "octocat/t3code",
+          visibility: "private",
+          protocol: "https",
+        });
+        assert.equal(result.status, "pushed");
+        assert.equal(result.branch, "feature/publish");
+        assert.equal((yield* jj.listRemotes(repo)).remotes[0]?.url, remote);
+        assert.equal(
+          (yield* process.run({
+            cwd: root,
+            command: "git",
+            operation: "test",
+            args: ["--git-dir", remote, "show", "refs/heads/feature/publish:file.txt"],
+          })).stdout,
+          "published\n",
+        );
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            jj,
+            provider,
+            git: {
+              execute: () => Effect.die("Git execution reached for JJ publishing"),
+              ensureRemote: () => Effect.die("Git remote mutation reached for JJ publishing"),
+              pushCurrentBranch: () => Effect.die("Git push reached for JJ publishing"),
+            },
+          }),
+        ),
+      );
+    }),
+  ).pipe(Effect.provide(nativeLayer)),
+);
 
 it.effect("looks up repositories through the requested provider without search", () => {
   const calls: Array<{ cwd: string; repository: string }> = [];

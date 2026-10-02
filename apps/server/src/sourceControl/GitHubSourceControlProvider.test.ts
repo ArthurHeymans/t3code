@@ -30,6 +30,33 @@ function makeProvider(github: Partial<GitHubCli.GitHubCli["Service"]>) {
   );
 }
 
+it.effect("preserves GitHub CLI repository discovery for Git fork workflows", () =>
+  Effect.gen(function* () {
+    const provider = yield* GitHubSourceControlProvider.make.pipe(
+      Effect.provide(GitHubCli.layer),
+      Effect.provideService(VcsProcess.VcsProcess, {
+        run: (input) =>
+          Effect.sync(() => {
+            assert.isFalse(input.args.includes("--repo"));
+            return processResult("https://github.com/upstream/project/pull/1");
+          }),
+      }),
+    );
+    yield* provider.createChangeRequest({
+      cwd: "/git-fork",
+      baseRefName: "main",
+      headSelector: "my-fork:feature",
+      title: "Fix",
+      bodyFile: "/tmp/pr.md",
+      context: {
+        provider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
+        remoteName: "origin",
+        remoteUrl: "git@github-work:my-fork/project.git",
+      },
+    });
+  }),
+);
+
 it.effect("uses the enterprise quota for a current-repository default branch read", () =>
   Effect.gen(function* () {
     const provider = yield* GitHubSourceControlProvider.make.pipe(
@@ -37,7 +64,10 @@ it.effect("uses the enterprise quota for a current-repository default branch rea
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {
-            if (input.args[1] !== "rate_limit") return processResult("main");
+            if (input.args[1] !== "rate_limit") {
+              assert.strictEqual(input.args[2], "enterprise.test/acme/web");
+              return processResult("main");
+            }
             assert.strictEqual(input.args[3], "enterprise.test");
             return processResult(
               '{"data":{"rateLimit":{"cost":1,"limit":5000,"remaining":5000,"resetAt":"2099-01-01T00:00:00Z"}}}',
@@ -51,10 +81,76 @@ it.effect("uses the enterprise quota for a current-repository default branch rea
         provider: { kind: "github", name: "GitHub Enterprise", baseUrl: "https://enterprise.test" },
         remoteName: "origin",
         remoteUrl: "https://enterprise.test/acme/web.git",
+        explicitRepository: true,
       },
     });
     assert.strictEqual(branch, "main");
   }),
+);
+
+it.effect(
+  "targets the hosting repository explicitly without requiring Git discovery from the cwd",
+  () =>
+    Effect.gen(function* () {
+      const summary =
+        '{"number":42,"title":"JJ change","url":"https://github.com/acme/web/pull/42","baseRefName":"main","headRefName":"feature/jj","state":"OPEN","isDraft":false,"mergedAt":null,"closedAt":null,"updatedAt":"2026-01-01T00:00:00Z","isCrossRepository":false,"headRepository":null,"headRepositoryOwner":null}';
+      const provider = yield* GitHubSourceControlProvider.make.pipe(
+        Effect.provide(GitHubCli.layer),
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: (input) =>
+            Effect.sync(() => {
+              if (input.args[1] === "rate_limit")
+                return processResult(
+                  '{"data":{"rateLimit":{"cost":1,"limit":5000,"remaining":5000,"resetAt":"2099-01-01T00:00:00Z"}}}',
+                );
+              assert.strictEqual(input.cwd, "/jj-secondary-without-git");
+              if (input.args[0] === "repo") {
+                assert.strictEqual(input.args[2], "github.com/acme/web");
+                return processResult("main");
+              }
+              assert.strictEqual(
+                input.args[input.args.indexOf("--repo") + 1],
+                "github.com/acme/web",
+              );
+              return processResult(input.args[1] === "list" ? `[${summary}]` : summary);
+            }),
+        }),
+      );
+      const input = {
+        cwd: "/jj-secondary-without-git",
+        context: {
+          provider: { kind: "github" as const, name: "GitHub", baseUrl: "https://github.com" },
+          remoteName: "origin",
+          remoteUrl: "git@github-work:acme/web.git",
+          explicitRepository: true,
+        },
+      };
+      assert.equal(
+        (yield* provider.listChangeRequests({
+          ...input,
+          state: "open",
+          headSelector: "feature/jj",
+        }))[0]?.number,
+        42,
+      );
+      assert.equal(
+        (yield* provider.listChangeRequests({
+          ...input,
+          state: "closed",
+          headSelector: "feature/jj",
+        }))[0]?.number,
+        42,
+      );
+      assert.equal((yield* provider.getChangeRequest({ ...input, reference: "42" })).number, 42);
+      yield* provider.createChangeRequest({
+        ...input,
+        baseRefName: "main",
+        headSelector: "feature/jj",
+        title: "JJ change",
+        bodyFile: "/body.md",
+      });
+      assert.equal(yield* provider.getDefaultBranch(input), "main");
+    }),
 );
 
 it.effect("maps GitHub PR summaries into provider-neutral change requests", () =>

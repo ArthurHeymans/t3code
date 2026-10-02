@@ -45,19 +45,6 @@ export const VcsWorkspace = Schema.Struct({
 });
 export type VcsWorkspace = typeof VcsWorkspace.Type;
 
-export const VcsListWorkspacesInput = Schema.Struct({
-  cwd: TrimmedNonEmptyString,
-});
-export type VcsListWorkspacesInput = typeof VcsListWorkspacesInput.Type;
-
-export const VcsListWorkspacesResult = Schema.Struct({
-  kind: VcsDriverKind,
-  isRepo: Schema.Boolean,
-  canCreateWorkspace: Schema.Boolean,
-  workspaces: Schema.Array(VcsWorkspace),
-});
-export type VcsListWorkspacesResult = typeof VcsListWorkspacesResult.Type;
-
 export const VcsListWorkspaceFilesResult = Schema.Struct({
   paths: Schema.Array(TrimmedNonEmptyString),
   truncated: Schema.Boolean,

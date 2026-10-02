@@ -131,6 +131,7 @@ function selectProviderContext(
     readonly name: string;
     readonly url: string;
   }>,
+  explicitRepository = false,
 ): SourceControlProvider.SourceControlProviderContext | null {
   const candidates: Array<SourceControlProvider.SourceControlProviderContext> = [];
   for (const remote of remotes) {
@@ -140,11 +141,15 @@ function selectProviderContext(
         provider,
         remoteName: remote.name,
         remoteUrl: remote.url,
+        ...(explicitRepository ? { explicitRepository: true } : {}),
       });
     }
   }
 
   return (
+    (explicitRepository
+      ? candidates.find((candidate) => candidate.remoteName === "upstream")
+      : undefined) ??
     candidates.find((candidate) => candidate.remoteName === "origin") ??
     candidates.find((candidate) => candidate.provider.kind !== "unknown") ??
     candidates[0] ??
@@ -238,7 +243,7 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
               }),
           ),
         );
-        const context = selectProviderContext(remotes.remotes);
+        const context = selectProviderContext(remotes.remotes, handle.kind === "jj");
 
         return yield* refineUnknownRemoteProvider({
           specs: discoverySpecs,

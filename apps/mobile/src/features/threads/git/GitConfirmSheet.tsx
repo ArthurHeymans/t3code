@@ -36,6 +36,7 @@ export function GitConfirmSheet(props: GitConfirmSheetProps) {
   const params = props.route.params;
 
   const confirmAction = params.confirmAction as
+    | "commit"
     | "push"
     | "create_pr"
     | "commit_push"
@@ -63,6 +64,7 @@ export function GitConfirmSheet(props: GitConfirmSheetProps) {
     navigation.dispatch(StackActions.replace("Thread", { environmentId, threadId }));
     await gitActions.onRunSelectedThreadGitAction({
       action: confirmAction,
+      confirmedDefaultRef: true,
       ...(params.commitMessage ? { commitMessage: params.commitMessage } : {}),
       ...(params.filePaths ? { filePaths: params.filePaths.split(",") } : {}),
     });

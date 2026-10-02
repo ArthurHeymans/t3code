@@ -279,6 +279,14 @@ const make = Effect.gen(function* () {
         input.workspaceStrategy.type === "existing_worktree"
           ? input.workspaceStrategy.worktreePath
           : null;
+      if (input.workspaceStrategy.type === "existing_worktree") {
+        yield* git
+          .validateWorktreePath({
+            cwd: project.workspaceRoot,
+            path: input.workspaceStrategy.worktreePath,
+          })
+          .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+      }
       if (input.workspaceStrategy.type === "worktree") {
         if (runId !== null) {
           yield* threads

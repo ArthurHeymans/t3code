@@ -863,6 +863,7 @@ function OpenCommandPaletteDialog(props: {
   );
   const [isPickingProjectFolder, setIsPickingProjectFolder] = useState(false);
   const [addProjectCloneFlow, setAddProjectCloneFlow] = useState<AddProjectCloneFlow | null>(null);
+  const [cloneWithJj, setCloneWithJj] = useState(false);
   // The name step of New project: while set, the palette input is the name.
   const [newProjectFlow, setNewProjectFlow] = useState<{
     readonly environmentId: EnvironmentId;
@@ -1546,6 +1547,7 @@ function OpenCommandPaletteDialog(props: {
   const startAddProjectClone = useCallback(
     (environmentId: EnvironmentId, source: AddProjectRemoteSource): void => {
       setAddProjectEnvironmentId(environmentId);
+      setCloneWithJj(false);
       setAddProjectCloneFlow({ step: "repository", environmentId, source });
       pushPaletteView({
         addonIcon: remoteProjectSourceIcon(source, ADDON_ICON_CLASS),
@@ -2768,6 +2770,10 @@ function OpenCommandPaletteDialog(props: {
         input: {
           remoteUrl: addProjectCloneFlow.remoteUrl,
           destinationPath,
+          ...(cloneWithJj &&
+          browseEnvironment?.serverConfig?.environment.capabilities.jujutsuWorkflows === true
+            ? { vcsKind: "jj" }
+            : {}),
         },
       });
       setIsRemoteProjectCloning(false);
@@ -2801,6 +2807,10 @@ function OpenCommandPaletteDialog(props: {
         createdAt: new Date().toISOString(),
         remoteUrl: addProjectCloneFlow.remoteUrl,
         destinationPath,
+        ...(cloneWithJj &&
+        browseEnvironment?.serverConfig?.environment.capabilities.jujutsuWorkflows === true
+          ? { vcsKind: "jj" }
+          : {}),
       },
     });
     setIsRemoteProjectCloning(false);
@@ -2900,12 +2910,42 @@ function OpenCommandPaletteDialog(props: {
     browseUp,
     browseTo,
   });
-  const cloneDestinationBrowseGroups = useMemo(
-    () =>
-      browseGroups.map((group) =>
+  const cloneDestinationBrowseGroups = useMemo<CommandPaletteView["groups"]>(
+    () => [
+      ...(browseEnvironment?.serverConfig?.environment.capabilities.jujutsuWorkflows === true
+        ? [
+            {
+              value: "clone-vcs",
+              label: "Version control",
+              items: [
+                {
+                  kind: "action" as const,
+                  value: "clone-vcs:jj",
+                  searchTerms: [],
+                  title: "Use Jujutsu",
+                  icon: <FolderGit2Icon className={ITEM_ICON_CLASS} />,
+                  description: "Clone as a colocated JJ repository",
+                  titleTrailingContent: (
+                    <Checkbox checked={cloneWithJj} tabIndex={-1} aria-hidden />
+                  ),
+                  keepOpen: true,
+                  run: async () => {
+                    setCloneWithJj((value) => !value);
+                  },
+                },
+              ],
+            },
+          ]
+        : []),
+      ...browseGroups.map((group) =>
         group.value === "directories" ? { ...group, label: "Select where to clone" } : group,
       ),
-    [browseGroups],
+    ],
+    [
+      browseGroups,
+      browseEnvironment?.serverConfig?.environment.capabilities.jujutsuWorkflows,
+      cloneWithJj,
+    ],
   );
 
   const remoteProjectContext = useMemo(() => {

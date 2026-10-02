@@ -99,6 +99,26 @@ For a local Git repository without a remote, **Publish Repository** creates a ho
 adds it as `origin`, and pushes your commits. If there are no commits yet, it creates the remote;
 make your first commit before pushing.
 
+## Use Jujutsu
+
+Install [Jujutsu](https://jj-vcs.github.io/jj/) 0.39 or newer on the machine running your
+T3 Code server. Add an existing JJ checkout, choose **Use Jujutsu** when cloning, or
+initialize an empty directory with Jujutsu. Clones keep Git metadata alongside JJ;
+existing non-colocated Git-backed repositories and secondary JJ workspaces are supported too.
+
+Commit records the working-copy change; selected-file commits leave other edits in the
+next change. Publishing requires an unambiguous local bookmark and pushes only that
+bookmark. For feature work, create a feature bookmark; committing on the default bookmark
+requires an explicit choice. If trunk bookmarks the working-copy change itself, separate
+that change in JJ before creating a feature bookmark.
+
+**Fetch** imports remote bookmarks without rebasing or resetting your working copy.
+Use JJ to resolve divergent bookmarks or update a stale workspace (`jj workspace update-stale`).
+New workspaces start from stable bookmark history rather than another workspace's pending edits.
+JJ's file-tracking rules and size limits still apply; use `jj file track` for files that are not auto-tracked.
+Pruning operation history and rebuilding JJ's index can make old checkpoints unavailable for native
+restore. Their objects and diffs remain retained; a failed restore leaves your files unchanged.
+
 ## Create a pull request
 
 Use a thread's Git actions to commit, push, and create a pull request. T3 Code can generate commit

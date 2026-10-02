@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
+import { it as effectIt } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { Effect, FileSystem, Layer, Path } from "effect";
+import * as JjVcsDriver from "./vcs/JjVcsDriver.ts";
+import * as VcsProcess from "./vcs/VcsProcess.ts";
 import {
   ProjectId,
   ProviderInstanceId,
@@ -7,7 +12,11 @@ import {
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
-import { storageCleanupActivityAt, storageCleanupThreadIdle } from "./storageCleanup.ts";
+import {
+  storageCleanupActivityAt,
+  storageCleanupThreadIdle,
+  storageCleanupJjIntegrated,
+} from "./storageCleanup.ts";
 
 const NOW_MS = Date.parse("2026-06-10T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -64,6 +73,37 @@ function shell(overrides: Partial<OrchestrationV2ThreadShell> = {}): Orchestrati
     ...overrides,
   };
 }
+
+effectIt.effect("JJ cleanup checks every parent and retains described empty changes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-jj-cleanup-integration-" });
+      const jj = yield* JjVcsDriver.makeVcsDriverShape();
+      const run = (args: string[]) => jj.execute({ cwd, args, operation: "StorageCleanup.test" });
+      const parent = () =>
+        run(["log", "-r", "@-", "--no-graph", "-T", "commit_id"]).pipe(
+          Effect.map((result) => result.stdout.trim()),
+        );
+      yield* run(["git", "init", "--no-colocate"]);
+      yield* fs.writeFileString(path.join(cwd, "base.txt"), "base\n");
+      yield* run(["commit", "-m", "base"]);
+      const base = yield* parent();
+      expect(yield* storageCleanupJjIntegrated(jj, cwd, base)).toBe(true);
+      yield* run(["describe", "-m", "intentional empty change"]);
+      expect(yield* storageCleanupJjIntegrated(jj, cwd, base)).toBe(false);
+      yield* run(["new", "root()"]);
+      yield* fs.writeFileString(path.join(cwd, "side.txt"), "side\n");
+      yield* run(["commit", "-m", "side"]);
+      const side = yield* parent();
+      yield* run(["new", base, side]);
+      expect(yield* storageCleanupJjIntegrated(jj, cwd, base)).toBe(false);
+      yield* run(["commit", "-m", "merge"]);
+      expect(yield* storageCleanupJjIntegrated(jj, cwd, yield* parent())).toBe(true);
+    }),
+  ).pipe(Effect.provide(VcsProcess.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
 
 describe("V2 storage cleanup eligibility", () => {
   const candidate = () => shell({ branch: "feature", worktreePath: "/worktrees/feature" });
