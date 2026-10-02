@@ -12,6 +12,7 @@ import {
 } from "@t3tools/client-runtime/connection";
 import { fetchEnvironmentShellSnapshot } from "@t3tools/client-runtime/state/shell-snapshot-http";
 import { fetchEnvironmentBoundedThreadSnapshot } from "@t3tools/client-runtime/state/bounded-thread-snapshot-http";
+import { fetchEnvironmentThreadHistoryPage } from "@t3tools/client-runtime/state/thread-history-http";
 import {
   applyShellStreamEvent,
   mergeShellSnapshotProjects,
@@ -44,6 +45,7 @@ import {
   ThreadId,
   type OrchestrationV2ArchivedShellSnapshot,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
@@ -428,6 +430,7 @@ interface NormalizedQueuedRun {
   readonly position: number | null;
   readonly held: boolean;
   readonly text: string;
+  readonly truncated: boolean;
 }
 
 interface NormalizedThreadPayload {
@@ -1157,12 +1160,18 @@ const queuedRuns = (projection: OrchestrationV2ThreadProjection): NormalizedQueu
           (b.queuePosition ?? Number.MAX_SAFE_INTEGER) || a.ordinal - b.ordinal,
     )
     .slice(0, 50)
-    .map((run) => ({
-      runId: singleLine(run.id, 4_000),
-      position: run.queuePosition ?? null,
-      held: run.queueHeld === true,
-      text: clipUtf8Bytes(bodyText(messages.get(run.userMessageId)?.text ?? ""), 4_000),
-    }));
+    .map((run) => {
+      const original = messages.get(run.userMessageId)?.text ?? "";
+      const text = clipUtf8Bytes(bodyText(original), 4_000);
+      return {
+        runId: singleLine(run.id, 4_000),
+        position: run.queuePosition ?? null,
+        held: run.queueHeld === true,
+        text,
+        // Editing a preview would replace the full message with it.
+        truncated: text !== original,
+      };
+    });
 };
 
 export const normalizeThreadProjection = (
@@ -1235,28 +1244,70 @@ export const normalizeThreadProjection = (
   return payload;
 };
 
+/** Older rows not yet sent, and the server cursor for anything older still. */
+interface ThreadHistorySegment {
+  readonly rows: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
+  readonly cursor: string | null;
+}
+
 /**
- * Older timeline rows immediately before `beforeItemId`, normalized with the
- * same bounds as the live window. Items are chronological.
+ * Per-thread paging state. The live projection only holds the server's
+ * bounded window; rows before it are reached through opaque server cursors.
+ * Segments are keyed by the first item already sent to the client, which is
+ * what it pages backwards from.
  */
-export const normalizeThreadHistoryPage = (
-  projection: OrchestrationV2ThreadProjection,
+export interface ThreadHistoryState {
+  projection: OrchestrationV2ThreadProjection;
+  windowCursor: string | null;
+  readonly segments: Map<string, ThreadHistorySegment>;
+}
+
+export interface ThreadHistoryPageSource {
+  readonly items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
+  readonly nextCursor: string | null;
+  readonly hasMoreHistory: boolean;
+}
+
+/**
+ * Older items immediately before `beforeItemId`, normalized and bounded like
+ * the live window. Items are chronological. Rows that do not fit are kept for
+ * the next request rather than dropped.
+ */
+export const serveThreadHistory = <E, R>(
+  state: ThreadHistoryState,
   beforeItemId: string,
-): { readonly items: NormalizedThreadItem[]; readonly hasMore: boolean } => {
-  const index = projection.visibleTurnItems.findIndex((row) => row.item.id === beforeItemId);
-  const end = index < 0 ? 0 : index;
-  const start = Math.max(0, end - MAX_THREAD_ITEMS);
-  const normalize = threadItemNormalizer(projection);
-  const { items } = budgetItems(
-    projection.visibleTurnItems.slice(start, end).map((row) => normalize(row.item)),
-  );
-  let hasMore = start > 0;
-  while (Buffer.byteLength(encodeJson(items), "utf8") > 700_000 && items.length > 0) {
-    items.shift();
-    hasMore = true;
-  }
-  return { items, hasMore };
-};
+  fetchPage: (cursor: string) => Effect.Effect<ThreadHistoryPageSource, E, R>,
+) =>
+  Effect.gen(function* () {
+    const window = state.projection.visibleTurnItems;
+    const index = window.findIndex((row) => row.item.id === beforeItemId);
+    let segment =
+      index >= 0
+        ? { rows: window.slice(0, index), cursor: state.windowCursor }
+        : state.segments.get(beforeItemId);
+    if (segment === undefined) {
+      return yield* fail(
+        "history-unavailable",
+        "The bridge has no history position for that item; reopen the thread.",
+      );
+    }
+    if (segment.rows.length === 0 && segment.cursor !== null) {
+      const page = yield* fetchPage(segment.cursor);
+      segment = { rows: page.items, cursor: page.hasMoreHistory ? page.nextCursor : null };
+    }
+    const normalize = threadItemNormalizer(state.projection);
+    const start = Math.max(0, segment.rows.length - MAX_THREAD_ITEMS);
+    const { items } = budgetItems(segment.rows.slice(start).map((row) => normalize(row.item)));
+    let dropped = 0;
+    while (Buffer.byteLength(encodeJson(items), "utf8") > 700_000 && items.length > 1) {
+      items.shift();
+      dropped += 1;
+    }
+    const remaining = { rows: segment.rows.slice(0, start + dropped), cursor: segment.cursor };
+    // An empty server page still advances the cursor; retry from the same item.
+    state.segments.set(items[0]?.id ?? beforeItemId, remaining);
+    return { items, hasMore: remaining.rows.length > 0 || remaining.cursor !== null };
+  });
 
 export const normalizeArchivedThreads = (snapshot: OrchestrationV2ArchivedShellSnapshot) => {
   const projects = new Map(snapshot.projects.map((project) => [project.id, project]));
@@ -1371,6 +1422,9 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   const firstReady = yield* Deferred.make<BridgeConnection>();
   const connectionReady = yield* Ref.make(firstReady);
   const subscriptions = yield* Ref.make(new Map<string, Fiber.Fiber<void, unknown>>());
+  // History paging needs the subscription's live window and server cursor.
+  const threadHistories = new Map<string, ThreadHistoryState>();
+  const subscriptionThreads = new Map<string, string>();
   yield* Effect.addFinalizer(() =>
     Ref.get(connection).pipe(
       Effect.flatMap((current) => (current ? Scope.close(current.scope, Exit.void) : Effect.void)),
@@ -1434,6 +1488,11 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
     const current = yield* Ref.get(subscriptions);
     const fiber = current.get(subscriptionId);
     if (fiber === undefined) return;
+    const threadId = subscriptionThreads.get(subscriptionId);
+    if (threadId !== undefined) {
+      subscriptionThreads.delete(subscriptionId);
+      threadHistories.delete(threadId);
+    }
     yield* Fiber.interrupt(fiber);
     yield* Ref.update(subscriptions, (value) => {
       const next = new Map(value);
@@ -1687,10 +1746,25 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         const input = yield* decodeThreadHistoryInput(message.input).pipe(
           Effect.mapError(invalidInput),
         );
-        const projection = yield* current.session.client[
-          ORCHESTRATION_V2_WS_METHODS.getThreadProjection
-        ]({ threadId: input.threadId });
-        return normalizeThreadHistoryPage(projection, input.beforeItemId);
+        const state = threadHistories.get(input.threadId);
+        if (state === undefined) {
+          return yield* fail(
+            "history-unavailable",
+            "Subscribe to the thread before loading its history.",
+          );
+        }
+        return yield* serveThreadHistory(state, input.beforeItemId, (cursor) =>
+          fetchEnvironmentThreadHistoryPage({
+            prepared: current.prepared,
+            threadId: input.threadId,
+            cursor,
+            signer: Option.none(),
+          }).pipe(
+            Effect.mapError((cause) =>
+              fail("history-failed", safeErrorMessage(cause, preparedSecrets(current.prepared))),
+            ),
+          ),
+        );
       }
       case "thread.search": {
         const input = yield* decodeThreadSearchInput(message.input).pipe(
@@ -1918,9 +1992,25 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         ),
       );
       let latest: OrchestrationV2ThreadProjection | null = snapshot.projection;
-      // The bounded window's server-side history marker persists while live
-      // events extend the window; only a new snapshot replaces it.
-      let serverHasOlderHistory = snapshot.hasMoreHistory === true;
+      // The bounded window's history cursor persists while live events extend
+      // the window; only a new snapshot replaces it. Pages already served
+      // stay valid because their cursors are keyed by item.
+      const remember = (
+        projection: OrchestrationV2ThreadProjection,
+        cursor: string | null | undefined,
+      ) => {
+        threadHistories.set(threadId, {
+          projection,
+          windowCursor: cursor ?? null,
+          segments: threadHistories.get(threadId)?.segments ?? new Map(),
+        });
+        return cursor !== null && cursor !== undefined;
+      };
+      subscriptionThreads.set(message.subscriptionId, threadId);
+      let serverHasOlderHistory = remember(
+        snapshot.projection,
+        snapshot.hasMoreHistory === true ? snapshot.historyCursor : null,
+      );
       outputSequence += 1;
       yield* writeRecord({
         kind: "snapshot",
@@ -1944,7 +2034,10 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             }
             if (item.kind === "snapshot") {
               latest = item.projection;
-              serverHasOlderHistory = item.hasMoreHistory === true;
+              serverHasOlderHistory = remember(
+                item.projection,
+                item.hasMoreHistory === true ? item.historyCursor : null,
+              );
               outputSequence += 1;
               yield* writeRecord({
                 kind: "snapshot",
@@ -1959,6 +2052,8 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             const reduced = reduceThreadProjection(latest, item.event, serverHasOlderHistory);
             if (reduced.payload === null) return;
             latest = reduced.projection;
+            const history = threadHistories.get(threadId);
+            if (history !== undefined && latest !== null) history.projection = latest;
             outputSequence += 1;
             yield* writeRecord({
               kind: "event",
