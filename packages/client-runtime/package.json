@@ -299,6 +299,10 @@
       "types": "./src/state/boundedThreadSnapshotHttp.ts",
       "default": "./src/state/boundedThreadSnapshotHttp.ts"
     },
+    "./state/thread-history-http": {
+      "types": "./src/state/threadHistoryHttp.ts",
+      "default": "./src/state/threadHistoryHttp.ts"
+    },
     "./state/thread-search": {
       "types": "./src/state/threadSearch.ts",
       "default": "./src/state/threadSearch.ts"

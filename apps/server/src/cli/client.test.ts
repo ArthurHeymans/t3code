@@ -39,7 +39,7 @@ import {
   normalizeArchivedThreads,
   normalizeModelCatalog,
   normalizeProviderCommands,
-  normalizeThreadHistoryPage,
+  serveThreadHistory,
   normalizeShellSnapshot,
   normalizeThreadProjection,
   reduceThreadProjection,
@@ -625,55 +625,81 @@ describe("stdio client bridge", () => {
     expect(normalized.truncated).toBe(true);
   });
 
-  it("pages older history before the loaded window", () => {
-    const base = {
-      threadId: v2Projection.thread.id,
-      runId: null,
-      nodeId: null,
-      providerThreadId: null,
-      providerTurnId: null,
-      nativeItemRef: null,
-      parentItemId: null,
-      ordinal: 0,
-      status: "completed" as const,
-      title: null,
-      startedAt: v2Now,
-      completedAt: v2Now,
-      updatedAt: v2Now,
-    };
-    const visibleTurnItems = Array.from({ length: 250 }, (_, position) => {
-      const id = TurnItemId.make(`history-${String(position)}`);
-      const item: OrchestrationV2TurnItem = {
-        ...base,
-        id,
-        type: "assistant_message",
-        messageId: MessageId.make(`history-message-${String(position)}`),
-        text: `line ${String(position)}`,
-        streaming: false,
+  it.effect("pages older history from the bounded window and then server cursors", () =>
+    Effect.gen(function* () {
+      const base = {
+        threadId: v2Projection.thread.id,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed" as const,
+        title: null,
+        startedAt: v2Now,
+        completedAt: v2Now,
+        updatedAt: v2Now,
       };
-      return {
-        item,
-        position,
-        visibility: "local" as const,
-        sourceThreadId: item.threadId,
-        sourceItemId: id,
+      const row = (position: number) => {
+        const id = TurnItemId.make(`history-${String(position)}`);
+        const item: OrchestrationV2TurnItem = {
+          ...base,
+          id,
+          type: "assistant_message",
+          messageId: MessageId.make(`history-message-${String(position)}`),
+          text: `line ${String(position)}`,
+          streaming: false,
+        };
+        return {
+          item,
+          position,
+          visibility: "local" as const,
+          sourceThreadId: item.threadId,
+          sourceItemId: id,
+        };
       };
-    });
-    const projection = { ...v2Projection, visibleTurnItems };
-    const live = normalizeThreadProjection(projection);
-    expect(live.items[0]?.id).toBe("history-150");
-    expect(live.hasOlderHistory).toBe(true);
-    const page = normalizeThreadHistoryPage(projection, "history-150");
-    expect(page.items.map((item) => item.id)).toEqual(
-      Array.from({ length: 100 }, (_, index) => `history-${String(index + 50)}`),
-    );
-    expect(page.hasMore).toBe(true);
-    const last = normalizeThreadHistoryPage(projection, "history-50");
-    expect(last.items).toHaveLength(50);
-    expect(last.hasMore).toBe(false);
-    expect(normalizeThreadProjection(v2Projection).hasOlderHistory).toBe(false);
-    expect(normalizeThreadProjection(v2Projection, true).hasOlderHistory).toBe(true);
-  });
+      const range = (from: number, to: number) =>
+        Array.from({ length: to - from }, (_, index) => row(from + index));
+      // Like the server's bounded snapshot: only rows 200..259 are in the
+      // projection; older rows sit behind an opaque cursor.
+      const projection = { ...v2Projection, visibleTurnItems: range(200, 260) };
+      const pages: Record<string, { items: ReturnType<typeof range>; next: string | null }> = {
+        "cursor-a": { items: range(80, 200), next: "cursor-b" },
+        "cursor-b": { items: range(0, 80), next: null },
+      };
+      const requested: string[] = [];
+      const fetchPage = (cursor: string) =>
+        Effect.sync(() => {
+          requested.push(cursor);
+          const page = pages[cursor]!;
+          return { items: page.items, nextCursor: page.next, hasMoreHistory: page.next !== null };
+        });
+      const state = { projection, windowCursor: "cursor-a", segments: new Map() };
+      const ids = (items: ReadonlyArray<{ readonly id: string }>) => items.map((item) => item.id);
+
+      expect(normalizeThreadProjection(projection, true).hasOlderHistory).toBe(true);
+      // Inside the live window, older window rows are served without a fetch.
+      const inWindow = yield* serveThreadHistory(state, "history-210", fetchPage);
+      expect(ids(inWindow.items)).toEqual(ids(range(200, 210).map((r) => r.item)));
+      expect(inWindow.hasMore).toBe(true);
+      expect(requested).toEqual([]);
+      // At the window's first row the cursor is followed; a 120-row page is
+      // served as 100 rows with the remaining 20 kept for the next request.
+      const first = yield* serveThreadHistory(state, "history-200", fetchPage);
+      expect(ids(first.items)).toEqual(ids(range(100, 200).map((r) => r.item)));
+      const second = yield* serveThreadHistory(state, "history-100", fetchPage);
+      expect(ids(second.items)).toEqual(ids(range(80, 100).map((r) => r.item)));
+      expect(second.hasMore).toBe(true);
+      const last = yield* serveThreadHistory(state, "history-80", fetchPage);
+      expect(ids(last.items)).toEqual(ids(range(0, 80).map((r) => r.item)));
+      expect(last.hasMore).toBe(false);
+      expect(requested).toEqual(["cursor-a", "cursor-b"]);
+      const unknown = yield* Effect.flip(serveThreadHistory(state, "elsewhere", fetchPage));
+      expect(unknown.code).toBe("history-unavailable");
+    }),
+  );
 
   it("exposes queued messages, context usage, file paths and input questions", () => {
     const queued: OrchestrationV2Run = {
@@ -730,6 +756,27 @@ describe("stdio client bridge", () => {
         ],
       },
     ];
+    const queuedMessage = {
+      id: queued.userMessageId,
+      threadId: v2Projection.thread.id,
+      runId: queued.id,
+      nodeId: null,
+      role: "user" as const,
+      text: "afterwards, update docs",
+      attachments: [],
+      streaming: false,
+      createdAt: v2Now,
+      updatedAt: v2Now,
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+    };
+    const longQueue = normalizeThreadProjection({
+      ...v2Projection,
+      runs: [queued],
+      messages: [{ ...queuedMessage, text: "x".repeat(5_000) }],
+    });
+    expect(longQueue.queued?.[0]).toMatchObject({ truncated: true });
+    expect(longQueue.queued?.[0]?.text).toHaveLength(4_000);
     const normalized = normalizeThreadProjection({
       ...v2Projection,
       runs: [queued],
@@ -772,7 +819,13 @@ describe("stdio client bridge", () => {
       })),
     });
     expect(normalized.queued).toEqual([
-      { runId: "run-queued", position: 1, held: true, text: "afterwards, update docs" },
+      {
+        runId: "run-queued",
+        position: 1,
+        held: true,
+        text: "afterwards, update docs",
+        truncated: false,
+      },
     ]);
     expect(normalized.thread?.tokenUsage).toEqual({ usedTokens: 1200, maxTokens: 4000 });
     expect(normalized.items[0]).toMatchObject({ type: "file_change", path: "src/main.rs" });
