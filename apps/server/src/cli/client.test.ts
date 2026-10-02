@@ -8,6 +8,8 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  CommandId,
+  ProviderInstanceId,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
   type ServerConfig,
@@ -29,10 +31,15 @@ import {
   v2Project,
   v2Projection,
   v2ShellSnapshot,
+  v2ThreadShell,
 } from "../../../../packages/client-runtime/src/state/orchestrationV2TestFixtures.ts";
 import {
   bridgeSocketUrl,
+  decodePassthroughThreadCommand,
+  normalizeArchivedThreads,
   normalizeModelCatalog,
+  normalizeProviderCommands,
+  normalizeThreadHistoryPage,
   normalizeShellSnapshot,
   normalizeThreadProjection,
   reduceThreadProjection,
@@ -159,6 +166,11 @@ describe("stdio client bridge", () => {
               model: "gpt-5.4",
               worktree: "root",
               path: "/workspace/project",
+              branch: null,
+              updatedAt: "2026-06-20T00:00:00.000Z",
+              pinned: false,
+              snoozedUntil: null,
+              unread: false,
               settled: false,
               parentThreadId: null,
               relationshipToParent: null,
@@ -169,6 +181,32 @@ describe("stdio client bridge", () => {
         },
       ],
       truncated: false,
+    });
+  });
+
+  it("exposes pin, snooze, branch and unseen-completion state on shell threads", () => {
+    const later = DateTime.makeUnsafe("2026-06-20T00:00:30.000Z");
+    const normalized = normalizeShellSnapshot(
+      {
+        ...v2ShellSnapshot,
+        threads: [
+          {
+            ...v2ThreadShell,
+            branch: "feature/emacs",
+            pinnedAt: v2Now,
+            snoozedUntil: later,
+            latestRunCompletedAt: later,
+            lastVisitedAt: v2Now,
+          },
+        ],
+      },
+      NOW,
+    );
+    expect(normalized.projects[0]?.threads[0]).toMatchObject({
+      branch: "feature/emacs",
+      pinned: true,
+      snoozedUntil: "2026-06-20T00:00:30.000Z",
+      unread: true,
     });
   });
 
@@ -585,6 +623,250 @@ describe("stdio client bridge", () => {
     ]);
     expect(normalized.pendingRequestCount).toBe(1);
     expect(normalized.truncated).toBe(true);
+  });
+
+  it("pages older history before the loaded window", () => {
+    const base = {
+      threadId: v2Projection.thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed" as const,
+      title: null,
+      startedAt: v2Now,
+      completedAt: v2Now,
+      updatedAt: v2Now,
+    };
+    const visibleTurnItems = Array.from({ length: 250 }, (_, position) => {
+      const id = TurnItemId.make(`history-${String(position)}`);
+      const item: OrchestrationV2TurnItem = {
+        ...base,
+        id,
+        type: "assistant_message",
+        messageId: MessageId.make(`history-message-${String(position)}`),
+        text: `line ${String(position)}`,
+        streaming: false,
+      };
+      return {
+        item,
+        position,
+        visibility: "local" as const,
+        sourceThreadId: item.threadId,
+        sourceItemId: id,
+      };
+    });
+    const projection = { ...v2Projection, visibleTurnItems };
+    const live = normalizeThreadProjection(projection);
+    expect(live.items[0]?.id).toBe("history-150");
+    expect(live.hasOlderHistory).toBe(true);
+    const page = normalizeThreadHistoryPage(projection, "history-150");
+    expect(page.items.map((item) => item.id)).toEqual(
+      Array.from({ length: 100 }, (_, index) => `history-${String(index + 50)}`),
+    );
+    expect(page.hasMore).toBe(true);
+    const last = normalizeThreadHistoryPage(projection, "history-50");
+    expect(last.items).toHaveLength(50);
+    expect(last.hasMore).toBe(false);
+    expect(normalizeThreadProjection(v2Projection).hasOlderHistory).toBe(false);
+    expect(normalizeThreadProjection(v2Projection, true).hasOlderHistory).toBe(true);
+  });
+
+  it("exposes queued messages, context usage, file paths and input questions", () => {
+    const queued: OrchestrationV2Run = {
+      id: RunId.make("run-queued"),
+      threadId: v2Projection.thread.id,
+      ordinal: 2,
+      providerInstanceId: v2Projection.thread.providerInstanceId,
+      modelSelection: v2Projection.thread.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("queued-message"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "queued",
+      queuePosition: 1,
+      queueHeld: true,
+      requestedAt: v2Now,
+      startedAt: null,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    const base = {
+      threadId: v2Projection.thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed" as const,
+      title: null,
+      startedAt: v2Now,
+      completedAt: v2Now,
+      updatedAt: v2Now,
+    };
+    const items: OrchestrationV2TurnItem[] = [
+      { ...base, id: TurnItemId.make("edit"), type: "file_change", fileName: "src/main.rs" },
+      {
+        ...base,
+        id: TurnItemId.make("question"),
+        type: "user_input_request",
+        requestId: RuntimeRequestId.make("input-1"),
+        questions: [
+          {
+            id: "q1",
+            header: "Scope",
+            question: "Which resolver?",
+            options: [
+              { label: "UDP", description: "fast path" },
+              { label: "DoH", description: "fallback", value: "doh " },
+            ],
+          },
+        ],
+      },
+    ];
+    const normalized = normalizeThreadProjection({
+      ...v2Projection,
+      runs: [queued],
+      messages: [
+        {
+          id: queued.userMessageId,
+          threadId: v2Projection.thread.id,
+          runId: queued.id,
+          nodeId: null,
+          role: "user",
+          text: "afterwards, update docs",
+          attachments: [],
+          streaming: false,
+          createdAt: v2Now,
+          updatedAt: v2Now,
+          createdBy: "user",
+          creationSource: "web",
+        },
+      ],
+      providerTurns: [
+        {
+          id: "turn-1" as never,
+          providerThreadId: "provider-thread" as never,
+          nodeId: NodeId.make("node-turn"),
+          runAttemptId: null,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "completed",
+          startedAt: v2Now,
+          completedAt: v2Now,
+          tokenUsage: { usedTokens: 1200, maxTokens: 4000, updatedAt: NOW },
+        },
+      ],
+      visibleTurnItems: items.map((item, position) => ({
+        item,
+        position,
+        visibility: "local" as const,
+        sourceThreadId: item.threadId,
+        sourceItemId: item.id,
+      })),
+    });
+    expect(normalized.queued).toEqual([
+      { runId: "run-queued", position: 1, held: true, text: "afterwards, update docs" },
+    ]);
+    expect(normalized.thread?.tokenUsage).toEqual({ usedTokens: 1200, maxTokens: 4000 });
+    expect(normalized.items[0]).toMatchObject({ type: "file_change", path: "src/main.rs" });
+    expect(normalized.items[1]?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Scope",
+        question: "Which resolver?",
+        multiSelect: false,
+        allowCustomAnswer: true,
+        options: [
+          { label: "UDP", description: "fast path", value: "UDP" },
+          { label: "DoH", description: "fallback", value: "doh " },
+        ],
+      },
+    ]);
+  });
+
+  it.effect("passes through only allowlisted thread commands", () =>
+    Effect.gen(function* () {
+      const commandId = CommandId.make("command-1");
+      const threadId = v2Projection.thread.id;
+      const pin = yield* decodePassthroughThreadCommand({
+        type: "thread.pin",
+        commandId,
+        threadId,
+      });
+      expect(pin.type).toBe("thread.pin");
+      const rename = yield* decodePassthroughThreadCommand({
+        type: "thread.metadata.update",
+        commandId,
+        threadId,
+        title: "Renamed",
+      });
+      expect(rename.type).toBe("thread.metadata.update");
+      const rebind = yield* Effect.flip(
+        decodePassthroughThreadCommand({
+          type: "thread.metadata.update",
+          commandId,
+          threadId,
+          worktreePath: "/elsewhere",
+        }),
+      );
+      expect(rebind.code).toBe("unsupported-command");
+      const interrupt = yield* Effect.flip(
+        decodePassthroughThreadCommand({
+          type: "run.interrupt",
+          commandId,
+          threadId,
+          runId: RunId.make("run-1"),
+        }),
+      );
+      expect(interrupt.code).toBe("unsupported-command");
+      const malformed = yield* Effect.flip(decodePassthroughThreadCommand({ type: "thread.pin" }));
+      expect(malformed.code).toBe("invalid-input");
+    }),
+  );
+
+  it("normalizes provider commands and archived threads", () => {
+    const instanceId = ProviderInstanceId.make("codex");
+    const commands = normalizeProviderCommands(
+      [
+        {
+          instanceId,
+          slashCommands: [{ name: "review", description: "Review changes" }],
+          skills: [
+            { name: "deploy", description: "Ship it", path: "/s", enabled: true },
+            { name: "off", path: "/o", enabled: false },
+          ],
+        },
+      ] as unknown as ServerConfig["providers"],
+      "codex",
+    );
+    expect(commands).toEqual({
+      slashCommands: [{ name: "review", description: "Review changes" }],
+      skills: [{ name: "deploy", description: "Ship it", userInvocationOnly: false }],
+    });
+    const archived = normalizeArchivedThreads({
+      schemaVersion: 1,
+      snapshotSequence: 0,
+      projects: [v2Project],
+      threads: [{ ...v2ThreadShell, archivedAt: v2Now }],
+    });
+    expect(archived.threads).toEqual([
+      {
+        id: "thread-v2",
+        title: "Thread",
+        projectId: "project-v2",
+        projectName: "Project",
+        provider: "codex",
+        model: "gpt-5.4",
+        updatedAt: "2026-06-20T00:00:00.000Z",
+      },
+    ]);
   });
 
   it("resumes thread updates after the bounded snapshot sequence", () => {

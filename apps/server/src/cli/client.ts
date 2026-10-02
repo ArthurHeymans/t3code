@@ -31,11 +31,18 @@ import {
   ModelSelection,
   NonNegativeInt,
   ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2Command,
+  OrchestrationV2ThreadLaunchWorkspaceStrategy,
+  ProjectId,
   ProviderApprovalDecision,
+  RunId,
+  TrimmedNonEmptyString,
+  WS_METHODS,
   ProviderInteractionMode,
   RuntimeMode,
   RuntimeRequestId,
   ThreadId,
+  type OrchestrationV2ArchivedShellSnapshot,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ThreadProjection,
@@ -132,6 +139,89 @@ const ThreadSnoozeInput = Schema.Struct({
   snoozedUntil: Schema.NullOr(IsoDateTime),
 });
 
+const ThreadCreateInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  text: TrimmedNonEmptyString,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+});
+const ThreadForkInput = Schema.Struct({
+  ...ThreadMutationBase,
+  // Client-supplied like commandId, so an ambiguous retry cannot fork twice.
+  targetThreadId: ThreadId,
+  runId: Schema.NullOr(RunId),
+  title: Schema.optional(TrimmedNonEmptyString),
+});
+const ThreadCommandInput = Schema.Struct({ command: Schema.Unknown });
+const ThreadHistoryInput = Schema.Struct({
+  threadId: ThreadId,
+  beforeItemId: TrimmedNonEmptyString,
+});
+const ThreadSearchInput = Schema.Struct({
+  query: TrimmedNonEmptyString,
+  limit: Schema.optional(Schema.Int),
+});
+const ProviderCommandsInput = Schema.Struct({ instanceId: Schema.String });
+const ProjectSearchEntriesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  query: Schema.String,
+  limit: Schema.optional(Schema.Int),
+});
+
+/**
+ * Thread commands Emacs may dispatch verbatim. Each is validated against the
+ * version-matched command schema; anything that creates threads, changes
+ * workspaces, or needs bridge-side state keeps a dedicated operation.
+ */
+export const PASSTHROUGH_THREAD_COMMANDS = new Set([
+  "thread.archive",
+  "thread.unarchive",
+  "thread.delete",
+  "thread.pin",
+  "thread.unpin",
+  "thread.visit",
+  "thread.mark-unread",
+  "thread.metadata.update",
+  "queued-run.cancel",
+  "queued-run.edit",
+  "queued-run.reorder",
+  "queued-message.promote-to-steer",
+  "queue.resume",
+  "runtime-request.respond",
+  "thread.user-input.dismiss",
+]);
+
+const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationV2Command);
+
+export const decodePassthroughThreadCommand = (command: unknown) =>
+  decodeOrchestrationCommand(command).pipe(
+    Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+    Effect.filterOrFail(
+      (decoded) =>
+        PASSTHROUGH_THREAD_COMMANDS.has(decoded.type) &&
+        // Metadata updates may rename; branch and worktree rebinding stay private.
+        (decoded.type !== "thread.metadata.update" ||
+          Object.keys(decoded).every((key) =>
+            ["type", "commandId", "threadId", "title", "regenerateTitle"].includes(key),
+          )),
+      (decoded) =>
+        fail("unsupported-command", `Command is not available to clients: ${decoded.type}`),
+    ),
+  );
+
+const invalidInput = (cause: unknown) => fail("invalid-input", safeErrorMessage(cause));
+const decodeThreadCreateInput = Schema.decodeUnknownEffect(ThreadCreateInput);
+const decodeThreadForkInput = Schema.decodeUnknownEffect(ThreadForkInput);
+const decodeThreadCommandInput = Schema.decodeUnknownEffect(ThreadCommandInput);
+const decodeThreadHistoryInput = Schema.decodeUnknownEffect(ThreadHistoryInput);
+const decodeThreadSearchInput = Schema.decodeUnknownEffect(ThreadSearchInput);
+const decodeProviderCommandsInput = Schema.decodeUnknownEffect(ProviderCommandsInput);
+const decodeProjectSearchEntriesInput = Schema.decodeUnknownEffect(ProjectSearchEntriesInput);
+
 const decodeThreadSendInput = Schema.decodeUnknownEffect(ThreadSendInput);
 const decodeThreadInterruptInput = Schema.decodeUnknownEffect(ThreadInterruptInput);
 const decodeThreadApprovalInput = Schema.decodeUnknownEffect(ThreadApprovalInput);
@@ -209,6 +299,11 @@ interface NormalizedShellThread {
   readonly model: string;
   readonly worktree: string;
   readonly path: string;
+  readonly branch: string | null;
+  readonly updatedAt: string;
+  readonly pinned: boolean;
+  readonly snoozedUntil: string | null;
+  readonly unread: boolean;
   readonly settled: boolean;
   readonly parentThreadId: string | null;
   readonly relationshipToParent: "fork" | "subagent" | null;
@@ -309,11 +404,36 @@ interface NormalizedThreadItem {
   readonly runStatus: string | null;
   readonly runOrdinal: number | null;
   readonly presentation: "message" | "work";
+  /** File path for file changes, so renderers can visit it. */
+  readonly path?: string;
+  /** Structured questions for pending user-input requests. */
+  readonly questions?: ReadonlyArray<NormalizedUserInputQuestion>;
+}
+
+interface NormalizedUserInputQuestion {
+  readonly id: string;
+  readonly header: string;
+  readonly question: string;
+  readonly multiSelect: boolean;
+  readonly allowCustomAnswer: boolean;
+  readonly options: ReadonlyArray<{
+    readonly label: string;
+    readonly description: string;
+    readonly value: string;
+  }>;
+}
+
+interface NormalizedQueuedRun {
+  readonly runId: string;
+  readonly position: number | null;
+  readonly held: boolean;
+  readonly text: string;
 }
 
 interface NormalizedThreadPayload {
   readonly thread: {
     readonly id: string;
+    readonly projectId: string;
     readonly title: string;
     readonly status: string;
     readonly provider: string;
@@ -324,13 +444,18 @@ interface NormalizedThreadPayload {
     readonly hasStartedSession: boolean;
     readonly worktree: string;
     readonly worktreePath: string | null;
+    readonly branch: string | null;
     readonly runtimeMode: string;
     readonly interactionMode: string;
     readonly activeRunId: string | null;
+    readonly tokenUsage: { readonly usedTokens: number; readonly maxTokens: number | null } | null;
   } | null;
   readonly items: ReadonlyArray<NormalizedThreadItem>;
   readonly attention?: ReadonlyArray<NormalizedThreadItem>;
   readonly pendingRequestCount?: number;
+  readonly queued?: ReadonlyArray<NormalizedQueuedRun>;
+  /** Older items exist; load them with `thread.history` before the first item. */
+  hasOlderHistory?: boolean;
   truncated: boolean;
   readonly deleted?: boolean;
   readonly error?: string;
@@ -649,6 +774,16 @@ const threadIsSettled = (
     },
   );
 
+// Mirrors the web sidebar: a completion is unseen only once the server tracks
+// visits and the latest run finished after the last one.
+const hasUnseenCompletion = (thread: OrchestrationV2ShellSnapshot["threads"][number]): boolean =>
+  thread.latestRunCompletedAt !== null &&
+  thread.latestRunCompletedAt !== undefined &&
+  thread.lastVisitedAt !== null &&
+  thread.lastVisitedAt !== undefined &&
+  DateTime.toEpochMillis(thread.latestRunCompletedAt) >
+    DateTime.toEpochMillis(thread.lastVisitedAt);
+
 const shellThreadHasProjection = (
   thread: OrchestrationV2ShellSnapshot["threads"][number],
 ): boolean =>
@@ -718,6 +853,11 @@ export const normalizeShellSnapshot = (
           model: singleLine(thread.modelSelection.model),
           worktree: singleLine(thread.worktreePath ?? "root"),
           path: singleLine(thread.worktreePath ?? project.workspaceRoot, 2_000),
+          branch: thread.branch === null ? null : singleLine(thread.branch),
+          updatedAt: DateTime.formatIso(thread.updatedAt),
+          pinned: thread.pinnedAt !== null && thread.pinnedAt !== undefined,
+          snoozedUntil: optionalIso(thread.snoozedUntil),
+          unread: hasUnseenCompletion(thread),
           settled,
           parentThreadId: thread.lineage.parentThreadId,
           relationshipToParent: thread.lineage.relationshipToParent,
@@ -828,16 +968,33 @@ const normalizeTurnItem = (item: OrchestrationV2TurnItem): NormalizedThreadItem 
           item.questions.map((question) => `${question.header}: ${question.question}`).join("\n"),
         ),
         actionId: item.requestId,
+        questions: item.questions.slice(0, 16).map((question) => ({
+          // Answers are keyed by this ID, so it must round-trip unchanged.
+          id: question.id,
+          header: singleLine(question.header),
+          question: bodyText(question.question, 2_000),
+          multiSelect: question.multiSelect === true,
+          allowCustomAnswer: question.allowCustomAnswer !== false,
+          options: question.options.slice(0, 32).map((option) => ({
+            label: singleLine(option.label),
+            description: singleLine(option.description),
+            // Provider option values must round-trip unchanged.
+            value: option.value ?? option.label,
+          })),
+        })),
       };
     case "file_change":
-      return base(
-        "File change",
-        item.fileName,
-        item.diffStr ??
-          (item.oldStr !== undefined || item.newStr !== undefined
-            ? `--- before\n${item.oldStr ?? ""}\n+++ after\n${item.newStr ?? ""}`
-            : null),
-      );
+      return {
+        ...base(
+          "File change",
+          item.fileName,
+          item.diffStr ??
+            (item.oldStr !== undefined || item.newStr !== undefined
+              ? `--- before\n${item.oldStr ?? ""}\n+++ after\n${item.newStr ?? ""}`
+              : null),
+        ),
+        path: singleLine(item.fileName, 2_000),
+      };
     case "command_execution":
       return base("Command", item.input, item.output ?? null);
     case "file_search":
@@ -914,14 +1071,10 @@ const normalizeProjectionStatus = (projection: OrchestrationV2ThreadProjection):
   return "idle";
 };
 
-export const normalizeThreadProjection = (
-  projection: OrchestrationV2ThreadProjection,
-): NormalizedThreadPayload => {
-  const visible = projection.visibleTurnItems.slice(-MAX_THREAD_ITEMS);
+// Run metadata comes from the projection's complete control-plane arrays, so
+// the same normalizer serves the live window and older history pages.
+const threadItemNormalizer = (projection: OrchestrationV2ThreadProjection) => {
   const runs = new Map(projection.runs.map((run) => [run.id, run]));
-  const activeRun = projection.runs.findLast((run) =>
-    ["preparing", "starting", "running", "waiting"].includes(run.status),
-  );
   const userRuns = new Map(projection.runs.map((run) => [run.userMessageId, run]));
   // Match the web's last-assistant-per-run presentation, but only fold
   // commentary after completion. Active assistant output remains readable.
@@ -931,7 +1084,7 @@ export const normalizeThreadProjection = (
       lastAssistant.set(item.runId, item.id);
     }
   }
-  const normalize = (item: OrchestrationV2TurnItem): NormalizedThreadItem => {
+  return (item: OrchestrationV2TurnItem): NormalizedThreadItem => {
     const run =
       item.runId !== null
         ? runs.get(item.runId)
@@ -954,6 +1107,73 @@ export const normalizeThreadProjection = (
           : "message",
     };
   };
+};
+
+/** Apply the shared text budget newest-first, returning chronological items. */
+const budgetItems = (
+  items: ReadonlyArray<NormalizedThreadItem>,
+): { readonly items: NormalizedThreadItem[]; readonly clipped: boolean } => {
+  let remaining = MAX_THREAD_TEXT_CHARS;
+  let clipped = false;
+  const budgeted = items
+    .toReversed()
+    .map((item) => {
+      const take = (value: string | null): string | null => {
+        if (value === null) return null;
+        const encodedLength = Buffer.byteLength(value, "utf8");
+        const result = clipUtf8Bytes(value, remaining);
+        if (Buffer.byteLength(result, "utf8") < encodedLength) clipped = true;
+        remaining -= Buffer.byteLength(result, "utf8");
+        return result;
+      };
+      return { ...item, detail: take(item.detail), text: take(item.text) };
+    })
+    .toReversed();
+  return { items: budgeted, clipped };
+};
+
+const latestTokenUsage = (projection: OrchestrationV2ThreadProjection) => {
+  const usage = projection.providerTurns
+    .flatMap((turn) => (turn.tokenUsage === undefined ? [] : [turn.tokenUsage]))
+    .reduce<OrchestrationV2ThreadProjection["providerTurns"][number]["tokenUsage"] | null>(
+      (latest, next) =>
+        latest === null || latest === undefined || next.updatedAt > latest.updatedAt
+          ? next
+          : latest,
+      null,
+    );
+  return usage === null || usage === undefined
+    ? null
+    : { usedTokens: usage.usedTokens, maxTokens: usage.maxTokens ?? null };
+};
+
+const queuedRuns = (projection: OrchestrationV2ThreadProjection): NormalizedQueuedRun[] => {
+  const messages = new Map(projection.messages.map((message) => [message.id, message]));
+  return projection.runs
+    .filter((run) => run.status === "queued")
+    .toSorted(
+      (a, b) =>
+        (a.queuePosition ?? Number.MAX_SAFE_INTEGER) -
+          (b.queuePosition ?? Number.MAX_SAFE_INTEGER) || a.ordinal - b.ordinal,
+    )
+    .slice(0, 50)
+    .map((run) => ({
+      runId: singleLine(run.id, 4_000),
+      position: run.queuePosition ?? null,
+      held: run.queueHeld === true,
+      text: clipUtf8Bytes(bodyText(messages.get(run.userMessageId)?.text ?? ""), 4_000),
+    }));
+};
+
+export const normalizeThreadProjection = (
+  projection: OrchestrationV2ThreadProjection,
+  serverHasOlderHistory = false,
+): NormalizedThreadPayload => {
+  const visible = projection.visibleTurnItems.slice(-MAX_THREAD_ITEMS);
+  const activeRun = projection.runs.findLast((run) =>
+    ["preparing", "starting", "running", "waiting"].includes(run.status),
+  );
+  const normalize = threadItemNormalizer(projection);
   const pending = projection.runtimeRequests.filter((request) => request.status === "pending");
   const pendingIds = new Set(pending.map((request) => request.id));
   // Attention is independent of the recent-history window. Keep this list
@@ -974,26 +1194,13 @@ export const normalizeThreadProjection = (
         detail: null,
       };
     });
-  let remaining = MAX_THREAD_TEXT_CHARS;
-  let clipped = projection.visibleTurnItems.length > visible.length;
-  const items = visible
-    .map((row) => normalize(row.item))
-    .toReversed()
-    .map((item) => {
-      const take = (value: string | null): string | null => {
-        if (value === null) return null;
-        const encodedLength = Buffer.byteLength(value, "utf8");
-        const result = clipUtf8Bytes(value, remaining);
-        if (Buffer.byteLength(result, "utf8") < encodedLength) clipped = true;
-        remaining -= Buffer.byteLength(result, "utf8");
-        return result;
-      };
-      return { ...item, detail: take(item.detail), text: take(item.text) };
-    })
-    .toReversed();
-  let payload: NormalizedThreadPayload = {
+  const olderInWindow = projection.visibleTurnItems.length > visible.length;
+  const budgeted = budgetItems(visible.map((row) => normalize(row.item)));
+  const items = budgeted.items;
+  const payload: NormalizedThreadPayload = {
     thread: {
       id: singleLine(projection.thread.id, 4_000),
+      projectId: singleLine(projection.thread.projectId, 4_000),
       title: singleLine(projection.thread.title),
       status: normalizeProjectionStatus(projection),
       provider: singleLine(projection.thread.providerInstanceId),
@@ -1007,20 +1214,93 @@ export const normalizeThreadProjection = (
         projection.thread.worktreePath === null
           ? null
           : singleLine(projection.thread.worktreePath, 2_000),
+      branch: projection.thread.branch === null ? null : singleLine(projection.thread.branch),
       runtimeMode: projection.thread.runtimeMode,
       interactionMode: projection.thread.interactionMode,
       activeRunId: activeRun?.id ?? null,
+      tokenUsage: latestTokenUsage(projection),
     },
     items,
     attention,
     pendingRequestCount: pending.length,
-    truncated: clipped,
+    queued: queuedRuns(projection),
+    hasOlderHistory: olderInWindow || serverHasOlderHistory,
+    truncated: olderInWindow || budgeted.clipped,
   };
   while (Buffer.byteLength(encodeJson(payload), "utf8") > 700_000 && items.length > 0) {
     items.shift();
     payload.truncated = true;
+    payload.hasOlderHistory = true;
   }
   return payload;
+};
+
+/**
+ * Older timeline rows immediately before `beforeItemId`, normalized with the
+ * same bounds as the live window. Items are chronological.
+ */
+export const normalizeThreadHistoryPage = (
+  projection: OrchestrationV2ThreadProjection,
+  beforeItemId: string,
+): { readonly items: NormalizedThreadItem[]; readonly hasMore: boolean } => {
+  const index = projection.visibleTurnItems.findIndex((row) => row.item.id === beforeItemId);
+  const end = index < 0 ? 0 : index;
+  const start = Math.max(0, end - MAX_THREAD_ITEMS);
+  const normalize = threadItemNormalizer(projection);
+  const { items } = budgetItems(
+    projection.visibleTurnItems.slice(start, end).map((row) => normalize(row.item)),
+  );
+  let hasMore = start > 0;
+  while (Buffer.byteLength(encodeJson(items), "utf8") > 700_000 && items.length > 0) {
+    items.shift();
+    hasMore = true;
+  }
+  return { items, hasMore };
+};
+
+export const normalizeArchivedThreads = (snapshot: OrchestrationV2ArchivedShellSnapshot) => {
+  const projects = new Map(snapshot.projects.map((project) => [project.id, project]));
+  return {
+    threads: snapshot.threads
+      .filter((thread) => thread.deletedAt === null)
+      .toSorted((a, b) => DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt))
+      .slice(0, 500)
+      .map((thread) => {
+        const project = projects.get(thread.projectId);
+        return {
+          id: thread.id,
+          title: singleLine(thread.title),
+          projectId: thread.projectId,
+          projectName: singleLine(
+            project?.repositoryIdentity?.displayName ?? project?.title ?? thread.projectId,
+          ),
+          provider: singleLine(thread.providerInstanceId),
+          model: singleLine(thread.modelSelection.model),
+          updatedAt: DateTime.formatIso(thread.updatedAt),
+        };
+      }),
+  };
+};
+
+export const normalizeProviderCommands = (
+  providers: ServerConfig["providers"],
+  instanceId: string,
+) => {
+  const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+  return {
+    slashCommands: (provider?.slashCommands ?? []).slice(0, 200).map((command) => ({
+      name: singleLine(command.name),
+      description: command.description === undefined ? null : singleLine(command.description),
+    })),
+    skills: (provider?.skills ?? [])
+      .filter((skill) => skill.enabled)
+      .slice(0, 200)
+      .map((skill) => ({
+        name: singleLine(skill.name),
+        description: singleLine(skill.shortDescription ?? skill.description ?? ""),
+        userInvocationOnly: skill.userInvocationOnly === true,
+      })),
+  };
 };
 
 const deletedThreadPayload: NormalizedThreadPayload = {
@@ -1040,6 +1320,7 @@ export const threadResumeInput = (threadId: typeof ThreadId.Type, snapshotSequen
 export const reduceThreadProjection = (
   projection: OrchestrationV2ThreadProjection,
   event: OrchestrationV2DomainEvent,
+  serverHasOlderHistory = false,
 ): {
   readonly projection: OrchestrationV2ThreadProjection | null;
   readonly payload: NormalizedThreadPayload | null;
@@ -1050,7 +1331,7 @@ export const reduceThreadProjection = (
   const next = applyOrchestrationV2ProjectionEvent(projection, event);
   return {
     projection: next,
-    payload: next === null ? null : normalizeThreadProjection(next),
+    payload: next === null ? null : normalizeThreadProjection(next, serverHasOlderHistory),
   };
 };
 
@@ -1205,6 +1486,8 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             shellResumeCompletionMarker: current.config.shellResumeCompletionMarker === true,
             threadResumeCompletionMarker: current.config.threadResumeCompletionMarker === true,
             threadSnapshotPagination: current.config.threadSnapshotPagination === true,
+            threadLifecycle: true,
+            composerCompletion: true,
           },
         };
       case "model.catalog":
@@ -1357,6 +1640,102 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
                 snoozedUntil: input.snoozedUntil,
               },
         );
+      }
+      case "thread.create": {
+        const input = yield* decodeThreadCreateInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const launch = current.session.client[ORCHESTRATION_V2_WS_METHODS.launchThread];
+        const result = yield* launch({
+          commandId: input.commandId,
+          creationSource: "server",
+          projectId: input.projectId,
+          title: input.title ?? singleLine(input.text, 80),
+          generateTitle: input.title === undefined,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          workspaceStrategy: input.workspaceStrategy,
+          initialMessage: { text: input.text, attachments: [] },
+        });
+        return { threadId: result.threadId };
+      }
+      case "thread.fork": {
+        const input = yield* decodeThreadForkInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        yield* dispatch({
+          type: "thread.fork",
+          commandId: input.commandId,
+          createdBy: "user",
+          creationSource: "server",
+          sourceThreadId: input.threadId,
+          targetThreadId: input.targetThreadId,
+          sourcePoint:
+            input.runId === null ? { type: "latest_stable" } : { type: "run", runId: input.runId },
+          ...(input.title === undefined ? {} : { title: input.title }),
+        });
+        return { threadId: input.targetThreadId };
+      }
+      case "thread.command": {
+        const input = yield* decodeThreadCommandInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        return yield* dispatch(yield* decodePassthroughThreadCommand(input.command));
+      }
+      case "thread.history": {
+        const input = yield* decodeThreadHistoryInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const projection = yield* current.session.client[
+          ORCHESTRATION_V2_WS_METHODS.getThreadProjection
+        ]({ threadId: input.threadId });
+        return normalizeThreadHistoryPage(projection, input.beforeItemId);
+      }
+      case "thread.search": {
+        const input = yield* decodeThreadSearchInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const result = yield* current.session.client[ORCHESTRATION_V2_WS_METHODS.searchThreads]({
+          query: input.query,
+          limit: Math.min(50, Math.max(1, input.limit ?? 30)),
+        });
+        return {
+          matches: result.matches.map((match) => ({
+            threadId: match.threadId,
+            projectId: match.projectId,
+            source: match.source,
+            snippet: singleLine(match.snippet),
+          })),
+        };
+      }
+      case "threads.archived": {
+        const snapshot = yield* current.session.client[
+          ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot
+        ]({});
+        return normalizeArchivedThreads(snapshot);
+      }
+      case "provider.commands": {
+        const input = yield* decodeProviderCommandsInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        return normalizeProviderCommands(current.config.providers, input.instanceId);
+      }
+      case "project.searchEntries": {
+        const input = yield* decodeProjectSearchEntriesInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const result = yield* current.session.client[WS_METHODS.projectsSearchEntries]({
+          cwd: input.cwd,
+          query: input.query.trim().slice(0, 256),
+          limit: Math.min(200, Math.max(1, input.limit ?? 50)),
+        });
+        return {
+          entries: result.entries
+            .slice(0, 200)
+            .map((entry) => ({ path: singleLine(entry.path, 2_000), kind: entry.kind })),
+          truncated: result.truncated,
+        };
       }
       default:
         return yield* fail("unsupported-operation", `Unsupported operation: ${message.operation}`);
@@ -1539,13 +1918,16 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         ),
       );
       let latest: OrchestrationV2ThreadProjection | null = snapshot.projection;
+      // The bounded window's server-side history marker persists while live
+      // events extend the window; only a new snapshot replaces it.
+      let serverHasOlderHistory = snapshot.hasMoreHistory === true;
       outputSequence += 1;
       yield* writeRecord({
         kind: "snapshot",
         subscriptionId: message.subscriptionId,
         generation: current.generation,
         sequence: outputSequence,
-        payload: normalizeThreadProjection(snapshot.projection),
+        payload: normalizeThreadProjection(snapshot.projection, serverHasOlderHistory),
       });
       yield* method(threadResumeInput(threadId, snapshot.snapshotSequence)).pipe(
         Stream.runForEach((item: OrchestrationV2ThreadStreamItem) =>
@@ -1562,18 +1944,19 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             }
             if (item.kind === "snapshot") {
               latest = item.projection;
+              serverHasOlderHistory = item.hasMoreHistory === true;
               outputSequence += 1;
               yield* writeRecord({
                 kind: "snapshot",
                 subscriptionId: message.subscriptionId,
                 generation: current.generation,
                 sequence: outputSequence,
-                payload: normalizeThreadProjection(latest),
+                payload: normalizeThreadProjection(latest, serverHasOlderHistory),
               });
               return;
             }
-            if (latest === null) return;
-            const reduced = reduceThreadProjection(latest, item.event);
+            if (item.kind !== "event" || latest === null) return;
+            const reduced = reduceThreadProjection(latest, item.event, serverHasOlderHistory);
             if (reduced.payload === null) return;
             latest = reduced.projection;
             outputSequence += 1;
@@ -1641,6 +2024,8 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             mutations: true,
             threadSections: true,
             modelSelection: true,
+            threadLifecycle: true,
+            composerCompletion: true,
             terminal: false,
             serverEnvironmentId: connected.config.environment.environmentId,
           },
