@@ -112,7 +112,8 @@ bookmark. For feature work, create a feature bookmark; committing on the default
 requires an explicit choice. If trunk bookmarks the working-copy change itself, separate
 that change in JJ before creating a feature bookmark.
 
-**Fetch** imports remote bookmarks without rebasing or resetting your working copy.
+**Fetch** imports remote bookmarks using native JJ behavior. T3 Code performs no separate
+rebase or reset, but JJ can move an empty working copy when a remote bookmark is deleted.
 Use JJ to resolve divergent bookmarks or update a stale workspace (`jj workspace update-stale`).
 New workspaces start from stable bookmark history rather than another workspace's pending edits.
 JJ's file-tracking rules and size limits still apply; use `jj file track` for files that are not auto-tracked.

@@ -16,6 +16,7 @@ import type {
 } from "@t3tools/contracts";
 import { CheckpointRef } from "@t3tools/contracts";
 import * as VcsProcess from "./VcsProcess.ts";
+import type { VcsWorkflow } from "./VcsWorkflow.ts";
 
 export interface VcsCaptureCheckpointInput {
   readonly cwd: string;
@@ -62,6 +63,7 @@ export interface VcsDriverShape {
     input: Omit<VcsProcess.VcsProcessInput, "command">,
   ) => Effect.Effect<VcsProcess.VcsProcessOutput, VcsError>;
   readonly checkpoints?: VcsCheckpointOps;
+  readonly workflow?: VcsWorkflow;
   readonly detectRepository: (cwd: string) => Effect.Effect<VcsRepositoryIdentity | null, VcsError>;
   readonly isInsideWorkTree: (cwd: string) => Effect.Effect<boolean, VcsError>;
   readonly listWorkspaceFiles: (

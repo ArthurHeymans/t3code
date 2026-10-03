@@ -38,6 +38,8 @@ import {
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
+import * as GitWorkflow from "./GitWorkflow.ts";
+import * as ServerConfig from "../config.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
 export interface ExecuteGitInput {
@@ -88,6 +90,7 @@ export interface GitLocalStatusOptions {
 }
 
 export interface GitRemoteStatusDetails {
+  publication?: { readonly name: string; readonly remoteName: string; readonly remoteRef: string };
   isRepo: boolean;
   defaultBranch: string | null;
   isDefaultBranch: boolean;
@@ -1272,10 +1275,19 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     ),
   };
 
+  const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+  const workflow = Option.isSome(config)
+    ? GitWorkflow.make(
+        yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ServerConfig.ServerConfig, config.value),
+        ),
+      )
+    : undefined;
   return {
     capabilities,
     execute,
     checkpoints,
+    ...(workflow ? { workflow } : {}),
     detectRepository,
     isInsideWorkTree,
     listWorkspaceFiles,

@@ -29,7 +29,7 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as Option from "effect/Option";
 import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
-import * as JjGitWorkflowAdapter from "../vcs/JjGitWorkflowAdapter.ts";
+import * as JjWorkflow from "../vcs/JjWorkflow.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
 
@@ -458,9 +458,11 @@ export const make = Effect.gen(function* () {
             branch: status.refName ?? "@",
             status: "remote_added" as const,
           };
-        const pushed = yield* JjGitWorkflowAdapter.make(jj, git, () =>
-          Effect.succeed(true),
-        ).pushCurrentBranch(input.cwd, status.refName, { remoteName });
+        const pushed = yield* (jj.workflow ?? JjWorkflow.make(jj)).publish(
+          input.cwd,
+          status.refName,
+          { remoteName },
+        );
         return {
           repository: toRepositoryInfo(providerKind, urls),
           remoteName,

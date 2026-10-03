@@ -32,6 +32,8 @@ import {
 } from "@t3tools/contracts";
 
 import * as VcsDriver from "./VcsDriver.ts";
+import * as JjWorkflow from "./JjWorkflow.ts";
+import * as ServerConfig from "../config.ts";
 import { nowFreshness } from "./VcsFreshness.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 import { parseTurnDiffFilesFromNumstat } from "../checkpointing/Diffs.ts";
@@ -1589,19 +1591,17 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
   )(function* (input) {
     const requestedPath = path.normalize(path.resolve(input.cwd, input.path));
     if (
-      !(yield* fileSystem
-        .exists(requestedPath)
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new VcsRepositoryDetectionError({
-                cwd: input.cwd,
-                operation: "JjVcsDriver.removeWorktree",
-                detail: "Could not inspect the workspace path.",
-                cause,
-              }),
-          ),
-        ))
+      !(yield* fileSystem.exists(requestedPath).pipe(
+        Effect.mapError(
+          (cause) =>
+            new VcsRepositoryDetectionError({
+              cwd: input.cwd,
+              operation: "JjVcsDriver.removeWorktree",
+              detail: "Could not inspect the workspace path.",
+              cause,
+            }),
+        ),
+      ))
     )
       return;
     const workspace = (yield* listWorkspaces(input.cwd)).find(
@@ -1675,19 +1675,17 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
     );
     // Detach metadata before deletion so status refreshes cannot snapshot a
     // half-deleted tree. Keep registration and metadata if deletion fails.
-    yield* fileSystem
-      .rename(path.join(requestedPath, ".jj"), detachedMetadata)
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new VcsRepositoryDetectionError({
-              cwd: input.cwd,
-              operation: "JjVcsDriver.removeWorktree",
-              detail: "Could not detach workspace metadata before removal.",
-              cause,
-            }),
-        ),
-      );
+    yield* fileSystem.rename(path.join(requestedPath, ".jj"), detachedMetadata).pipe(
+      Effect.mapError(
+        (cause) =>
+          new VcsRepositoryDetectionError({
+            cwd: input.cwd,
+            operation: "JjVcsDriver.removeWorktree",
+            detail: "Could not detach workspace metadata before removal.",
+            cause,
+          }),
+      ),
+    );
     yield* fileSystem.remove(requestedPath, { recursive: true, force: input.force === true }).pipe(
       Effect.mapError(
         (cause) =>
@@ -1708,19 +1706,17 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
       ["workspace", "forget", "--ignore-working-copy", "--", workspace.name],
       { timeoutMs: 10_000 },
     );
-    yield* fileSystem
-      .remove(detachedMetadata, { recursive: true })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new VcsRepositoryDetectionError({
-              cwd: input.cwd,
-              operation: "JjVcsDriver.removeWorktree",
-              detail: "Workspace removed, but detached metadata could not be cleaned up.",
-              cause,
-            }),
-        ),
-      );
+    yield* fileSystem.remove(detachedMetadata, { recursive: true }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new VcsRepositoryDetectionError({
+            cwd: input.cwd,
+            operation: "JjVcsDriver.removeWorktree",
+            detail: "Workspace removed, but detached metadata could not be cleaned up.",
+            cause,
+          }),
+      ),
+    );
   });
 
   const renameBookmark: JjVcsDriverShape["renameBookmark"] = Effect.fn(
@@ -1848,7 +1844,7 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
       : relativePaths.filter((relativePath) => !ignoredPaths.has(relativePath));
   });
 
-  return {
+  const driver = {
     capabilities,
     execute,
     checkpoints,
@@ -1878,6 +1874,12 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
     hasUntrackedFiles,
     validateWorktreePath,
   } satisfies JjVcsDriverShape;
+  const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+  const defaultWorkspacePath = Option.isSome(config)
+    ? (cwd: string, refName: string) =>
+        path.join(config.value.worktreesDir, path.basename(cwd), refName.replaceAll("/", "-"))
+    : undefined;
+  return { ...driver, workflow: JjWorkflow.make(driver, defaultWorkspacePath) };
 });
 
 export const makeJjVcsDriver = Effect.fn("makeJjVcsDriver")(function* () {

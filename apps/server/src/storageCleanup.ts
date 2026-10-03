@@ -30,7 +30,8 @@ import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as GitWorkflow from "./git/GitWorkflowService.ts";
 import * as JjVcsDriver from "./vcs/JjVcsDriver.ts";
-import * as JjGitWorkflowAdapter from "./vcs/JjGitWorkflowAdapter.ts";
+import * as GitNativeWorkflow from "./vcs/GitWorkflow.ts";
+import * as JjWorkflow from "./vcs/JjWorkflow.ts";
 import { jjCommit } from "./vcs/jjExpressions.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -266,8 +267,8 @@ export const make = Effect.gen(function* () {
           : path.join(worktreePath, ".git");
         if (!(yield* fs.exists(marker)) || (yield* fs.stat(marker)).type !== "File") return;
         const core = native
-          ? JjGitWorkflowAdapter.make(native, git, () => Effect.succeed(true))
-          : git;
+          ? (native.workflow ?? JjWorkflow.make(native))
+          : GitNativeWorkflow.make(git);
         const head = native
           ? (yield* native.currentChange(worktreePath))?.commitId
           : (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha;
@@ -303,8 +304,8 @@ export const make = Effect.gen(function* () {
         let eligible = deleted || old;
         if (!eligible && (settings.worktreeUnchanged || settings.worktreeOnMerge)) {
           const repositoryCwd = path.resolve(project.workspaceRoot);
-          const remote = yield* core.resolvePrimaryRemoteName(repositoryCwd);
-          const branch = yield* core.resolveDefaultBranchName(repositoryCwd, remote);
+          const remote = yield* core.primaryRemote(repositoryCwd);
+          const branch = yield* core.defaultRef(repositoryCwd, remote);
           if (branch === null) return;
           const defaultRef = `refs/remotes/${remote}/${branch}`;
           const refreshed = refreshedDefaultRefs.get(repositoryCwd) ?? new Set<string>();

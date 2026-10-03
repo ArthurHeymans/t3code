@@ -5,6 +5,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import { VcsRepositoryDetectionError } from "@t3tools/contracts";
+import { mergeGitStatusParts } from "@t3tools/shared/git";
+import * as JjWorkflow from "../vcs/JjWorkflow.ts";
 
 import * as GitManager from "./GitManager.ts";
 import * as GitWorkflowService from "./GitWorkflowService.ts";
@@ -87,14 +89,28 @@ describe("GitWorkflowService", () => {
     );
     const layer = GitWorkflowService.layer.pipe(
       Layer.provide(
-        Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
-          resolve: () =>
-            Effect.succeed({
-              kind: "jj",
+        Layer.effect(
+          VcsDriverRegistry.VcsDriverRegistry,
+          Effect.gen(function* () {
+            const jj = yield* JjVcsDriver.JjVcsDriver;
+            const handle = {
+              kind: "jj" as const,
               repository: {} as VcsDriverRegistry.VcsDriverHandle["repository"],
-              driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
-            }),
-        }),
+              driver: {
+                ...jj,
+                workflow: JjWorkflow.make(
+                  jj,
+                  (_cwd, name) => `/worktrees/repo/${name.replaceAll("/", "-")}`,
+                ),
+              },
+            };
+            return VcsDriverRegistry.VcsDriverRegistry.of({
+              resolve: () => Effect.succeed(handle),
+              detect: () => Effect.succeed(handle),
+              get: () => Effect.succeed(jj),
+            });
+          }),
+        ),
       ),
       Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
       Layer.provide(
@@ -162,7 +178,11 @@ describe("GitWorkflowService", () => {
         }),
       ),
       Layer.provide(
-        Layer.mock(GitManager.GitManager)({ remoteStatus: () => Effect.succeed(null) }),
+        Layer.mock(GitManager.GitManager)({
+          localStatus,
+          status: () => localStatus().pipe(Effect.map((local) => mergeGitStatusParts(local, null))),
+          remoteStatus: () => Effect.succeed(null),
+        }),
       ),
       Layer.provide(ServerConfigTestLayer),
     );

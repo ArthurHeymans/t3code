@@ -1686,6 +1686,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       isDefaultBranch,
       branch,
       upstreamRef,
+      ...(branch && upstream
+        ? {
+            publication: {
+              name: branch,
+              remoteName: upstream.remoteName,
+              remoteRef: upstream.branchName,
+            },
+          }
+        : {}),
       hasUpstream: upstreamRef !== null,
       aheadCount,
       behindCount,
