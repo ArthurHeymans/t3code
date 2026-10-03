@@ -38,8 +38,6 @@ import {
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
-import * as GitWorkflow from "./GitWorkflow.ts";
-import * as ServerConfig from "../config.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
 export interface ExecuteGitInput {
@@ -172,11 +170,6 @@ export interface GitCommitProgress {
 }
 
 export interface GitCommitOptions {
-  /** JJ splits these paths; Git has already staged them in prepareCommitContext. */
-  readonly filePaths?: readonly string[];
-  readonly refName?: string | null;
-  /** Explicitly requested the existing default bookmark rather than a feature. */
-  readonly allowDefaultRef?: boolean;
   readonly timeoutMs?: number;
   readonly progress?: GitCommitProgress;
 }
@@ -1275,19 +1268,10 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     ),
   };
 
-  const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
-  const workflow = Option.isSome(config)
-    ? GitWorkflow.make(
-        yield* makeGitVcsDriverCore().pipe(
-          Effect.provideService(ServerConfig.ServerConfig, config.value),
-        ),
-      )
-    : undefined;
   return {
     capabilities,
     execute,
     checkpoints,
-    ...(workflow ? { workflow } : {}),
     detectRepository,
     isInsideWorkTree,
     listWorkspaceFiles,

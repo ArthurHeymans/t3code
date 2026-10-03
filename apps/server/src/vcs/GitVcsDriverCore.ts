@@ -828,7 +828,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const { worktreesDir } = yield* ServerConfig.ServerConfig;
+  const config = Option.getOrNull(yield* Effect.serviceOption(ServerConfig.ServerConfig));
   const crypto = yield* Crypto.Crypto;
 
   const executeRaw: GitVcsDriver.GitVcsDriver["Service"]["execute"] = Effect.fnUntraced(
@@ -3088,7 +3088,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const targetBranch = input.newRefName ?? input.refName;
     const sanitizedBranch = targetBranch.replace(/\//g, "-");
     const repoName = path.basename(input.cwd);
-    const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
+    const worktreePath =
+      input.path ?? (config ? path.join(config.worktreesDir, repoName, sanitizedBranch) : null);
+    if (!worktreePath)
+      return yield* new GitCommandError({
+        cwd: input.cwd,
+        operation: "GitVcsDriver.createWorktree",
+        command: "git worktree add",
+        detail: "Specify a path for the new workspace.",
+      });
     const args = input.newRefName
       ? ["worktree", "add", "-b", input.newRefName, worktreePath, input.refName]
       : ["worktree", "add", worktreePath, input.refName];

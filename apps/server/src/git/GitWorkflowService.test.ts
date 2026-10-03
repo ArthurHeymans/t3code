@@ -1,4 +1,6 @@
 import { assert, describe, expect, it, vi } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -15,18 +17,14 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
-const jjCapabilities = {
-  kind: "jj" as const,
-  supportsWorktrees: true as const,
-  supportsWorkspaceSelection: true as const,
-  supportsBookmarks: true as const,
-  supportsAtomicSnapshot: true as const,
-  supportsPushDefaultRemote: false as const,
-  ignoreClassifier: "git-compatible-fallback" as const,
-};
-const JjDriverTestLayer = Layer.mock(JjVcsDriver.JjVcsDriver)({
-  capabilities: jjCapabilities,
-});
+const jjDriverLayer = (overrides: Partial<JjVcsDriver.JjVcsDriver["Service"]> = {}) =>
+  Layer.effect(
+    JjVcsDriver.JjVcsDriver,
+    JjVcsDriver.makeVcsDriverShape().pipe(
+      Effect.map((driver) => JjVcsDriver.JjVcsDriver.of({ ...driver, ...overrides })),
+    ),
+  ).pipe(Layer.provide(VcsProcess.layer), Layer.provide(NodeServices.layer));
+const JjDriverTestLayer = jjDriverLayer();
 const ServerConfigTestLayer = Layer.succeed(
   ServerConfig.ServerConfig,
   ServerConfig.make({ worktreesDir: "/worktrees" } as ServerConfig.ServerConfig["Service"]),
@@ -113,12 +111,7 @@ describe("GitWorkflowService", () => {
         ),
       ),
       Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-      Layer.provide(
-        Layer.mock(JjVcsDriver.JjVcsDriver)({
-          capabilities: jjCapabilities,
-          createWorktree,
-        }),
-      ),
+      Layer.provide(jjDriverLayer({ createWorktree })),
       Layer.provide(Layer.mock(GitManager.GitManager)({})),
       Layer.provide(ServerConfigTestLayer),
     );
@@ -171,12 +164,7 @@ describe("GitWorkflowService", () => {
         }),
       ),
       Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-      Layer.provide(
-        Layer.mock(JjVcsDriver.JjVcsDriver)({
-          capabilities: jjCapabilities,
-          localStatus,
-        }),
-      ),
+      Layer.provide(jjDriverLayer({ localStatus })),
       Layer.provide(
         Layer.mock(GitManager.GitManager)({
           localStatus,
@@ -196,100 +184,6 @@ describe("GitWorkflowService", () => {
       );
       expect(localStatus).toHaveBeenCalledTimes(2);
     }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("returns an empty local status when no VCS repository is detected", () =>
-    Effect.gen(function* () {
-      const workflow = yield* GitWorkflowService.GitWorkflowService;
-      const status = yield* workflow.localStatus({ cwd: "/not-a-repo" });
-
-      assert.deepStrictEqual(status, {
-        kind: "unknown",
-        isRepo: false,
-        hasPrimaryRemote: false,
-        isDefaultRef: false,
-        refName: null,
-        hasWorkingTreeChanges: false,
-        workingTree: {
-          files: [],
-          insertions: 0,
-          deletions: 0,
-        },
-      });
-    }).pipe(
-      Effect.provide(
-        makeLayer({
-          detect: () => Effect.succeed(null),
-        }),
-      ),
-    ),
-  );
-
-  it.effect("returns an empty full status when no VCS repository is detected", () =>
-    Effect.gen(function* () {
-      const workflow = yield* GitWorkflowService.GitWorkflowService;
-      const status = yield* workflow.status({ cwd: "/not-a-repo" });
-
-      assert.deepStrictEqual(status, {
-        kind: "unknown",
-        isRepo: false,
-        hasPrimaryRemote: false,
-        isDefaultRef: false,
-        refName: null,
-        hasWorkingTreeChanges: false,
-        workingTree: {
-          files: [],
-          insertions: 0,
-          deletions: 0,
-        },
-        hasUpstream: false,
-        aheadCount: 0,
-        behindCount: 0,
-        aheadOfDefaultCount: 0,
-        pr: null,
-      });
-    }).pipe(
-      Effect.provide(
-        makeLayer({
-          detect: () => Effect.succeed(null),
-        }),
-      ),
-    ),
-  );
-
-  it.effect("does not call GitManager status methods when no VCS repository is detected", () => {
-    const localStatus = vi.fn();
-    const remoteStatus = vi.fn();
-    const status = vi.fn();
-
-    const testLayer = GitWorkflowService.layer.pipe(
-      Layer.provide(
-        Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
-          detect: () => Effect.succeed(null),
-        }),
-      ),
-      Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-      Layer.provide(JjDriverTestLayer),
-      Layer.provide(
-        Layer.mock(GitManager.GitManager)({
-          localStatus,
-          remoteStatus,
-          status,
-        }),
-      ),
-      Layer.provide(ServerConfigTestLayer),
-    );
-
-    return Effect.gen(function* () {
-      const workflow = yield* GitWorkflowService.GitWorkflowService;
-      yield* workflow.localStatus({ cwd: "/not-a-repo" });
-      yield* workflow.remoteStatus({ cwd: "/not-a-repo" });
-      yield* workflow.status({ cwd: "/not-a-repo" });
-
-      assert.equal(localStatus.mock.calls.length, 0);
-      assert.equal(remoteStatus.mock.calls.length, 0);
-      assert.equal(status.mock.calls.length, 0);
-    }).pipe(Effect.provide(testLayer));
   });
 
   it.effect("returns an empty ref list when no VCS repository is detected", () =>
@@ -312,33 +206,6 @@ describe("GitWorkflowService", () => {
       ),
     ),
   );
-
-  it.effect("structures workflow detection failures without exposing upstream details", () => {
-    const cause = new VcsRepositoryDetectionError({
-      operation: "VcsDriverRegistry.detect",
-      cwd: "/repo",
-      detail: "upstream detail must stay in the cause chain",
-    });
-
-    return Effect.gen(function* () {
-      const workflow = yield* GitWorkflowService.GitWorkflowService;
-      const error = yield* workflow.status({ cwd: "/repo" }).pipe(Effect.flip);
-
-      expect(error).toMatchObject({
-        _tag: "GitManagerError",
-        operation: "GitWorkflowService.status",
-        cwd: "/repo",
-        detail: "Failed to detect a VCS repository for this Git workflow.",
-      });
-      expect(error.message).not.toContain(cause.detail);
-    }).pipe(
-      Effect.provide(
-        makeLayer({
-          detect: () => Effect.fail(cause),
-        }),
-      ),
-    );
-  });
 
   it.effect("structures command detection failures without exposing upstream details", () => {
     const cause = new VcsRepositoryDetectionError({

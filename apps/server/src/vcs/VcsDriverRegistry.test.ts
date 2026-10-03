@@ -5,8 +5,14 @@ import * as Layer from "effect/Layer";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as VcsProcess from "./VcsProcess.ts";
+import * as GitVcsDriver from "./GitVcsDriver.ts";
 import * as VcsProjectConfig from "./VcsProjectConfig.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
+
+const registryLayer = Layer.effect(
+  VcsDriverRegistry.VcsDriverRegistry,
+  VcsDriverRegistry.make,
+).pipe(Layer.provide(GitVcsDriver.layer));
 
 const processOutput = (stdout: string): VcsProcess.VcsProcessOutput => ({
   exitCode: ChildProcessSpawner.ExitCode(0),
@@ -21,7 +27,7 @@ const normalizeGitArgs = (args: ReadonlyArray<string>): ReadonlyArray<string> =>
 
 describe("VcsDriverRegistry", () => {
   it.effect("routes directly by VCS driver kind for non-repository workflows", () => {
-    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+    const layer = registryLayer.pipe(
       Layer.provide(NodeServices.layer),
       Layer.provide(
         Layer.mock(VcsProjectConfig.VcsProjectConfig)({
@@ -41,13 +47,14 @@ describe("VcsDriverRegistry", () => {
       const jjDriver = yield* registry.get("jj");
 
       assert.strictEqual(gitDriver.capabilities.kind, "git");
+      assert.strictEqual(gitDriver.workflow?.kind, "git");
       assert.strictEqual(jjDriver.capabilities.kind, "jj");
     }).pipe(Effect.provide(layer));
   });
 
   it.effect("caches repository detection for repeated resolves in the same cwd and kind", () => {
     const calls: VcsProcess.VcsProcessInput[] = [];
-    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+    const layer = registryLayer.pipe(
       Layer.provide(NodeServices.layer),
       Layer.provide(
         Layer.mock(VcsProjectConfig.VcsProjectConfig)({
@@ -97,7 +104,7 @@ describe("VcsDriverRegistry", () => {
 
   it.effect("prefers jj auto-detection for colocated repositories", () => {
     const calls: VcsProcess.VcsProcessInput[] = [];
-    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+    const layer = registryLayer.pipe(
       Layer.provide(NodeServices.layer),
       Layer.provide(
         Layer.mock(VcsProjectConfig.VcsProjectConfig)({
@@ -133,7 +140,7 @@ describe("VcsDriverRegistry", () => {
 
   it.effect("detects a repository created after a negative lookup", () => {
     let insideWorkTreeChecks = 0;
-    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+    const layer = registryLayer.pipe(
       Layer.provide(NodeServices.layer),
       Layer.provide(
         Layer.mock(VcsProjectConfig.VcsProjectConfig)({

@@ -32,6 +32,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   TextGenerationError,
+  VcsProcessSpawnError,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -39,8 +40,9 @@ import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as GitLabCli from "../sourceControl/GitLabCli.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
-import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProjectConfig from "../vcs/VcsProjectConfig.ts";
 import * as GitHubSourceControlProvider from "../sourceControl/GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "../sourceControl/GitLabSourceControlProvider.ts";
 import {
@@ -640,13 +642,16 @@ function preparePullRequestThread(
 }
 
 function makeManager(input?: {
-  withJj?: boolean;
   ghScenario?: FakeGhScenario;
   sourceControlProvider?: SourceControlProvider["Service"];
   textGeneration?: Partial<FakeGitTextGeneration>;
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
   gitConfigReads?: string[];
+  gitQueries?: string[][];
+  vcsQueries?: VcsProcess.VcsProcessInput[];
+  failHostingRemote?: boolean;
+  jjUnavailable?: boolean;
   /** Seeds the V2 stores the per-project settings lookup reads. */
   seed?: Effect.Effect<
     void,
@@ -662,30 +667,73 @@ function makeManager(input?: {
 
   const serverSettingsLayer = ServerSettings.ServerSettingsService.layerTest(input?.serverSettings);
 
-  const vcsDriverLayer = input?.gitConfigReads
-    ? Layer.effect(
-        GitVcsDriver.GitVcsDriver,
-        GitVcsDriver.make.pipe(
-          Effect.map((service) =>
-            GitVcsDriver.GitVcsDriver.of({
-              ...service,
-              readConfigValue: (cwd, key) =>
-                Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                  Effect.andThen(service.readConfigValue(cwd, key)),
-                ),
-            }),
+  const processLayer =
+    input?.vcsQueries || input?.jjUnavailable
+      ? Layer.effect(
+          VcsProcess.VcsProcess,
+          VcsProcess.VcsProcess.pipe(
+            Effect.map((service) =>
+              VcsProcess.VcsProcess.of({
+                run: (query) =>
+                  Effect.sync(() => input.vcsQueries?.push(query)).pipe(
+                    Effect.andThen(
+                      input.jjUnavailable && query.command === "jj"
+                        ? Effect.fail(
+                            new VcsProcessSpawnError({
+                              cwd: query.cwd,
+                              command: query.command,
+                              operation: query.operation,
+                              cause: new Error("private launch detail"),
+                            }),
+                          )
+                        : service.run(query),
+                    ),
+                  ),
+              }),
+            ),
           ),
-        ),
-      ).pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      )
-    : GitVcsDriver.layer.pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      );
+        ).pipe(Layer.provide(VcsProcess.layer))
+      : VcsProcess.layer;
+  const vcsDriverLayer =
+    input?.gitConfigReads || input?.gitQueries || input?.failHostingRemote
+      ? Layer.effect(
+          GitVcsDriver.GitVcsDriver,
+          GitVcsDriver.make.pipe(
+            Effect.map((service) =>
+              GitVcsDriver.GitVcsDriver.of({
+                ...service,
+                execute: (query) =>
+                  Effect.sync(() => input.gitQueries?.push([...query.args])).pipe(
+                    Effect.andThen(service.execute(query)),
+                  ),
+                readConfigValue: (cwd, key) =>
+                  Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
+                    Effect.andThen(
+                      input.failHostingRemote && /^branch\..*\.remote$/.test(key)
+                        ? Effect.fail(
+                            new GitCommandError({
+                              cwd,
+                              operation: "test.hosting",
+                              command: "git config",
+                              detail: "Hosting metadata unavailable.",
+                            }),
+                          )
+                        : service.readConfigValue(cwd, key),
+                    ),
+                  ),
+              }),
+            ),
+          ),
+        ).pipe(
+          Layer.provideMerge(processLayer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        )
+      : GitVcsDriver.layer.pipe(
+          Layer.provideMerge(processLayer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        );
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
@@ -717,9 +765,12 @@ function makeManager(input?: {
       },
     ),
     vcsDriverLayer,
-    ...(input?.withJj
-      ? [JjVcsDriver.layer.pipe(Layer.provide(VcsProcess.layer), Layer.provide(NodeServices.layer))]
-      : []),
+    Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+      Layer.provide(VcsProjectConfig.layer),
+      Layer.provide(vcsDriverLayer),
+      Layer.provide(processLayer),
+      Layer.provide(NodeServices.layer),
+    ),
     serverSettingsLayer,
   ).pipe(Layer.provideMerge(sourceControlRegistryLayer), Layer.provideMerge(NodeServices.layer));
   // Built into the test's scope: the manager reads these stores after this returns.
@@ -732,11 +783,12 @@ function makeManager(input?: {
     if (input?.seed !== undefined) {
       yield* input.seed.pipe(Effect.provideContext(stores), Effect.orDie);
     }
-    const manager = yield* GitManager.make.pipe(
-      Effect.provide(managerLayer),
-      Effect.provideContext(stores),
-    );
-    return { manager, ghCalls };
+    return yield* Effect.gen(function* () {
+      const git = yield* GitVcsDriver.GitVcsDriver;
+      const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+      const manager = yield* GitManager.make;
+      return { manager, ghCalls, git, registry };
+    }).pipe(Effect.provide(managerLayer), Effect.provideContext(stores));
   });
 }
 
@@ -946,7 +998,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd });
 
       expect(status).toEqual({
-        kind: "git",
+        kind: "unknown",
         isRepo: false,
         hasPrimaryRemote: false,
         isDefaultRef: false,
@@ -977,7 +1029,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd });
 
       expect(status).toEqual({
-        kind: "git",
+        kind: "unknown",
         isRepo: false,
         hasPrimaryRemote: false,
         isDefaultRef: false,
@@ -1050,6 +1102,198 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           key === "branch.feature/status-identity-cache.remote" || key === "remote.origin.url",
       );
       expect(identityReads).toHaveLength(0);
+    }),
+  );
+
+  it.effect("local status shares raw Git mutation caches", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      const { manager, git, registry } = yield* makeManager();
+      expect((yield* manager.localStatus({ cwd: repoDir })).hasPrimaryRemote).toBe(false);
+      const workflow = (yield* registry.resolve({ cwd: repoDir })).driver.workflow!;
+      expect(
+        (yield* workflow.refs.listRefs({ cwd: repoDir })).refs.some(
+          (ref) => ref.name === "feature/cache",
+        ),
+      ).toBe(false);
+
+      yield* git.ensureRemote({ cwd: repoDir, preferredName: "origin", url: remoteDir });
+      yield* git.createRef({ cwd: repoDir, refName: "feature/cache" });
+      yield* manager.invalidateLocalStatus(repoDir);
+      expect((yield* manager.localStatus({ cwd: repoDir })).hasPrimaryRemote).toBe(true);
+      expect(
+        (yield* workflow.refs.listRefs({ cwd: repoDir })).refs.some(
+          (ref) => ref.name === "feature/cache",
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("warm local status uses only cheap hosting metadata and tolerates failure", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["remote", "add", "origin", "https://github.com/acme/repo.git"]);
+      const gitQueries: string[][] = [];
+      const gitConfigReads: string[] = [];
+      const { manager } = yield* makeManager({ gitQueries, gitConfigReads });
+      yield* manager.localStatus({ cwd: repoDir });
+      gitQueries.length = 0;
+      gitConfigReads.length = 0;
+      yield* manager.invalidateLocalStatus(repoDir);
+      const status = yield* manager.localStatus({ cwd: repoDir });
+      expect(status.sourceControlProvider?.kind).toBe("github");
+      expect(gitQueries).toEqual([]);
+      expect(gitConfigReads).toEqual(["branch.main.remote", "remote.origin.url"]);
+      const failing = yield* makeManager({ failHostingRemote: true });
+      expect((yield* failing.manager.localStatus({ cwd: repoDir })).isRepo).toBe(true);
+    }),
+  );
+
+  it.effect("plain pushes share the status and branch PR cache", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/plain-push"]);
+      yield* runGit(repoDir, ["push", "origin", "feature/plain-push"]);
+      const pr = {
+        number: 114,
+        title: "Plain push",
+        url: "https://github.com/acme/repo/pull/114",
+        baseRefName: "main",
+        headRefName: "feature/plain-push",
+      };
+      const gitQueries: string[][] = [];
+      const { manager, ghCalls } = yield* makeManager({
+        gitQueries,
+        ghScenario: { prListSequence: [encodeCliJson([pr])] },
+      });
+      expect(
+        (yield* manager.remoteStatus({ cwd: repoDir }, { refreshUpstream: false }))?.pr?.number,
+      ).toBe(114);
+      gitQueries.length = 0;
+      expect(
+        (yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/plain-push" }))?.number,
+      ).toBe(114);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+      expect(gitQueries.some((args) => args[0] === "for-each-ref")).toBe(false);
+    }),
+  );
+
+  for (const missing of ["remote", "merge"]) {
+    it.effect(`a half-configured upstream missing ${missing} keeps PR lookups`, () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir("t3code-git-manager-half-upstream-");
+        yield* initRepo(cwd);
+        const remote = yield* createBareRemote();
+        yield* runGit(cwd, ["remote", "add", "origin", remote]);
+        yield* runGit(cwd, ["push", "-u", "origin", "main"]);
+        yield* runGit(cwd, ["checkout", "-b", "feature/half-upstream"]);
+        yield* runGit(cwd, ["push", "origin", "feature/half-upstream"]);
+        yield* runGit(cwd, [
+          "config",
+          `branch.feature/half-upstream.${missing === "remote" ? "merge" : "remote"}`,
+          missing === "remote" ? "refs/heads/feature/half-upstream" : "origin",
+        ]);
+        const pr = {
+          number: 115,
+          title: "Partial upstream",
+          url: "https://github.com/acme/repo/pull/115",
+          baseRefName: "main",
+          headRefName: "feature/half-upstream",
+        };
+        const { manager, registry, ghCalls } = yield* makeManager({
+          ghScenario: { prListSequence: [encodeCliJson([pr])] },
+        });
+        const workflow = (yield* registry.resolve({ cwd })).driver.workflow!;
+        expect((yield* workflow.refContext(cwd, "feature/half-upstream")).publication).toEqual({
+          name: "feature/half-upstream",
+          remoteName: null,
+          remoteRef: null,
+        });
+        expect((yield* manager.remoteStatus({ cwd }, { refreshUpstream: false }))?.pr?.number).toBe(
+          115,
+        );
+        expect(
+          (yield* manager.branchPullRequest({ cwd, branch: "feature/half-upstream" }))?.number,
+        ).toBe(115);
+        expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+      }),
+    );
+  }
+
+  for (const jjUnavailable of [false, true]) {
+    it.effect(
+      `JJ metadata fails closed with ${jjUnavailable ? "an unavailable CLI" : "an unreadable repository"}`,
+      () =>
+        Effect.gen(function* () {
+          const repoDir = yield* makeTempDir("t3code-git-manager-");
+          yield* initRepo(repoDir);
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.makeDirectory(NodePath.join(repoDir, ".jj", "repo"), { recursive: true });
+          const before = (yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout;
+          NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "pending work\n");
+          const { manager } = yield* makeManager({ jjUnavailable });
+          const events: GitActionProgressEvent[] = [];
+          const error = yield* runStackedAction(
+            manager,
+            { cwd: repoDir, action: "commit", commitMessage: "must not commit" },
+            {
+              progressReporter: {
+                publish: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              },
+            },
+          ).pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "GitCommandError",
+            operation: jjUnavailable ? "GitManager.resolveWorkflow" : "JjWorkflow",
+          });
+          expect(events.map((event) => event.kind)).toContain("action_failed");
+          const statusError = yield* manager.status({ cwd: repoDir }).pipe(Effect.flip);
+          expect(statusError).toMatchObject(
+            jjUnavailable
+              ? {
+                  _tag: "GitManagerError",
+                  operation: "GitManager.status",
+                  detail: "Could not detect the repository for source-control status.",
+                }
+              : { _tag: "GitCommandError", operation: "JjWorkflow" },
+          );
+          expect(statusError.message).not.toContain("private launch detail");
+          expect((yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout).toBe(before);
+        }),
+    );
+  }
+
+  it.effect("configured Git routing wins even with JJ metadata present", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.makeDirectory(NodePath.join(repoDir, ".jj", "repo"), { recursive: true });
+      yield* fs.makeDirectory(NodePath.join(repoDir, ".t3code"));
+      yield* fs.writeFileString(
+        NodePath.join(repoDir, ".t3code/vcs.json"),
+        encodeCliJson({ vcsKind: "git" }),
+      );
+      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "Git-selected work\n");
+      const { manager } = yield* makeManager({ jjUnavailable: true });
+      expect((yield* manager.localStatus({ cwd: repoDir })).kind).toBe("git");
+      expect(
+        (yield* runStackedAction(manager, {
+          cwd: repoDir,
+          action: "commit",
+          commitMessage: "selected Git",
+        })).commit.status,
+      ).toBe("created");
     }),
   );
 
@@ -1254,61 +1498,69 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
-  it.effect("branch PR lookup uses the saved name after the local branch is deleted", () =>
-    Effect.gen(function* () {
-      const repoDir = yield* makeTempDir("t3code-git-manager-");
-      yield* initRepo(repoDir);
-      const remoteDir = yield* createBareRemote();
-      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
-      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
-      yield* runGit(repoDir, ["checkout", "-b", "feature/deleted-local-branch"]);
-      yield* runGit(repoDir, ["push", "-u", "origin", "feature/deleted-local-branch"]);
-      yield* runGit(repoDir, ["checkout", "main"]);
-      yield* runGit(repoDir, ["branch", "-D", "feature/deleted-local-branch"]);
-      yield* runGit(repoDir, ["branch", "feature/deleted-local-branch/child"]);
-      yield* runGit(repoDir, [
-        "branch",
-        "--set-upstream-to",
-        "origin/main",
-        "feature/deleted-local-branch/child",
-      ]);
+  for (const pruneRemote of [false, true]) {
+    it.effect(
+      `branch PR lookup uses the saved name after the local branch is deleted${pruneRemote ? " and remote ref is pruned" : ""}`,
+      () =>
+        Effect.gen(function* () {
+          const repoDir = yield* makeTempDir("t3code-git-manager-");
+          yield* initRepo(repoDir);
+          const remoteDir = yield* createBareRemote();
+          yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+          yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+          yield* runGit(repoDir, ["checkout", "-b", "feature/deleted-local-branch"]);
+          yield* runGit(repoDir, ["push", "-u", "origin", "feature/deleted-local-branch"]);
+          yield* runGit(repoDir, ["checkout", "main"]);
+          yield* runGit(repoDir, ["branch", "-D", "feature/deleted-local-branch"]);
+          if (pruneRemote) {
+            yield* runGit(repoDir, ["push", "origin", "--delete", "feature/deleted-local-branch"]);
+            yield* runGit(repoDir, ["fetch", "--prune", "origin"]);
+          }
+          yield* runGit(repoDir, ["branch", "feature/deleted-local-branch/child"]);
+          yield* runGit(repoDir, [
+            "branch",
+            "--set-upstream-to",
+            "origin/main",
+            "feature/deleted-local-branch/child",
+          ]);
 
-      const { manager, ghCalls } = yield* makeManager({
-        ghScenario: {
-          prListSequence: [
-            // Fake gh returns raw JSON stdout, matching the CLI boundary under test.
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
-            JSON.stringify([
-              {
-                number: 217,
-                title: "Deleted local branch PR",
-                url: "https://github.com/pingdotgg/t3code/pull/217",
-                baseRefName: "main",
-                headRefName: "feature/deleted-local-branch",
-                state: "MERGED",
-                updatedAt: "2026-04-04T15:00:00Z",
-              },
-            ]),
-          ],
-        },
-      });
+          const { manager, ghCalls } = yield* makeManager({
+            ghScenario: {
+              prListSequence: [
+                // Fake gh returns raw JSON stdout, matching the CLI boundary under test.
+                // @effect-diagnostics-next-line preferSchemaOverJson:off
+                JSON.stringify([
+                  {
+                    number: 217,
+                    title: "Deleted local branch PR",
+                    url: "https://github.com/pingdotgg/t3code/pull/217",
+                    baseRefName: "main",
+                    headRefName: "feature/deleted-local-branch",
+                    state: "MERGED",
+                    updatedAt: "2026-04-04T15:00:00Z",
+                  },
+                ]),
+              ],
+            },
+          });
 
-      const pullRequest = yield* manager.branchPullRequest({
-        cwd: repoDir,
-        branch: "feature/deleted-local-branch",
-      });
+          const pullRequest = yield* manager.branchPullRequest({
+            cwd: repoDir,
+            branch: "feature/deleted-local-branch",
+          });
 
-      expect(pullRequest).toMatchObject({
-        state: "merged",
-        closedAt: null,
-        mergedAt: null,
-        updatedAt: "2026-04-04T15:00:00.000Z",
-      });
-      expect(ghCalls.some((call) => call.includes("--head feature/deleted-local-branch"))).toBe(
-        true,
-      );
-    }),
-  );
+          expect(pullRequest).toMatchObject({
+            state: "merged",
+            closedAt: null,
+            mergedAt: null,
+            updatedAt: "2026-04-04T15:00:00.000Z",
+          });
+          expect(ghCalls.some((call) => call.includes("--head feature/deleted-local-branch"))).toBe(
+            true,
+          );
+        }),
+    );
+  }
 
   it.effect("branch PR lookup recovers a deleted fork branch from its remote-tracking ref", () =>
     Effect.gen(function* () {
@@ -3166,6 +3418,23 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
+  it.effect("JJ local status adds no hosting queries to the native snapshot", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir("t3code-jj-local-");
+      NodeChildProcess.execFileSync("jj", ["git", "init", "--no-colocate"], { cwd });
+      const vcsQueries: VcsProcess.VcsProcessInput[] = [];
+      const { manager, registry } = yield* makeManager({ vcsQueries });
+      const workflow = (yield* registry.resolve({ cwd })).driver.workflow!;
+      vcsQueries.length = 0;
+      yield* workflow.state(cwd, { localOnly: true });
+      const nativeQueries = vcsQueries.map((query) => [query.command, ...query.args]);
+      vcsQueries.length = 0;
+      const status = yield* manager.localStatus({ cwd });
+      expect(status.kind).toBe("jj");
+      expect(vcsQueries.map((query) => [query.command, ...query.args])).toEqual(nativeQueries);
+    }),
+  );
+
   it.effect("requires separate default-bookmark consent despite featureBranch false", () =>
     Effect.gen(function* () {
       const cwd = yield* makeTempDir("t3code-jj-consent-");
@@ -3183,7 +3452,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* jj(["bookmark", "create", "main", "-r", "@-"]);
       const before = yield* jj(["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
       NodeFS.writeFileSync(NodePath.join(cwd, "file.txt"), "edited\n");
-      const { manager } = yield* makeManager({ withJj: true });
+      const { manager } = yield* makeManager();
       const denied = yield* runStackedAction(manager, {
         cwd,
         action: "commit",

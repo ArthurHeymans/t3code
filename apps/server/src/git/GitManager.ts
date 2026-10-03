@@ -69,9 +69,6 @@ import { detachStackFrame } from "./detachStackFrame.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
-import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
-import * as GitWorkflow from "../vcs/GitWorkflow.ts";
-import * as JjWorkflow from "../vcs/JjWorkflow.ts";
 import type { VcsWorkflow } from "../vcs/VcsWorkflow.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as ServerConfig from "../config.ts";
@@ -701,71 +698,33 @@ class CurrentWorkflow extends Context.Service<CurrentWorkflow, VcsWorkflow>()(
 
 export const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
-  const jj = Option.getOrNull(yield* Effect.serviceOption(JjVcsDriver.JjVcsDriver));
-  const registry = Option.getOrNull(
-    yield* Effect.serviceOption(VcsDriverRegistry.VcsDriverRegistry),
-  );
+  const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
   const config = Option.getOrNull(yield* Effect.serviceOption(ServerConfig.ServerConfig));
-  const detectJj = (cwd: string) =>
-    registry
-      ? registry.detect({ cwd }).pipe(
-          Effect.map((handle) => handle?.kind === "jj"),
-          Effect.mapError(
-            (cause) =>
-              new GitCommandError({
-                cwd,
-                operation: "GitManager.route",
-                command: "vcs-route",
-                detail: "Could not resolve the repository driver.",
-                cause,
-              }),
-          ),
-        )
-      : jj
-        ? jj.isInsideWorkTree(cwd).pipe(
-            Effect.mapError(
-              (cause) =>
-                new GitCommandError({
-                  cwd,
-                  operation: "GitManager.route",
-                  command: "jj root",
-                  detail: "Could not detect Jujutsu workspace.",
-                  cause,
-                }),
-            ),
-          )
-        : Effect.succeed(false);
   const resolveWorkflow = (cwd: string) =>
-    registry
-      ? registry.resolve({ cwd }).pipe(
-          Effect.mapError(
-            (cause) =>
+    registry.resolve({ cwd }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitCommandError({
+            cwd,
+            operation: "GitManager.resolveWorkflow",
+            command: "vcs-route",
+            detail: "Could not resolve the repository workflow.",
+            cause,
+          }),
+      ),
+      Effect.flatMap((handle) =>
+        handle.driver.workflow
+          ? Effect.succeed(handle.driver.workflow)
+          : Effect.fail(
               new GitCommandError({
                 cwd,
                 operation: "GitManager.resolveWorkflow",
                 command: "vcs-route",
-                detail: "Could not resolve the repository workflow.",
-                cause,
+                detail: "This repository has no source-control workflow.",
               }),
-          ),
-          Effect.flatMap((handle) =>
-            handle.driver.workflow
-              ? Effect.succeed(handle.driver.workflow)
-              : Effect.fail(
-                  new GitCommandError({
-                    cwd,
-                    operation: "GitManager.resolveWorkflow",
-                    command: "vcs-route",
-                    detail: "This repository has no source-control workflow.",
-                  }),
-                ),
-          ),
-        )
-      : detectJj(cwd).pipe(
-          Effect.map((native) =>
-            native && jj ? (jj.workflow ?? JjWorkflow.make(jj)) : GitWorkflow.make(gitDriver),
-          ),
-        );
+            ),
+      ),
+    );
   const withWorkflow =
     (cwd: string) =>
     <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -1083,6 +1042,9 @@ export const make = Effect.gen(function* () {
   const readLocalStatus = Effect.fn("readLocalStatus")(function* (cwd: string) {
     const workflow = yield* CurrentWorkflow;
     const { local } = yield* workflow.state(cwd, { localOnly: true });
+    // JJ's local status is a native snapshot. Hosting resolution belongs to
+    // explicit PR/action paths, not an extra set of JJ queries on every poll.
+    if (workflow.kind === "jj") return local;
     const hostingProvider = local.isRepo ? yield* resolveHostingProvider(cwd, local.refName) : null;
     return {
       ...local,
@@ -1169,16 +1131,46 @@ export const make = Effect.gen(function* () {
         ...(remoteName.length > 0 ? { remoteName } : {}),
       };
       return Effect.gen(function* () {
-        const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
-        if (!lookup) {
-          return { latest: null, headContext };
-        }
-        // Only skip when the branch is untracked as well: anything carrying an
-        // upstream keeps the old behaviour.
+        const workflow = yield* CurrentWorkflow;
+        const shouldProbe =
+          workflow.kind === "jj" || !details.localBranchExists || details.upstreamRef === null;
+        const preferredRemote =
+          shouldProbe && details.localBranchExists
+            ? yield* publicationRemote(cwd, branch)
+            : details.remoteName;
+        const probeEffect = workflow.probePublication(cwd, branch, preferredRemote).pipe(
+          Effect.mapError(
+            (cause) =>
+              new GitManagerError({
+                cwd,
+                operation: "branchPullRequest",
+                detail: cause.detail,
+                cause,
+              }),
+          ),
+        );
+        // Ambiguous deleted refs must fail. A failed probe for a local branch
+        // must remain unknown, rather than masquerading as unpublished.
+        const probe = shouldProbe
+          ? yield* details.localBranchExists
+              ? probeEffect.pipe(
+                  Effect.orElseSucceed(() => ({ remoteName: null, published: null })),
+                )
+              : probeEffect
+          : undefined;
+        const { headContext, lookup } = yield* resolveLookupHeadContext(
+          cwd,
+          {
+            ...details,
+            ...(!details.localBranchExists && probe?.remoteName
+              ? { remoteName: probe.remoteName }
+              : {}),
+          },
+          probe,
+        );
         if (
-          details.localBranchExists &&
-          details.upstreamRef === null &&
-          (yield* isUnpublishedBranch(cwd, headContext))
+          !lookup ||
+          (probe?.published === false && (workflow.kind === "jj" || details.localBranchExists))
         ) {
           return { latest: null, headContext };
         }
@@ -1373,10 +1365,10 @@ export const make = Effect.gen(function* () {
       Effect.flatMap((workflow) => workflow.remoteUrl(cwd, remoteName)),
       Effect.orElseSucceed(() => null),
     );
-  const publicationFor = (cwd: string, name: string) =>
+  const publicationRemote = (cwd: string, name: string) =>
     CurrentWorkflow.pipe(
-      Effect.flatMap((workflow) => workflow.refContext(cwd, name)),
-      Effect.map((context) => context.publication),
+      Effect.flatMap((workflow) => workflow.publicationRemote(cwd, name)),
+      Effect.orElseSucceed(() => null),
     );
 
   const resolveHostingProvider = Effect.fn("resolveHostingProvider")(function* (
@@ -1384,7 +1376,7 @@ export const make = Effect.gen(function* () {
     branch: string | null,
   ) {
     const preferredRemoteName =
-      branch === null ? "origin" : ((yield* publicationFor(cwd, branch)).remoteName ?? "origin");
+      branch === null ? "origin" : ((yield* publicationRemote(cwd, branch)) ?? "origin");
     const remoteUrl =
       (yield* readRemoteUrlNullable(cwd, preferredRemoteName)) ??
       (yield* readRemoteUrlNullable(cwd, "origin"));
@@ -1438,7 +1430,7 @@ export const make = Effect.gen(function* () {
 
   const resolvePrLookupRepositoryIdentity = Effect.fn("resolvePrLookupRepositoryIdentity")(
     function* (cwd: string, branch: string, remoteNameOverride?: string) {
-      const remoteName = remoteNameOverride ?? (yield* publicationFor(cwd, branch)).remoteName;
+      const remoteName = remoteNameOverride ?? (yield* publicationRemote(cwd, branch));
       const [headRemote, targetRemote] = yield* Effect.all(
         [
           resolveRemoteRepositoryContext(cwd, remoteName),
@@ -1459,8 +1451,7 @@ export const make = Effect.gen(function* () {
     cwd: string,
     details: { branch: string; upstreamRef: string | null; remoteName?: string },
   ) {
-    const remoteName =
-      details.remoteName ?? (yield* publicationFor(cwd, details.branch)).remoteName;
+    const remoteName = details.remoteName ?? (yield* publicationRemote(cwd, details.branch));
     const headBranchFromUpstream = details.upstreamRef
       ? extractBranchNameFromRemoteRef(details.upstreamRef, { remoteName })
       : "";
@@ -1542,8 +1533,8 @@ export const make = Effect.gen(function* () {
   ) {
     if (!branch) return null;
     const workflow = yield* CurrentWorkflow;
-    return yield* workflow.refContext(cwd, branch, preferredRemoteName ?? undefined).pipe(
-      Effect.map((context) => context.trackingRemote),
+    return yield* workflow.probePublication(cwd, branch, preferredRemoteName).pipe(
+      Effect.map((probe) => probe.remoteName),
       Effect.orElseSucceed(() => null),
     );
   });
@@ -1568,6 +1559,7 @@ export const make = Effect.gen(function* () {
       defaultBranch: string | null;
       remoteName?: string;
     },
+    probe?: { readonly remoteName: string | null; readonly published: boolean | null },
   ) {
     const headContext = yield* resolveBranchHeadContext(cwd, details);
     const upstreamHeadIsDefault =
@@ -1581,7 +1573,9 @@ export const make = Effect.gen(function* () {
     ) {
       return { headContext, lookup: true };
     }
-    const remoteName = yield* findRemoteTrackingRemote(cwd, details.branch, headContext.remoteName);
+    const remoteName = probe
+      ? probe.remoteName
+      : yield* findRemoteTrackingRemote(cwd, details.branch, headContext.remoteName);
     if (remoteName === null) {
       return { headContext, lookup: false };
     }
@@ -1591,31 +1585,6 @@ export const make = Effect.gen(function* () {
       remoteName,
     });
     return { headContext: ownNameContext, lookup: true };
-  });
-
-  /**
-   * Whether git has no record of this branch on any remote, so a change request
-   * cannot exist for it and asking the provider is a guaranteed-empty API call.
-   *
-   * `git push` writes the remote-tracking ref even without `-u` (how most
-   * terminal and agent pushes land), and configured upstream metadata survives
-   * when a merged change request's remote branch is deleted. Together they
-   * distinguish branches known to have reached a host from genuinely local
-   * branches. The ref glob spans every remote so a fork branch still counts. A
-   * repository that tracks no remotes at all cannot answer the question,
-   * because then every branch looks unpublished; it, and any failed probe,
-   * keeps the lookup.
-   */
-  const isUnpublishedBranch = Effect.fn("isUnpublishedBranch")(function* (
-    cwd: string,
-    headContext: Pick<BranchHeadContext, "headBranch" | "localBranch">,
-  ) {
-    if (!headContext.headBranch) return false;
-    const workflow = yield* CurrentWorkflow;
-    return yield* workflow.refContext(cwd, headContext.localBranch).pipe(
-      Effect.map((context) => !context.published),
-      Effect.orElseSucceed(() => false),
-    );
   });
 
   const findOpenPr = Effect.fn("findOpenPr")(function* (
@@ -1787,7 +1756,7 @@ export const make = Effect.gen(function* () {
     headContext: Pick<BranchHeadContext, "isCrossRepository" | "remoteName">,
   ) {
     const workflow = yield* CurrentWorkflow;
-    const configured = (yield* workflow.refContext(cwd, branch)).mergeBase;
+    const configured = yield* workflow.prBaseRef(cwd, branch);
     if (configured) return configured;
 
     if (upstreamRef && !headContext.isCrossRepository) {
@@ -2126,14 +2095,37 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const detectForStatus = (cwd: string) =>
+    registry.detect({ cwd }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitManagerError({
+            cwd,
+            operation: "GitManager.status",
+            detail: "Could not detect the repository for source-control status.",
+            cause,
+          }),
+      ),
+    );
   const localStatus: GitManager["Service"]["localStatus"] = Effect.fn("localStatus")(
     function* (input) {
+      if (!(yield* detectForStatus(input.cwd)))
+        return {
+          kind: "unknown" as const,
+          isRepo: false,
+          hasPrimaryRemote: false,
+          isDefaultRef: false,
+          refName: null,
+          hasWorkingTreeChanges: false,
+          workingTree: { files: [], insertions: 0, deletions: 0 },
+        };
       const cacheKey = yield* normalizeStatusCacheKey(input.cwd);
       return yield* Cache.get(localStatusResultCache, cacheKey);
     },
   );
   const remoteStatus: GitManager["Service"]["remoteStatus"] = Effect.fn("remoteStatus")(
     function* (input, options) {
+      if (!(yield* detectForStatus(input.cwd))) return null;
       const cacheKey = yield* normalizeStatusCacheKey(input.cwd);
       if (options?.refreshUpstream === false || options?.refreshMissingPullRequest) {
         return yield* readRemoteStatus(cacheKey, options).pipe(withWorkflow(cacheKey));
@@ -2168,7 +2160,6 @@ export const make = Effect.gen(function* () {
             }),
         ),
       );
-      if (!context.published) return null;
       const localBranchExists = context.exists;
       const remoteName = context.publication.remoteName;
       const upstreamRef =
@@ -2866,6 +2857,7 @@ export const make = Effect.gen(function* () {
       });
 
       return yield* runAction().pipe(
+        withWorkflow(input.cwd),
         Effect.ensuring(invalidateStatus(input.cwd)),
         Effect.tapError((error) =>
           Effect.flatMap(Ref.get(currentPhase), (phase) =>
@@ -2878,7 +2870,6 @@ export const make = Effect.gen(function* () {
         ),
       );
     },
-    (effect, input) => effect.pipe(withWorkflow(input.cwd)),
   );
 
   return GitManager.of({

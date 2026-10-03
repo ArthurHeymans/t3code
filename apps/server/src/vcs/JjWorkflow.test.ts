@@ -52,6 +52,21 @@ const record = (
   });
 
 describe("Native Jujutsu workflows", () => {
+  it.effect("reads a PR base hint from the JJ Git backend", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { cwd, fs, path, adapter } = yield* fixture;
+        assert.isNull(yield* adapter.prBaseRef(cwd, "feature/base-hint"));
+        const config = path.join(cwd, ".jj", "repo", "store", "git", "config");
+        const existing = yield* fs.readFileString(config);
+        yield* fs.writeFileString(
+          config,
+          `${existing}\n[branch "feature/base-hint"]\n\tgh-merge-base = release/2026\n`,
+        );
+        assert.equal(yield* adapter.prBaseRef(cwd, "feature/base-hint"), "release/2026");
+      }),
+    ).pipe(Effect.provide(layer)),
+  );
   it.effect("does not treat an unpublished or deleted remote bookmark as published", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -62,9 +77,9 @@ describe("Native Jujutsu workflows", () => {
         yield* fs.writeFileString(path.join(cwd, "feature.txt"), "local work\n");
         yield* jj.createRef({ cwd, refName: "feature/published" });
         yield* record(adapter, cwd, "feature", { refName: "feature/published" });
-        assert.isFalse((yield* adapter.refContext(cwd, "feature/published")).published);
+        assert.isFalse((yield* adapter.probePublication(cwd, "feature/published")).published);
         yield* adapter.publish(cwd, "feature/published");
-        assert.isTrue((yield* adapter.refContext(cwd, "feature/published")).published);
+        assert.isTrue((yield* adapter.probePublication(cwd, "feature/published")).published);
         yield* command(
           root,
           ["--git-dir", remote, "update-ref", "-d", "refs/heads/feature/published"],
@@ -72,7 +87,7 @@ describe("Native Jujutsu workflows", () => {
         );
         yield* adapter.refs.fetchRemote({ cwd, remoteName: "origin" });
         const deleted = yield* adapter.refContext(cwd, "feature/published");
-        assert.isFalse(deleted.published);
+        assert.isFalse((yield* adapter.probePublication(cwd, "feature/published")).published);
         assert.isNull(deleted.publication.remoteRef);
       }),
     ).pipe(Effect.provide(layer)),

@@ -10,75 +10,106 @@ import { GitCommandError } from "@t3tools/contracts";
 export function make(git: GitVcsDriver.GitVcsDriver["Service"]): VcsWorkflow {
   const remoteUrl: VcsWorkflow["remoteUrl"] = (cwd, name) =>
     git.readConfigValue(cwd, `remote.${name}.url`);
-  const refContext: VcsWorkflow["refContext"] = Effect.fnUntraced(
-    function* (cwd, name, remoteOverride) {
-      const [mergeBase, remotes, local, tracking] = yield* Effect.all([
-        git.readConfigValue(cwd, `branch.${name}.gh-merge-base`),
-        git.execute({ cwd, operation: "GitWorkflow.refContext.remotes", args: ["remote"] }),
+  const refContext: VcsWorkflow["refContext"] = Effect.fnUntraced(function* (cwd, name) {
+    const [local, remoteName, merge] = yield* Effect.all(
+      [
         git.execute({
-          cwd,
-          operation: "GitWorkflow.refContext.local",
-          args: [
-            "for-each-ref",
-            "--format=%(refname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
-            `refs/heads/${name}`,
-          ],
-        }),
-        git.execute({
-          cwd,
-          operation: "GitWorkflow.refContext.tracking",
-          args: ["for-each-ref", "--format=%(refname)", "refs/remotes"],
-        }),
-      ]);
-      const saved = local.stdout
-        .split("\n")
-        .find((row) => row.split("\0")[0] === `refs/heads/${name}`)
-        ?.split("\0");
-      if (saved?.[1] && (!saved[2] || !saved[3]))
-        return yield* new GitCommandError({
           cwd,
           operation: "GitWorkflow.refContext",
+          args: ["show-ref", "--verify", "--quiet", `refs/heads/${name}`],
+          allowNonZeroExit: true,
+        }),
+        git.readConfigValue(cwd, `branch.${name}.remote`),
+        git.readConfigValue(cwd, `branch.${name}.merge`),
+      ],
+      { concurrency: "unbounded" },
+    );
+    if (local.exitCode !== 0 && local.exitCode !== 1)
+      return yield* new GitCommandError({
+        cwd,
+        operation: "GitWorkflow.refContext",
+        command: "git show-ref",
+        detail: "Could not inspect the local ref.",
+      });
+    return {
+      exists: local.exitCode === 0,
+      publication: {
+        name,
+        remoteName: remoteName && merge ? remoteName : null,
+        remoteRef: remoteName && merge ? merge.replace(/^refs\/heads\//, "") : null,
+      },
+    };
+  });
+  const probePublication: VcsWorkflow["probePublication"] = Effect.fnUntraced(
+    function* (cwd, name, preferredRemote) {
+      const [remotes, tracking, configuredRemote, configuredMerge] = yield* Effect.all(
+        [
+          git.execute({ cwd, operation: "GitWorkflow.probePublication.remotes", args: ["remote"] }),
+          // Presence is enough; never enumerate a repository's remote history.
+          git.execute({
+            cwd,
+            operation: "GitWorkflow.probePublication.any",
+            args: ["for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes"],
+          }),
+          git.readConfigValue(cwd, `branch.${name}.remote`),
+          git.readConfigValue(cwd, `branch.${name}.merge`),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (remotes.stdoutTruncated || tracking.stdoutTruncated)
+        return yield* new GitCommandError({
+          cwd,
+          operation: "GitWorkflow.probePublication",
           command: "git for-each-ref",
-          detail: `Saved upstream for ${name} is incomplete.`,
+          detail: "Repository metadata exceeded the output limit.",
         });
-      const configuredRemote = saved?.[2] || null;
-      const merge = saved?.[3] || null;
       const remoteNames = remotes.stdout.trim().split("\n").filter(Boolean);
-      const refs = new Set(tracking.stdout.trim().split("\n"));
-      const matching = remoteNames.filter((remote) => refs.has(`refs/remotes/${remote}/${name}`));
-      if (!saved && remoteOverride === undefined && matching.length > 1)
+      const matching = (yield* Effect.forEach(
+        remoteNames,
+        (remote) =>
+          git
+            .execute({
+              cwd,
+              operation: "GitWorkflow.probePublication.exact",
+              args: ["show-ref", "--verify", "--quiet", `refs/remotes/${remote}/${name}`],
+              allowNonZeroExit: true,
+            })
+            .pipe(
+              Effect.flatMap((result) =>
+                result.exitCode === 0 || result.exitCode === 1
+                  ? Effect.succeed(result.exitCode === 0 ? remote : null)
+                  : Effect.fail(
+                      new GitCommandError({
+                        cwd,
+                        operation: "GitWorkflow.probePublication",
+                        command: "git show-ref",
+                        detail: "Could not inspect the remote ref.",
+                      }),
+                    ),
+              ),
+            ),
+        { concurrency: "unbounded" },
+      )).filter((remote) => remote !== null);
+      if (preferredRemote === undefined && matching.length > 1)
         return yield* new GitCommandError({
           cwd,
-          operation: "GitWorkflow.refContext",
-          command: "git for-each-ref",
+          operation: "GitWorkflow.probePublication",
+          command: "git show-ref",
           detail: `Multiple remotes track ${name}. Its pull request is ambiguous.`,
         });
-      const remoteName =
-        remoteOverride ??
-        (saved?.[2] || configuredRemote) ??
-        (matching.includes("origin") ? "origin" : (matching[0] ?? null));
+      const remoteName = matching.includes(preferredRemote ?? "")
+        ? (preferredRemote ?? null)
+        : matching.includes("origin")
+          ? "origin"
+          : (matching[0] ?? null);
       return {
-        exists: saved !== undefined,
-        publication: {
-          name,
-          remoteName,
-          remoteRef:
-            remoteName === configuredRemote && merge
-              ? merge.replace(/^refs\/heads\//, "")
-              : matching.includes(remoteName ?? "")
-                ? name
-                : null,
-        },
-        mergeBase,
-        trackingRemote: matching.includes(remoteOverride ?? configuredRemote ?? "")
-          ? (remoteOverride ?? configuredRemote)
-          : matching.includes("origin")
-            ? "origin"
-            : (matching[0] ?? null),
+        remoteName,
         published:
-          (configuredRemote !== null && merge !== null) ||
-          matching.length > 0 ||
-          tracking.stdout.trim() === "",
+          (configuredRemote !== null && configuredMerge !== null) || matching.length > 0
+            ? true
+            : tracking.stdout.trim()
+              ? false
+              : null,
       };
     },
   );
@@ -86,15 +117,6 @@ export function make(git: GitVcsDriver.GitVcsDriver["Service"]): VcsWorkflow {
     kind: "git",
     refs: {
       validateWorktreePath: () => Effect.void,
-      hasCommit: (input) =>
-        git
-          .execute({
-            cwd: input.cwd,
-            operation: "GitWorkflow.hasCommit",
-            args: ["rev-parse", "--verify", `${input.refName}^{commit}`],
-            allowNonZeroExit: true,
-          })
-          .pipe(Effect.map((result) => result.exitCode === 0)),
       listRefs: git.listRefs,
       createWorktree: git.createWorktree,
       listLocalBranchNames: git.listLocalBranchNames,
@@ -107,7 +129,6 @@ export function make(git: GitVcsDriver.GitVcsDriver["Service"]): VcsWorkflow {
         git
           .pruneWorktrees({ cwd: input.cwd })
           .pipe(Effect.andThen(git.createWorktree(input)), Effect.asVoid),
-      pruneWorktrees: git.pruneWorktrees,
       deleteLocalBranch: git.deleteLocalBranch,
       createRef: git.createRef,
       switchRef: (input) => Effect.scoped(git.switchRef(input)),
@@ -150,6 +171,9 @@ export function make(git: GitVcsDriver.GitVcsDriver["Service"]): VcsWorkflow {
       };
     }),
     refContext,
+    publicationRemote: (cwd, name) => git.readConfigValue(cwd, `branch.${name}.remote`),
+    probePublication,
+    prBaseRef: (cwd, name) => git.readConfigValue(cwd, `branch.${name}.gh-merge-base`),
     remoteUrl,
     primaryRemote: git.resolvePrimaryRemoteName,
     defaultRef: git.resolveDefaultBranchName,

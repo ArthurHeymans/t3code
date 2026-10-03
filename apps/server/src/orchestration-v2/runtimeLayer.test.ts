@@ -105,7 +105,6 @@ const CheckpointStoreTestLayer = CheckpointStore.layer.pipe(
   Layer.provide(VcsDriverRegistryTestLayer),
 );
 const GitWorkflowTestLayer = Layer.mock(GitWorkflow.GitWorkflowService)({
-  pruneWorktrees: () => Effect.void,
   createWorktree: () => Effect.succeed({} as never),
 });
 const ProjectServiceTestLayer = Layer.mock(ProjectService.ProjectService)({

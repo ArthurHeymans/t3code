@@ -3,13 +3,13 @@ import { normalizeGitRemoteUrl, resolveAutoFeatureBranchName } from "@t3tools/sh
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { detectPrTemplate } from "../sourceControl/PrTemplateDetection.ts";
-import type { JjVcsDriverShape } from "./JjVcsDriver.ts";
+import type { JjBookmark, JjVcsDriverShape } from "./JjVcsDriver.ts";
 import type { VcsWorkflow } from "./VcsWorkflow.ts";
 import { jjCommit, jjFile, jjRef, jjString } from "./jjExpressions.ts";
 
 /** Native JJ operations, without Git configuration or a Git command facade. */
 export function make(
-  jj: JjVcsDriverShape,
+  jj: Omit<JjVcsDriverShape, "workflow">,
   defaultWorkspacePath?: (cwd: string, refName: string) => string,
 ): VcsWorkflow {
   const error = (cwd: string, detail: string) =>
@@ -47,8 +47,14 @@ export function make(
       );
     return remote.name;
   });
-  const remoteForRef = Effect.fnUntraced(function* (cwd: string, refName: string | null) {
-    const tracked = (yield* jj.listBookmarks(cwd).pipe(Effect.mapError(mapError(cwd)))).filter(
+  const remoteForRef = Effect.fnUntraced(function* (
+    cwd: string,
+    refName: string | null,
+    bookmarks?: readonly JjBookmark[],
+  ) {
+    const tracked = (
+      bookmarks ?? (yield* jj.listBookmarks(cwd).pipe(Effect.mapError(mapError(cwd))))
+    ).filter(
       (bookmark) => bookmark.name === refName && bookmark.remoteName !== null && bookmark.tracked,
     );
     if (tracked.length === 1 && tracked[0]?.remoteName) return tracked[0].remoteName;
@@ -76,25 +82,19 @@ export function make(
       ),
       Effect.mapError(mapError(cwd)),
     );
-  const refContext: VcsWorkflow["refContext"] = Effect.fnUntraced(
-    function* (cwd, name, remoteOverride) {
-      const bookmarks = yield* jj.listBookmarks(cwd).pipe(Effect.mapError(mapError(cwd)));
-      const remoteName =
-        remoteOverride ?? (yield* remoteForRef(cwd, name).pipe(Effect.orElseSucceed(() => null)));
-      const upstream = bookmarks.find(
-        (bookmark) => bookmark.name === name && bookmark.remoteName === remoteName,
-      );
-      return {
-        exists: bookmarks.some(
-          (bookmark) => bookmark.name === name && bookmark.remoteName === null,
-        ),
-        publication: { name, remoteName, remoteRef: upstream?.target ? name : null },
-        mergeBase: null,
-        trackingRemote: upstream?.target ? remoteName : null,
-        published: Boolean(upstream?.target),
-      };
-    },
-  );
+  const refContext: VcsWorkflow["refContext"] = Effect.fnUntraced(function* (cwd, name) {
+    const bookmarks = yield* jj.listBookmarks(cwd).pipe(Effect.mapError(mapError(cwd)));
+    const remoteName = yield* remoteForRef(cwd, name, bookmarks).pipe(
+      Effect.orElseSucceed(() => null),
+    );
+    const upstream = bookmarks.find(
+      (bookmark) => bookmark.name === name && bookmark.remoteName === remoteName,
+    );
+    return {
+      exists: bookmarks.some((bookmark) => bookmark.name === name && bookmark.remoteName === null),
+      publication: { name, remoteName, remoteRef: upstream?.target ? name : null },
+    };
+  });
   const count = (cwd: string, revset: string) =>
     run(cwd, [
       "log",
@@ -121,7 +121,9 @@ export function make(
     const head = bookmarks.find(
       (bookmark) => bookmark.remoteName === null && bookmark.name === name,
     )?.target;
-    const remoteName = yield* remoteForRef(cwd, name).pipe(Effect.orElseSucceed(() => null));
+    const remoteName = yield* remoteForRef(cwd, name, bookmarks).pipe(
+      Effect.orElseSucceed(() => null),
+    );
     const upstream = bookmarks.find(
       (bookmark) => bookmark.name === name && bookmark.remoteName === remoteName,
     )?.target;
@@ -188,16 +190,6 @@ export function make(
     kind: "jj",
     refs: {
       validateWorktreePath: (input) => native(input.cwd, jj.validateWorktreePath(input)),
-      hasCommit: (input) =>
-        native(
-          input.cwd,
-          jj.execute({
-            cwd: input.cwd,
-            operation: "JjWorkflow.hasCommit",
-            args: ["log", "-r", jjRef(input.refName), "--no-graph", "-T", "commit_id"],
-            allowNonZeroExit: true,
-          }),
-        ).pipe(Effect.map((result) => result.exitCode === 0 && result.stdout.trim() !== "")),
       listRefs: (input) => native(input.cwd, jj.listRefs(input)),
       createWorktree: (input) => {
         const workspacePath =
@@ -238,7 +230,6 @@ export function make(
         native(input.cwd, jj.resolveRemoteTrackingCommit(input)),
       removeWorktree: (input) => native(input.cwd, jj.removeWorktree(input)),
       recoverWorktree: (input) => native(input.cwd, jj.recoverWorktree(input)),
-      pruneWorktrees: (input) => native(input.cwd, jj.pruneWorktrees(input.cwd)),
       deleteLocalBranch: (input) =>
         run(input.cwd, ["bookmark", "delete", "--", `exact:${input.refName}`]).pipe(Effect.asVoid),
       createRef: (input) => native(input.cwd, jj.createRef(input)),
@@ -311,6 +302,27 @@ export function make(
     }),
     state,
     refContext,
+    publicationRemote: (cwd, name) => remoteForRef(cwd, name),
+    probePublication: Effect.fnUntraced(function* (cwd, name, preferredRemote) {
+      const bookmarks = yield* jj.listBookmarks(cwd).pipe(Effect.mapError(mapError(cwd)));
+      const remoteName = preferredRemote ?? (yield* remoteForRef(cwd, name, bookmarks));
+      const published = bookmarks.some(
+        (bookmark) =>
+          bookmark.name === name && bookmark.remoteName === remoteName && bookmark.target !== null,
+      );
+      return { remoteName: published ? remoteName : null, published };
+    }),
+    prBaseRef: (cwd, name) =>
+      native(
+        cwd,
+        jj.readGitBackend({
+          cwd,
+          operation: "JjWorkflow.prBaseRef",
+          args: ["config", "--get", `branch.${name}.gh-merge-base`],
+          allowNonZeroExit: true,
+          outputMode: "error",
+        }),
+      ).pipe(Effect.map((result) => result.stdout.trim() || null)),
     remoteUrl,
     primaryRemote,
     defaultRef,

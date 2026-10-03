@@ -165,11 +165,7 @@ const makeRuntimeLayer = (dbPath: string) => {
         subscribeChanges: Effect.never,
       }),
     ),
-    Layer.provide(
-      Layer.mock(GitWorkflow.GitWorkflowService)({
-        pruneWorktrees: () => Effect.void,
-      }),
-    ),
+    Layer.provide(Layer.mock(GitWorkflow.GitWorkflowService)({})),
     Layer.provide(platform),
   );
 };

@@ -19,15 +19,10 @@ export type VcsRefOperations = Pick<
   | "remoteBranchExists"
   | "resolveRemoteTrackingCommit"
   | "removeWorktree"
-  | "pruneWorktrees"
   | "deleteLocalBranch"
   | "createRef"
   | "renameBranch"
 > & {
-  readonly hasCommit: (input: {
-    readonly cwd: string;
-    readonly refName: string;
-  }) => Effect.Effect<boolean, GitCommandError>;
   readonly validateWorktreePath: (input: {
     readonly cwd: string;
     readonly path: string;
@@ -52,9 +47,6 @@ export interface PublicationRef {
 export interface RefContext {
   readonly exists: boolean;
   readonly publication: PublicationRef;
-  readonly mergeBase: string | null;
-  readonly published: boolean;
-  readonly trackingRemote: string | null;
 }
 
 export interface RepositoryState {
@@ -97,11 +89,26 @@ export interface VcsWorkflow {
       readonly refreshUpstream?: boolean;
     },
   ) => Effect.Effect<RepositoryState, GitCommandError>;
-  readonly refContext: (
+  /** Native ref metadata: Git's configured upstream or JJ's selected remote bookmark. */
+  readonly refContext: (cwd: string, refName: string) => Effect.Effect<RefContext, GitCommandError>;
+  /** Cheap routing hint, also used for best-effort hosting labels. */
+  readonly publicationRemote: (
     cwd: string,
     refName: string,
-    remoteName?: string,
-  ) => Effect.Effect<RefContext, GitCommandError>;
+  ) => Effect.Effect<string | null, GitCommandError>;
+  /** Cold PR lookup only. No local evidence is different from known unpublished. */
+  readonly probePublication: (
+    cwd: string,
+    refName: string,
+    preferredRemote?: string | null,
+  ) => Effect.Effect<
+    { readonly remoteName: string | null; readonly published: boolean | null },
+    GitCommandError
+  >;
+  readonly prBaseRef: (
+    cwd: string,
+    refName: string,
+  ) => Effect.Effect<string | null, GitCommandError>;
   readonly remoteUrl: (
     cwd: string,
     remoteName: string,

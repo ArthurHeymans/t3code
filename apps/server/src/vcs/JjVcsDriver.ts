@@ -33,6 +33,7 @@ import {
 
 import * as VcsDriver from "./VcsDriver.ts";
 import * as JjWorkflow from "./JjWorkflow.ts";
+import type { VcsWorkflow } from "./VcsWorkflow.ts";
 import * as ServerConfig from "../config.ts";
 import { nowFreshness } from "./VcsFreshness.ts";
 import * as VcsProcess from "./VcsProcess.ts";
@@ -41,6 +42,7 @@ import { PATCH_RENDER_PREFIX_ARGS } from "./GitVcsDriverCore.ts";
 import { jjCommit, jjFile, jjRef, jjString } from "./jjExpressions.ts";
 
 export interface JjVcsDriverShape extends VcsDriver.VcsDriverShape {
+  readonly workflow: VcsWorkflow;
   readonly capabilities: VcsDriver.VcsDriverShape["capabilities"] & {
     readonly kind: "jj";
     readonly supportsBookmarks: true;
@@ -1873,7 +1875,7 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
     localStatus,
     hasUntrackedFiles,
     validateWorktreePath,
-  } satisfies JjVcsDriverShape;
+  } satisfies Omit<JjVcsDriverShape, "workflow">;
   const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
   const defaultWorkspacePath = Option.isSome(config)
     ? (cwd: string, refName: string) =>
