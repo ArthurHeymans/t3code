@@ -35,6 +35,7 @@ import {
 } from "../../../../packages/client-runtime/src/state/orchestrationV2TestFixtures.ts";
 import {
   bridgeSocketUrl,
+  MAX_SHELL_PROJECTS,
   decodePassthroughThreadCommand,
   normalizeArchivedThreads,
   normalizeModelCatalog,
@@ -211,14 +212,14 @@ describe("stdio client bridge", () => {
   });
 
   it("marks count-truncated shell projections", () => {
-    const projects = Array.from({ length: 51 }, (_, index) => ({
+    const projects = Array.from({ length: MAX_SHELL_PROJECTS + 1 }, (_, index) => ({
       ...v2Project,
       id: ProjectId.make(`project-${String(index)}`),
       title: `Project ${String(index)}`,
     }));
     const normalized = normalizeShellSnapshot({ ...v2ShellSnapshot, projects, threads: [] });
 
-    expect(normalized.projects).toHaveLength(50);
+    expect(normalized.projects).toHaveLength(MAX_SHELL_PROJECTS);
     expect(normalized.truncated).toBe(true);
   });
 
@@ -332,7 +333,7 @@ describe("stdio client bridge", () => {
 
   it("includes working projects beyond the project count cap", () => {
     const base = v2ShellSnapshot.threads[0]!;
-    const projects = Array.from({ length: 51 }, (_, index) => ({
+    const projects = Array.from({ length: MAX_SHELL_PROJECTS + 1 }, (_, index) => ({
       ...v2Project,
       id: ProjectId.make(`project-${String(index)}`),
     }));
@@ -343,15 +344,17 @@ describe("stdio client bridge", () => {
         id,
         projectId: project.id,
         lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
-        ...(index === 50
+        ...(index === MAX_SHELL_PROJECTS
           ? { status: "running" as const, activeRunId: RunId.make("active-run") }
           : { settledOverride: "settled" as const, settledAt: base.updatedAt }),
       };
     });
     const normalized = normalizeShellSnapshot({ ...v2ShellSnapshot, projects, threads }, NOW);
 
-    expect(normalized.projects).toHaveLength(50);
-    expect(normalized.projects.some(({ id }) => id === projects[50]!.id)).toBe(true);
+    expect(normalized.projects).toHaveLength(MAX_SHELL_PROJECTS);
+    expect(normalized.projects.some(({ id }) => id === projects[MAX_SHELL_PROJECTS]!.id)).toBe(
+      true,
+    );
     expect(normalized).toMatchObject({
       truncated: true,
       omittedSettledCount: 1,
