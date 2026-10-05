@@ -83,7 +83,8 @@ const PROTOCOL_VERSION = 1;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_LINE_BYTES = 900_000;
 const MAX_ERROR_CHARS = 1000;
-const MAX_SHELL_PROJECTS = 50;
+// Generous: the byte budget below is what keeps shells under the frame limit.
+export const MAX_SHELL_PROJECTS = 1_000;
 const MAX_SHELL_THREADS = 2_000;
 const MAX_DISPLAY_CHARS = 500;
 const MAX_THREAD_ITEMS = 100;
