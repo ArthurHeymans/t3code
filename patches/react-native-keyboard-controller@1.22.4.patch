@@ -200,7 +200,17 @@ index 54a1c57..19b44fc 100644
      scroll,
      layout,
      size,
-@@ -70,8 +72,8 @@ function useExtraContentPadding(options) {
+@@ -52,8 +54,4 @@ function useExtraContentPadding(options) {
+-        // check that view is still mounted and ref is actual
+-        // otherwise it may lead to a crash
+-        if (!scrollViewRef()) {
+-          return;
+-        }
++        // Reanimated 4.7 refs are objects on UI; scrollTo guards unset refs.
+         (0, _reactNativeReanimated.scrollTo)(scrollViewRef, 0, target, false);
+       });
+     } else {
+@@ -70,8 +68,8 @@ function useExtraContentPadding(options) {
      }
  
      // Compute effective delta considering blankSpace floor
@@ -211,7 +221,7 @@ index 54a1c57..19b44fc 100644
      const effectiveDelta = currentTotal - previousTotal;
      if (effectiveDelta === 0) {
        // blankSpace absorbed the change
-@@ -90,10 +92,11 @@ function useExtraContentPadding(options) {
+@@ -90,10 +88,11 @@ function useExtraContentPadding(options) {
        const target = Math.max(scroll.value - effectiveDelta, -currentTotal);
        scrollToTarget(target);
      } else {
@@ -438,7 +448,17 @@ index 5885415..6e694fa 100644
      scroll,
      layout,
      size,
-@@ -64,8 +66,8 @@ function useExtraContentPadding(options) {
+@@ -46,8 +48,4 @@ function useExtraContentPadding(options) {
+-        // check that view is still mounted and ref is actual
+-        // otherwise it may lead to a crash
+-        if (!scrollViewRef()) {
+-          return;
+-        }
++        // Reanimated 4.7 refs are objects on UI; scrollTo guards unset refs.
+         scrollTo(scrollViewRef, 0, target, false);
+       });
+     } else {
+@@ -64,8 +62,8 @@ function useExtraContentPadding(options) {
      }
  
      // Compute effective delta considering blankSpace floor
@@ -449,7 +469,7 @@ index 5885415..6e694fa 100644
      const effectiveDelta = currentTotal - previousTotal;
      if (effectiveDelta === 0) {
        // blankSpace absorbed the change
-@@ -84,11 +86,12 @@ function useExtraContentPadding(options) {
+@@ -84,11 +82,12 @@ function useExtraContentPadding(options) {
        const target = Math.max(scroll.value - effectiveDelta, -currentTotal);
        scrollToTarget(target);
      } else {
@@ -833,7 +853,17 @@ index c9c93f3..76a201d 100644
      scroll,
      layout,
      size,
-@@ -99,14 +105,12 @@ function useExtraContentPadding(options: UseExtraContentPaddingOptions): void {
+@@ -74,8 +80,4 @@ function useExtraContentPadding(options: UseExtraContentPaddingOptions): void {
+-          // check that view is still mounted and ref is actual
+-          // otherwise it may lead to a crash
+-          if (!scrollViewRef()) {
+-            return;
+-          }
++          // Reanimated 4.7 refs are objects on UI; scrollTo guards unset refs.
+           scrollTo(scrollViewRef, 0, target, false);
+         });
+       } else {
+@@ -99,14 +101,12 @@ function useExtraContentPadding(options: UseExtraContentPaddingOptions): void {
        }
  
        // Compute effective delta considering blankSpace floor
@@ -854,7 +884,7 @@ index c9c93f3..76a201d 100644
        const effectiveDelta = currentTotal - previousTotal;
  
        if (effectiveDelta === 0) {
-@@ -139,16 +143,25 @@ function useExtraContentPadding(options: UseExtraContentPaddingOptions): void {
+@@ -139,16 +139,25 @@ function useExtraContentPadding(options: UseExtraContentPaddingOptions): void {
  
          scrollToTarget(target);
        } else {
