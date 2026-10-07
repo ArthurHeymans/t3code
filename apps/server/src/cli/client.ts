@@ -346,7 +346,7 @@ export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
           ? singleLine(provider.unavailableReason ?? provider.message ?? "")
           : null,
       requiresNewThreadForModelChange: provider.requiresNewThreadForModelChange === true,
-      models: provider.models.slice(0, 100).map((model) => ({
+      models: provider.models.map((model) => ({
         slug: singleLine(model.slug),
         name: singleLine(model.name),
         options: (model.capabilities?.optionDescriptors ?? []).slice(0, 16).map((option) =>
@@ -369,7 +369,6 @@ export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
       providers.length > 32 ||
       providers.some(
         (provider) =>
-          provider.models.length > 100 ||
           provider.models.some(
             (model) =>
               (model.capabilities?.optionDescriptors ?? []).length > 16 ||
@@ -379,8 +378,9 @@ export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
           ),
       ),
   };
-  // A catalog is a request response, not a stream; keep it below the NDJSON
-  // frame limit even if providers advertise many long option descriptors.
+  // Bound by encoded size, not model count: multi-provider runtimes such as
+  // Pi can advertise hundreds of models with distinct provider-qualified slugs.
+  // Keep the response below the NDJSON frame limit.
   while (Buffer.byteLength(encodeJson(catalog), "utf8") > 400_000) {
     const largest = catalog.providers.reduce<(typeof catalog.providers)[number] | null>(
       (best, provider) => (provider.models.length > (best?.models.length ?? 0) ? provider : best),

@@ -141,12 +141,26 @@ describe("stdio client bridge", () => {
       ],
       truncated: false,
     });
+    const manyModels = [
+      {
+        ...providers[0]!,
+        models: [
+          ...Array.from({ length: 100 }, () => providers[0]!.models[0]!),
+          { ...providers[0]!.models[0]!, slug: "openai-codex/gpt-5.4" },
+        ],
+      },
+    ];
+    const complete = normalizeModelCatalog(manyModels);
+    expect(complete.truncated).toBe(false);
+    expect(complete.providers[0]?.models).toHaveLength(101);
+    expect(complete.providers[0]?.models.at(-1)?.slug).toBe("openai-codex/gpt-5.4");
+
     const oversized = [
-      { ...providers[0]!, models: Array.from({ length: 101 }, () => providers[0]!.models[0]!) },
+      { ...providers[0]!, models: Array.from({ length: 3000 }, () => providers[0]!.models[0]!) },
     ];
     const bounded = normalizeModelCatalog(oversized);
     expect(bounded.truncated).toBe(true);
-    expect(bounded.providers[0]?.models).toHaveLength(100);
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(400_000);
   });
 
   it("normalizes the shell projection without exposing T3 schemas", () => {
