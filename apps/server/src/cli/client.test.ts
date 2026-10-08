@@ -44,6 +44,7 @@ import {
   normalizeProviderCommands,
   serveThreadHistory,
   normalizeShellSnapshot,
+  withWorkspaceStats,
   normalizeThreadProjection,
   reduceThreadProjection,
   safeErrorMessage,
@@ -259,14 +260,69 @@ describe("stdio client bridge", () => {
               settled: false,
               parentThreadId: null,
               relationshipToParent: null,
-              additions: 0,
-              deletions: 0,
+              additions: null,
+              deletions: null,
             },
           ],
         },
       ],
       truncated: false,
     });
+  });
+
+  it("projects jj workspace stats to every sibling without inventing zeros", () => {
+    const payload = normalizeShellSnapshot(
+      {
+        ...v2ShellSnapshot,
+        threads: [
+          v2ThreadShell,
+          {
+            ...v2ThreadShell,
+            id: ThreadId.make("sibling"),
+            lineage: { ...v2ThreadShell.lineage, rootThreadId: ThreadId.make("sibling") },
+          },
+          {
+            ...v2ThreadShell,
+            id: ThreadId.make("other"),
+            worktreePath: "/other",
+            lineage: { ...v2ThreadShell.lineage, rootThreadId: ThreadId.make("other") },
+          },
+        ],
+      },
+      NOW,
+    );
+    const status = {
+      kind: "jj" as const,
+      isRepo: true,
+      hasPrimaryRemote: false,
+      isDefaultRef: false,
+      refName: null,
+      hasWorkingTreeChanges: true,
+      workingTree: { files: [], insertions: 7, deletions: 2 },
+    };
+    const enriched = withWorkspaceStats(payload, new Map([["/workspace/project", status]]));
+    expect(
+      enriched.projects[0]?.threads.map(({ additions, deletions }) => [additions, deletions]),
+    ).toEqual([
+      [7, 2],
+      [7, 2],
+      [null, null],
+    ]);
+    expect(
+      withWorkspaceStats(
+        payload,
+        new Map([
+          [
+            "/workspace/project",
+            {
+              ...status,
+              isRepo: false,
+            },
+          ],
+        ]),
+      ).projects[0]?.threads[0]?.additions,
+    ).toBeNull();
+    expect(payload.projects[0]?.threads[0]?.additions).toBeNull();
   });
 
   it("exposes pin, snooze, branch and unseen-completion state on shell threads", () => {

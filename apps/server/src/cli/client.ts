@@ -60,6 +60,7 @@ import {
   type OrchestrationV2ThreadStreamItem,
   type OrchestrationV2TurnItem,
   type ServerConfig,
+  type VcsStatusLocalResult,
   type OrchestrationV2ShellStreamItem,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -346,8 +347,8 @@ interface NormalizedShellThread {
   readonly settled: boolean;
   readonly parentThreadId: string | null;
   readonly relationshipToParent: "fork" | "subagent" | null;
-  readonly additions: number;
-  readonly deletions: number;
+  readonly additions: number | null;
+  readonly deletions: number | null;
 }
 
 interface NormalizedShellProject {
@@ -364,6 +365,24 @@ interface NormalizedShellPayload {
   omittedOtherCount?: number;
   omittedProjectCount?: number;
 }
+
+export const withWorkspaceStats = (
+  payload: NormalizedShellPayload,
+  stats: ReadonlyMap<string, VcsStatusLocalResult>,
+): NormalizedShellPayload => ({
+  ...payload,
+  projects: payload.projects.map((project) => ({
+    ...project,
+    threads: project.threads.map((thread) => {
+      const status = stats.get(thread.path);
+      return {
+        ...thread,
+        additions: status?.isRepo ? status.workingTree.insertions : null,
+        deletions: status?.isRepo ? status.workingTree.deletions : null,
+      };
+    }),
+  })),
+});
 
 export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
   const catalog = {
@@ -900,8 +919,8 @@ export const normalizeShellSnapshot = (
           settled,
           parentThreadId: thread.lineage.parentThreadId,
           relationshipToParent: thread.lineage.relationshipToParent,
-          additions: 0,
-          deletions: 0,
+          additions: null,
+          deletions: null,
         })),
     })),
     truncated: false,
@@ -1949,7 +1968,61 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         ),
       );
       const latest = yield* Ref.make(snapshot);
-      let lastPayload = normalizeShellSnapshot(snapshot);
+      let basePayload = normalizeShellSnapshot(snapshot);
+      const stats = new Map<string, VcsStatusLocalResult>();
+      const watchers = new Map<string, Fiber.Fiber<void, never>>();
+      let statsDirty = false;
+      let lastPayload = withWorkspaceStats(basePayload, stats);
+      const publishStats = Effect.fn("clientBridge.publishWorkspaceStats")(function* () {
+        const payload = withWorkspaceStats(basePayload, stats);
+        if (encodeJson(payload) === encodeJson(lastPayload)) return;
+        lastPayload = payload;
+        outputSequence += 1;
+        yield* writeRecord({
+          kind: "event",
+          subscriptionId: message.subscriptionId,
+          generation: current.generation,
+          sequence: outputSequence,
+          payload,
+        });
+      });
+      const reconcileStats = Effect.fn("clientBridge.watchWorkspaceStats")(function* () {
+        // One shared server-side VCS watcher per active workspace, not per thread.
+        const paths = new Set(
+          basePayload.projects.flatMap((project) =>
+            project.threads.filter((thread) => !thread.settled).map((thread) => thread.path),
+          ),
+        );
+        for (const [path, fiber] of watchers) {
+          if (paths.has(path)) continue;
+          yield* Fiber.interrupt(fiber);
+          watchers.delete(path);
+          stats.delete(path);
+        }
+        for (const path of paths) {
+          if (watchers.has(path)) continue;
+          const fiber = yield* current.session.client[WS_METHODS.subscribeVcsStatus]({
+            cwd: path,
+          }).pipe(
+            Stream.runForEach((event) => {
+              if (event._tag === "remoteUpdated") return Effect.void;
+              return Effect.sync(() => {
+                stats.set(path, event.local);
+                statsDirty = true;
+              });
+            }),
+            // Older servers and inaccessible workspaces show unknown, not zero.
+            Effect.catchCause(() =>
+              Effect.sync(() => {
+                stats.delete(path);
+                statsDirty = true;
+              }),
+            ),
+            Effect.forkScoped,
+          );
+          watchers.set(path, fiber);
+        }
+      });
       outputSequence += 1;
       yield* writeRecord({
         kind: "snapshot",
@@ -1958,6 +2031,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         sequence: outputSequence,
         payload: lastPayload,
       });
+      yield* reconcileStats();
       const subscribeInput =
         current.config.shellResumeCompletionMarker === true
           ? {
@@ -1971,22 +2045,24 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
       const clockUpdates = Stream.tick("1 minute").pipe(
         Stream.map(() => ({ _tag: "Clock" as const })),
       );
-      yield* Stream.merge(serverUpdates, clockUpdates).pipe(
+      // Coalesce filesystem bursts and serialize stats with shell sequence numbers.
+      const statsUpdates = Stream.tick("1 second").pipe(
+        Stream.map(() => ({ _tag: "Stats" as const })),
+      );
+      yield* Stream.merge(Stream.merge(serverUpdates, clockUpdates), statsUpdates).pipe(
         Stream.runForEach((update) =>
           Effect.gen(function* () {
+            if (update._tag === "Stats") {
+              if (!statsDirty) return;
+              statsDirty = false;
+              yield* publishStats();
+              return;
+            }
             if (update._tag === "Clock") {
               const value = yield* Ref.get(latest);
-              const payload = normalizeShellSnapshot(value);
-              if (encodeJson(payload) === encodeJson(lastPayload)) return;
-              lastPayload = payload;
-              outputSequence += 1;
-              yield* writeRecord({
-                kind: "event",
-                subscriptionId: message.subscriptionId,
-                generation: current.generation,
-                sequence: outputSequence,
-                payload,
-              });
+              basePayload = normalizeShellSnapshot(value);
+              yield* reconcileStats();
+              yield* publishStats();
               return;
             }
             const item: OrchestrationV2ShellStreamItem = update.item;
@@ -2014,7 +2090,9 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
               next = applyShellStreamEvent(previous, item);
             }
             yield* Ref.set(latest, next);
-            lastPayload = normalizeShellSnapshot(next);
+            basePayload = normalizeShellSnapshot(next);
+            yield* reconcileStats();
+            lastPayload = withWorkspaceStats(basePayload, stats);
             outputSequence += 1;
             yield* writeRecord({
               kind: item.kind === "snapshot" ? "snapshot" : "event",
@@ -2027,7 +2105,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         ),
       );
     });
-    const run = superviseSubscription(runOnce);
+    const run = superviseSubscription(Effect.scoped(runOnce));
     const fiber = yield* Effect.forkScoped(run);
     yield* Ref.update(subscriptions, (value) => {
       const next = new Map(value);
