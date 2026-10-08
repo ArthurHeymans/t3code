@@ -1,3 +1,5 @@
+import * as LocalConnections from "./connections/LocalConnections.ts";
+import { LocalConnectionsError } from "@t3tools/contracts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -1078,6 +1080,7 @@ const makeWsRpcLayer = (
   clientOrigin: OrchestrationClientOrigin,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  localCatalogRequest: boolean,
 ) =>
   ServerWsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -1172,6 +1175,14 @@ const makeWsRpcLayer = (
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const localConnections = yield* LocalConnections.LocalConnections;
+      const localCatalogGuard = localCatalogRequest
+        ? Effect.void
+        : Effect.fail(
+            new LocalConnectionsError({
+              message: "Connection sharing requires a local connection.",
+            }),
+          );
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1625,6 +1636,7 @@ const makeWsRpcLayer = (
             : undefined;
 
           return {
+            localConnections: localCatalogRequest && localConnections.available,
             environment,
             auth,
             cwd: config.cwd,
@@ -3811,6 +3823,21 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "auth" },
           ),
+        [WS_METHODS.localConnectionsGet]: () =>
+          observeRpcEffect(
+            WS_METHODS.localConnectionsGet,
+            localCatalogGuard.pipe(Effect.andThen(localConnections.snapshot)),
+          ),
+        [WS_METHODS.localConnectionsResolve]: ({ environmentId }) =>
+          observeRpcEffect(
+            WS_METHODS.localConnectionsResolve,
+            localCatalogGuard.pipe(Effect.andThen(localConnections.resolve(environmentId))),
+          ),
+        [WS_METHODS.localConnectionsSubscribe]: () =>
+          observeRpcStream(
+            WS_METHODS.localConnectionsSubscribe,
+            Stream.unwrap(localCatalogGuard.pipe(Effect.as(localConnections.changes))),
+          ),
         [WS_METHODS.subscribeBackgroundPolicy]: (_input) =>
           observeRpcStream(
             WS_METHODS.subscribeBackgroundPolicy,
@@ -3839,6 +3866,7 @@ const makeWsRpcLayer = (
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+    const localCatalogConfig = yield* ServerConfig.ServerConfig;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const sql = yield* SqlClient.SqlClient;
@@ -3891,6 +3919,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               clientOrigin,
               clientAnalyticsProps,
               previewAutomationBroker,
+              LocalConnections.isLocalConnectionsRequest(request, localCatalogConfig.devUrl),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

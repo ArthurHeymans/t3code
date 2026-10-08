@@ -1,3 +1,4 @@
+import { LocalConnectionSharing } from "./LocalConnectionSharing";
 import {
   ChevronsLeftRightEllipsisIcon,
   EllipsisIcon,
@@ -3283,6 +3284,7 @@ export function ConnectionsSettings() {
 
   const primarySettings = (
     <>
+      <LocalConnectionSharing />
       {desktopBridge || canManageLocalBackend ? (
         <>
           <SettingsSection

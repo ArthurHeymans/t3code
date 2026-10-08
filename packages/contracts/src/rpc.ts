@@ -1,3 +1,8 @@
+import {
+  LocalConnectionsSnapshot,
+  LocalConnectionSecret,
+  LocalConnectionsError,
+} from "./localConnections.ts";
 import { OrchestrationDispatchCommandError } from "./orchestrationDispatch.ts";
 import {
   ChatGptReconnectProfileInput,
@@ -443,6 +448,9 @@ export const WS_METHODS = {
   // Server meta
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
+  localConnectionsGet: "localConnections.get",
+  localConnectionsResolve: "localConnections.resolve",
+  localConnectionsSubscribe: "localConnections.subscribe",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -561,6 +569,23 @@ const WsServerProbeRpc = Rpc.make(WS_METHODS.serverProbe, {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: EnvironmentAuthorizationError,
+});
+
+const WsLocalConnectionsGetRpc = Rpc.make(WS_METHODS.localConnectionsGet, {
+  payload: Schema.Struct({}),
+  success: LocalConnectionsSnapshot,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
+});
+const WsLocalConnectionsResolveRpc = Rpc.make(WS_METHODS.localConnectionsResolve, {
+  payload: Schema.Struct({ environmentId: Schema.String }),
+  success: LocalConnectionSecret,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
+});
+const WsLocalConnectionsSubscribeRpc = Rpc.make(WS_METHODS.localConnectionsSubscribe, {
+  payload: Schema.Struct({}),
+  success: LocalConnectionsSnapshot,
+  stream: true,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
 });
 
 const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
@@ -1708,6 +1733,9 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsLocalConnectionsGetRpc,
+  WsLocalConnectionsResolveRpc,
+  WsLocalConnectionsSubscribeRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

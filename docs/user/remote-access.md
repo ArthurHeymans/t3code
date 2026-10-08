@@ -143,6 +143,18 @@ running is left alone.
 For Antigravity's Google callback on a remote host, see
 [remote sign-in](./providers-antigravity.md#sign-in-from-a-remote-device).
 
+## Sharing connections with local clients
+
+On a loopback-hosted primary server, enable **Settings → Connections → Share
+connections with local clients** to let trusted local clients such as Emacs discover
+and use your saved bearer connections. This explicitly copies enabled connections
+and their tokens to that local server, encrypted at rest. Relay credentials and the
+primary connection are excluded. Local clients need administrator read access.
+
+Changes sync while sharing is enabled. Switching sharing off clears the shared
+copy and disconnects attached clients without forgetting your browser connections.
+Sharing is unavailable from remote or tunnel origins and on network-bound servers.
+
 ## Manage or revoke access
 
 On the host, **Settings → Connections** lets authorized administrators create

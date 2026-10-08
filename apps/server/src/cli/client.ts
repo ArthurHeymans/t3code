@@ -1,3 +1,10 @@
+import {
+  EnvironmentAttachInput,
+  EnvironmentDetachInput,
+  EnvironmentSendMessage,
+  EnvironmentGatewayError,
+  makeEnvironmentGateway,
+} from "./EnvironmentGateway.ts";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as EffectNodeStream from "@effect/platform-node/NodeStream";
 import * as RpcSession from "@t3tools/client-runtime/rpc";
@@ -258,10 +265,13 @@ const ClientMessage = Schema.Union([
   CancelMessage,
   SubscribeMessage,
   UnsubscribeMessage,
+  EnvironmentSendMessage,
 ]);
 type ClientMessage = typeof ClientMessage.Type;
 
 const decodeClientMessage = Schema.decodeUnknownEffect(ClientMessage);
+const decodeEnvironmentAttachInput = Schema.decodeUnknownEffect(EnvironmentAttachInput);
+const decodeEnvironmentDetachInput = Schema.decodeUnknownEffect(EnvironmentDetachInput);
 const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
 
 class ClientBridgeError extends Schema.TaggedError<ClientBridgeError>()("ClientBridgeError", {
@@ -367,15 +377,14 @@ export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
     })),
     truncated:
       providers.length > 32 ||
-      providers.some(
-        (provider) =>
-          provider.models.some(
-            (model) =>
-              (model.capabilities?.optionDescriptors ?? []).length > 16 ||
-              (model.capabilities?.optionDescriptors ?? []).some(
-                (option) => option.type === "select" && option.options.length > 32,
-              ),
-          ),
+      providers.some((provider) =>
+        provider.models.some(
+          (model) =>
+            (model.capabilities?.optionDescriptors ?? []).length > 16 ||
+            (model.capabilities?.optionDescriptors ?? []).some(
+              (option) => option.type === "select" && option.options.length > 32,
+            ),
+        ),
       ),
   };
   // Bound by encoded size, not model count: multi-provider runtimes such as
@@ -1426,6 +1435,25 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   // History paging needs the subscription's live window and server cursor.
   const threadHistories = new Map<string, ThreadHistoryState>();
   const subscriptionThreads = new Map<string, string>();
+  const gateway = yield* makeEnvironmentGateway(
+    (environmentId) =>
+      Effect.flatMap(Ref.get(connection), (current) =>
+        current === null
+          ? Effect.fail(fail("not-ready", "Send hello first."))
+          : current.session.client[WS_METHODS.localConnectionsResolve]({ environmentId }).pipe(
+              Effect.mapError(() => fail("sharing-unavailable", "Shared entry unavailable.")),
+            ),
+      ).pipe(
+        Effect.mapError(
+          () => new EnvironmentGatewayError({ message: "Shared entry unavailable." }),
+        ),
+      ),
+    (record) =>
+      writeRecord(record).pipe(
+        Effect.mapError(() => new EnvironmentGatewayError({ message: "Output unavailable." })),
+      ),
+  );
+  let environmentsAvailable = false;
   yield* Effect.addFinalizer(() =>
     Ref.get(connection).pipe(
       Effect.flatMap((current) => (current ? Scope.close(current.scope, Exit.void) : Effect.void)),
@@ -1532,6 +1560,29 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
   ) {
     const dispatch = current.session.client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand];
     switch (message.operation) {
+      case "environment.attach": {
+        if (!environmentsAvailable || message.input === null)
+          return yield* fail(
+            "sharing-unavailable",
+            "Use a local primary with an access:read admin token and enable connection sharing.",
+          );
+        const input = yield* decodeEnvironmentAttachInput(message.input).pipe(
+          Effect.mapError(() => fail("invalid-input", "Invalid attachment input.")),
+        );
+        if (input.clientEnvironmentId === current.clientEnvironmentId)
+          return yield* fail("invalid-input", "Cannot replace the root environment.");
+        return yield* gateway
+          .attach(input)
+          .pipe(
+            Effect.mapError(() => fail("attach-failed", "Cannot attach this shared environment.")),
+          );
+      }
+      case "environment.detach": {
+        const input = yield* decodeEnvironmentDetachInput(message.input).pipe(
+          Effect.mapError(() => fail("invalid-input", "Invalid detach input.")),
+        );
+        return yield* gateway.detach(input.clientEnvironmentId);
+      }
       case "server.getConfig":
         return {
           serverVersion: current.config.environment.serverVersion,
@@ -2107,6 +2158,28 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         yield* Ref.set(connection, connected);
         yield* Deferred.succeed(firstReady, connected);
         yield* monitorConnection(connected).pipe(Effect.forkScoped);
+        if (
+          process.env.T3_CLIENT_INTERNAL_CHILD !== "1" &&
+          connected.config.localConnections === true
+        ) {
+          environmentsAvailable = yield* connected.session.client[WS_METHODS.localConnectionsGet](
+            {},
+          ).pipe(
+            Effect.tap(gateway.reconcile),
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+          if (environmentsAvailable) {
+            yield* superviseSubscription(
+              Effect.gen(function* () {
+                const current = yield* awaitConnection();
+                yield* current.session.client[WS_METHODS.localConnectionsSubscribe]({}).pipe(
+                  Stream.runForEach(gateway.reconcile),
+                );
+              }),
+            ).pipe(Effect.forkScoped);
+          }
+        }
         yield* writeRecord({
           kind: "ready",
           protocolVersion: PROTOCOL_VERSION,
@@ -2123,11 +2196,23 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             threadLifecycle: true,
             composerCompletion: true,
             terminal: false,
+            environments: environmentsAvailable,
             serverEnvironmentId: connected.config.environment.environmentId,
           },
         });
         return;
       }
+      case "environment.send":
+        yield* gateway.send(message.environmentId, message.message).pipe(
+          Effect.catch(() =>
+            writeRecord({
+              kind: "state",
+              phase: "ready",
+              message: "Child input rejected: unknown attachment or invalid child message.",
+            }),
+          ),
+        );
+        return;
       case "request": {
         const current = yield* requireConnection();
         yield* respondToRequest(current, message);
@@ -2136,6 +2221,40 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
       case "cancel":
         return;
       case "subscribe":
+        if (message.stream === "environments") {
+          if (!environmentsAvailable || message.identity !== null)
+            return yield* fail(
+              "sharing-unavailable",
+              "Connection sharing requires a local admin connection; identity must be null.",
+            );
+          yield* stopSubscription(message.subscriptionId);
+          let sequence = message.resumeSequence ?? 0;
+          const run = superviseSubscription(
+            Effect.gen(function* () {
+              const current = yield* awaitConnection();
+              let first = true;
+              yield* current.session.client[WS_METHODS.localConnectionsSubscribe]({}).pipe(
+                Stream.runForEach((payload) =>
+                  Effect.gen(function* () {
+                    yield* writeRecord({
+                      kind: first ? "snapshot" : "event",
+                      subscriptionId: message.subscriptionId,
+                      generation: current.generation,
+                      sequence: ++sequence,
+                      payload,
+                    });
+                    first = false;
+                  }),
+                ),
+              );
+            }),
+          );
+          const fiber = yield* run.pipe(Effect.forkScoped);
+          yield* Ref.update(subscriptions, (value) =>
+            new Map(value).set(message.subscriptionId, fiber),
+          );
+          return;
+        }
         if (message.stream === "shell") {
           yield* startShellSubscription(message);
           return;
@@ -2183,6 +2302,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
 
 const ClientBridgeLayer = Layer.mergeAll(
   FetchHttpClient.layer,
+  Layer.succeed(FetchHttpClient.RequestInit, { redirect: "error" }),
   RpcSession.layerWithOptions({}).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor)),
 );
 
