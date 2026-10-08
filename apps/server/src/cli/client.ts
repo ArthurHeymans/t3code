@@ -42,6 +42,8 @@ import {
   OrchestrationV2Command,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
   ProjectId,
+  type Project,
+  type ProjectMutation,
   ProviderApprovalDecision,
   RunId,
   TrimmedNonEmptyString,
@@ -176,6 +178,13 @@ const ThreadSearchInput = Schema.Struct({
   limit: Schema.optional(Schema.Int),
 });
 const ProviderCommandsInput = Schema.Struct({ instanceId: Schema.String });
+const ProjectCreateInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  title: TrimmedNonEmptyString,
+  workspaceRoot: TrimmedNonEmptyString,
+});
+
 const ProjectSearchEntriesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   query: Schema.String,
@@ -224,6 +233,7 @@ export const decodePassthroughThreadCommand = (command: unknown) =>
   );
 
 const invalidInput = (cause: unknown) => fail("invalid-input", safeErrorMessage(cause));
+const decodeProjectCreateInput = Schema.decodeUnknownEffect(ProjectCreateInput);
 const decodeThreadCreateInput = Schema.decodeUnknownEffect(ThreadCreateInput);
 const decodeThreadForkInput = Schema.decodeUnknownEffect(ThreadForkInput);
 const decodeThreadCommandInput = Schema.decodeUnknownEffect(ThreadCommandInput);
@@ -231,6 +241,22 @@ const decodeThreadHistoryInput = Schema.decodeUnknownEffect(ThreadHistoryInput);
 const decodeThreadSearchInput = Schema.decodeUnknownEffect(ThreadSearchInput);
 const decodeProviderCommandsInput = Schema.decodeUnknownEffect(ProviderCommandsInput);
 const decodeProjectSearchEntriesInput = Schema.decodeUnknownEffect(ProjectSearchEntriesInput);
+
+export const registerProject = Effect.fn("clientBridge.registerProject")(function* <E>(
+  input: unknown,
+  mutate: (command: ProjectMutation) => Effect.Effect<Project, E>,
+) {
+  const decoded = yield* decodeProjectCreateInput(input).pipe(Effect.mapError(invalidInput));
+  const project = yield* mutate({ type: "project.create", ...decoded });
+  return {
+    project: {
+      id: project.id,
+      name: singleLine(project.repositoryIdentity?.displayName ?? project.title),
+      root: singleLine(project.workspaceRoot, 2_000),
+      threads: [],
+    },
+  };
+});
 
 const decodeThreadSendInput = Schema.decodeUnknownEffect(ThreadSendInput);
 const decodeThreadInterruptInput = Schema.decodeUnknownEffect(ThreadInterruptInput);
@@ -1599,6 +1625,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             threadSnapshotPagination: current.config.threadSnapshotPagination === true,
             threadLifecycle: true,
             composerCompletion: true,
+            projectRegistration: true,
           },
         };
       case "model.catalog":
@@ -1847,6 +1874,11 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
         );
         return normalizeProviderCommands(current.config.providers, input.instanceId);
       }
+      case "project.create":
+        return yield* registerProject(
+          message.input,
+          current.session.client[WS_METHODS.projectsMutate],
+        );
       case "project.searchEntries": {
         const input = yield* decodeProjectSearchEntriesInput(message.input).pipe(
           Effect.mapError(invalidInput),
@@ -2195,6 +2227,7 @@ const runClientBridge = Effect.fn("clientBridge.run")(function* () {
             modelSelection: true,
             threadLifecycle: true,
             composerCompletion: true,
+            projectRegistration: true,
             terminal: false,
             environments: environmentsAvailable,
             serverEnvironmentId: connected.config.environment.environmentId,

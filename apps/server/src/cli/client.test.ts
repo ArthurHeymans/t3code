@@ -4,6 +4,7 @@ import {
   MessageId,
   NodeId,
   ProjectId,
+  ProjectMutationError,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -37,6 +38,7 @@ import {
   bridgeSocketUrl,
   MAX_SHELL_PROJECTS,
   decodePassthroughThreadCommand,
+  registerProject,
   normalizeArchivedThreads,
   normalizeModelCatalog,
   normalizeProviderCommands,
@@ -81,6 +83,74 @@ const runBridge = (input: string) =>
   );
 
 describe("stdio client bridge", () => {
+  it.effect("registers an existing workspace with client-supplied IDs", () =>
+    Effect.gen(function* () {
+      const result = yield* registerProject(
+        {
+          commandId: "register-majutsu",
+          projectId: "majutsu",
+          title: "majutsu",
+          workspaceRoot: "/home/me/src/majutsu",
+          // Registration never creates a directory, even if requested.
+          createWorkspaceRootIfMissing: true,
+        },
+        (command) => {
+          expect(command).toEqual({
+            type: "project.create",
+            commandId: "register-majutsu",
+            projectId: "majutsu",
+            title: "majutsu",
+            workspaceRoot: "/home/me/src/majutsu",
+          });
+          return Effect.succeed({
+            id: ProjectId.make("majutsu"),
+            title: "majutsu",
+            workspaceRoot: "/home/me/src/majutsu",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: NOW,
+            updatedAt: NOW,
+            deletedAt: null,
+          });
+        },
+      );
+      expect(result).toEqual({
+        project: { id: "majutsu", name: "majutsu", root: "/home/me/src/majutsu", threads: [] },
+      });
+    }),
+  );
+
+  it.effect("rejects invalid registration and propagates mutation failures without retry", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const mutate = () => {
+        calls += 1;
+        return Effect.fail(
+          new ProjectMutationError({
+            commandId: CommandId.make("register-majutsu"),
+            message: "Permission denied",
+          }),
+        );
+      };
+      const invalid = yield* Effect.result(registerProject({ title: "majutsu" }, mutate));
+      expect(invalid._tag).toBe("Failure");
+      expect(calls).toBe(0);
+      const denied = yield* Effect.result(
+        registerProject(
+          {
+            commandId: "register-majutsu",
+            projectId: "majutsu",
+            title: "majutsu",
+            workspaceRoot: "/home/me/src/majutsu",
+          },
+          mutate,
+        ),
+      );
+      expect(denied._tag).toBe("Failure");
+      expect(calls).toBe(1);
+    }),
+  );
+
   it("negotiates the orchestration protocol on its websocket URL", () => {
     const url = new URL(bridgeSocketUrl("ws://127.0.0.1:3773/ws?wsTicket=opaque"));
     expect(url.searchParams.get("wsTicket")).toBe("opaque");
