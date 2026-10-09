@@ -122,7 +122,7 @@ async function request(
   });
   if (!response.ok)
     throw new Error(
-      "Local sharing requires a loopback primary server and administrator permissions.",
+      "Local sharing requires a localhost connection to the primary server and administrator permissions.",
     );
   return response;
 }

@@ -93,37 +93,46 @@ describe("local shared catalog", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect(
-    "rejects non-loopback hosting, disabled entries, duplicates and endpoint credentials",
-    () =>
-      Effect.gen(function* () {
-        const { layer, secrets, config } = yield* fixture;
+  it.effect("rejects disabled entries, duplicates and endpoint credentials", () =>
+    Effect.gen(function* () {
+      const { layer } = yield* fixture;
+      yield* Effect.gen(function* () {
+        const catalog = yield* LocalConnections.LocalConnections;
+        for (const entries of [
+          [{ ...entry, enabled: false }],
+          [entry, entry],
+          [{ ...entry, endpoint: "https://user:password@host" }],
+          [{ ...entry, endpoint: "https://host?token=secret" }],
+        ]) {
+          expect(yield* Effect.flip(catalog.replace(entries, true))).toBeDefined();
+        }
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps shared connections available when the server also accepts network clients", () =>
+    Effect.gen(function* () {
+      const { layer, secrets, config } = yield* fixture;
+      yield* Effect.gen(function* () {
+        const catalog = yield* LocalConnections.LocalConnections;
+        yield* catalog.replace([entry], true, undefined, (yield* catalog.status).revision);
+      }).pipe(Effect.provide(layer));
+      for (const host of ["0.0.0.0", "::", "192.168.1.2"]) {
         yield* Effect.gen(function* () {
           const catalog = yield* LocalConnections.LocalConnections;
-          for (const entries of [
-            [{ ...entry, enabled: false }],
-            [entry, entry],
-            [{ ...entry, endpoint: "https://user:password@host" }],
-            [{ ...entry, endpoint: "https://host?token=secret" }],
-          ]) {
-            expect(yield* Effect.flip(catalog.replace(entries, true))).toBeDefined();
-          }
-        }).pipe(Effect.provide(layer));
-        yield* Effect.gen(function* () {
-          const catalog = yield* LocalConnections.LocalConnections;
-          expect(catalog.available).toBe(false);
-          expect(yield* Effect.flip(catalog.replace([entry], true))).toBeDefined();
+          expect(catalog.available).toBe(true);
+          expect((yield* catalog.snapshot).environments.map(({ id }) => id)).toEqual([entry.id]);
+          expect(yield* catalog.resolve(entry.id)).toEqual(entry);
         }).pipe(
           Effect.provide(
             LocalConnections.layer.pipe(
               Layer.provide(Layer.succeed(ServerSecretStore.ServerSecretStore, secrets.service)),
-              Layer.provide(
-                Layer.succeed(ServerConfig.ServerConfig, { ...config, host: "0.0.0.0" }),
-              ),
+              Layer.provide(Layer.succeed(ServerConfig.ServerConfig, { ...config, host })),
             ),
           ),
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("streams authoritative removal snapshots without credentials", () =>
@@ -241,9 +250,11 @@ describe("local shared catalog", () => {
   });
 
   it("checks actual peer, host and exact browser origin rather than forwarding headers", () => {
-    const request = (host: string, peer: string, origin?: string) =>
+    const request = (host: string, peer: string, origin?: string, extraHeaders = {}) =>
       HttpServerRequest.fromWeb(
-        new Request(`http://${host}/ws`, { headers: { host, ...(origin ? { origin } : {}) } }),
+        new Request(`http://${host}/ws`, {
+          headers: { host, ...(origin ? { origin } : {}), ...extraHeaders },
+        }),
       ).modify({ remoteAddress: Option.some(peer) });
     expect(LocalConnections.isLocalConnectionsRequest(request("127.0.0.1:3773", "127.0.0.1"))).toBe(
       true,
@@ -254,6 +265,14 @@ describe("local shared catalog", () => {
     expect(LocalConnections.isLocalConnectionsRequest(request("public.example", "127.0.0.1"))).toBe(
       false,
     );
+    expect(LocalConnections.isLocalConnectionsRequest(request("[::1]:3773", "::1"))).toBe(true);
+    expect(
+      LocalConnections.isLocalConnectionsRequest(
+        request("127.0.0.1:3773", "192.168.1.2", undefined, {
+          "x-forwarded-for": "127.0.0.1",
+        }),
+      ),
+    ).toBe(false);
     expect(
       LocalConnections.isLocalConnectionsRequest(
         request("127.0.0.1:3773", "127.0.0.1", "http://evil.example"),

@@ -15,7 +15,6 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
-import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 
 const Document = Schema.Struct({
@@ -79,17 +78,9 @@ export class LocalConnections extends Context.Service<
 >()("t3/connections/LocalConnections") {}
 
 const make = Effect.gen(function* () {
-  const config = yield* ServerConfig.ServerConfig;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
-  const loopback = isLocalConnectionsEndpoint(
-    `http://${config.host === "::1" ? "[::1]" : (config.host ?? "127.0.0.1")}:${config.port}`,
-  );
+  // HTTP and RPC authorize the actual connection, not the server's listen address.
   const loaded = yield* Effect.gen(function* () {
-    if (!loopback)
-      return {
-        key: undefined,
-        document: { enabled: false, revision: "initial", environments: [] },
-      };
     const key = yield* secrets
       .getOrCreateRandom("local-connections-key", 32)
       .pipe(Effect.mapError(failure));
@@ -119,7 +110,7 @@ const make = Effect.gen(function* () {
       ),
     ),
   );
-  const available = loopback && loaded.key !== undefined;
+  const available = loaded.key !== undefined;
   const guard = available ? Effect.void : Effect.fail(failure());
   const state = yield* SubscriptionRef.make<typeof Document.Type>(loaded.document);
   const lock = yield* Semaphore.make(1);

@@ -74,8 +74,8 @@ export function LocalConnectionSharing() {
       )}
       {!status.available && (
         <p className="text-xs text-muted-foreground">
-          Unavailable: open a loopback-hosted primary server with administrator permissions. Remote,
-          relay, and tunnel origins cannot share connections.
+          Unavailable: connect to the primary server through localhost with administrator
+          permissions. Remote, relay, and tunnel origins cannot share connections.
         </p>
       )}
       {(error || status.syncError) && (
