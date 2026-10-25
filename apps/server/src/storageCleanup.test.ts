@@ -21,6 +21,8 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ServerConfig from "./config.ts";
 import * as StorageCleanup from "./storageCleanup.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import * as JjVcsDriver from "./vcs/JjVcsDriver.ts";
+import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Settings from "./serverSettings.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -239,24 +241,42 @@ const cleanupFixture = (
     worktreeAfterDays: 8,
     worktreeOnDelete: true,
   },
+  vcs: "git" | "jj" = "git",
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const config = yield* ServerConfig.ServerConfig;
     const git = yield* GitVcsDriver.GitVcsDriver;
+    const jj = yield* JjVcsDriver.JjVcsDriver;
     const repo = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "cleanup-repo-" }));
     const command = (cwd: string, args: string[]) =>
       git.execute({ operation: "cleanup-test", cwd, args });
-    yield* command(repo, ["init", "-b", "main"]);
-    yield* command(repo, ["config", "user.email", "cleanup@example.test"]);
-    yield* command(repo, ["config", "user.name", "Cleanup test"]);
-    yield* fs.writeFileString(`${repo}/tracked.txt`, "original\n");
-    yield* fs.writeFileString(`${repo}/.gitignore`, ".env\ndist/\nnode_modules/\n");
-    yield* command(repo, ["add", "."]);
-    yield* command(repo, ["commit", "-m", "initial"]);
+    const jjCommand = (cwd: string, args: string[]) =>
+      jj.execute({ operation: "cleanup-test", cwd, args });
     yield* fs.makeDirectory(config.worktreesDir, { recursive: true });
     const worktree = `${config.worktreesDir}/feature`;
-    yield* command(repo, ["worktree", "add", "-b", "feature", worktree]);
+    yield* fs.writeFileString(`${repo}/tracked.txt`, "original\n");
+    yield* fs.writeFileString(`${repo}/.gitignore`, ".env\ndist/\nnode_modules/\n");
+    if (vcs === "jj") {
+      yield* jjCommand(repo, ["git", "init", "--colocate"]);
+      // A bookmark on another workspace's mutable @ makes the driver start
+      // the new workspace from its parent, so commit main first.
+      yield* jjCommand(repo, ["commit", "-m", "initial"]);
+      yield* jjCommand(repo, ["bookmark", "create", "main", "-r", "@-"]);
+      yield* jj.createWorktree({
+        cwd: repo,
+        refName: "main",
+        newRefName: "feature",
+        path: worktree,
+      });
+    } else {
+      yield* command(repo, ["init", "-b", "main"]);
+      yield* command(repo, ["config", "user.email", "cleanup@example.test"]);
+      yield* command(repo, ["config", "user.name", "Cleanup test"]);
+      yield* command(repo, ["add", "."]);
+      yield* command(repo, ["commit", "-m", "initial"]);
+      yield* command(repo, ["worktree", "add", "-b", "feature", worktree]);
+    }
     let settings: import("@t3tools/contracts").ServerSettings = {
       ...DEFAULT_SERVER_SETTINGS,
       storageCleanup,
@@ -273,6 +293,7 @@ const cleanupFixture = (
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
     const context = yield* Layer.build(StorageCleanup.layer).pipe(
+      Effect.provideService(JjVcsDriver.JjVcsDriver, jj),
       Effect.provideService(GitVcsDriver.GitVcsDriver, {
         ...git,
         execute: (input) =>
@@ -382,6 +403,8 @@ const cleanupFixture = (
     return {
       service: Context.get(context, StorageCleanup.StorageCleanup),
       repo,
+      jj,
+      jjCommand,
       editBeforeRemoval: () => {
         editBeforeRemoval = true;
       },
@@ -467,6 +490,8 @@ const pausedMeasurementFixture = (storageCleanup?: StorageCleanupSettings) =>
     return { ...fixture, measuring, resume };
   });
 const cleanupTestLayer = GitVcsDriver.layer.pipe(
+  Layer.provideMerge(JjVcsDriver.layer),
+  Layer.provideMerge(VcsProcess.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "storage-cleanup-" })),
   Layer.provideMerge(NodeServices.layer),
 );
@@ -477,6 +502,7 @@ const runCleanupTest = <A, E>(
     | FileSystem.FileSystem
     | ServerConfig.ServerConfig
     | GitVcsDriver.GitVcsDriver
+    | JjVcsDriver.JjVcsDriver
     | Path.Path
     | Scope.Scope
   >,
@@ -1885,3 +1911,137 @@ it.live("keeps saved usage data when removing a settled checkout", () =>
     }),
   ),
 );
+
+describe("Jujutsu workspace cleanup", () => {
+  const jjEntries = (report: { entries: ReadonlyArray<{ path: string | null }> }, path: string) =>
+    report.entries.filter((entry) => entry.path === path);
+
+  const withRemote = (fixture: Effect.Success<ReturnType<typeof cleanupFixture>>) =>
+    Effect.gen(function* () {
+      const remote = `${fixture.repo}-remote.git`;
+      yield* fixture.command(fixture.repo, ["init", "--bare", remote]);
+      yield* fixture.jjCommand(fixture.repo, ["git", "remote", "add", "origin", remote]);
+      yield* fixture.jjCommand(fixture.repo, [
+        "git",
+        "push",
+        "--remote",
+        "origin",
+        "--bookmark",
+        "main",
+      ]);
+      yield* fixture.jjCommand(fixture.repo, ["git", "fetch", "--remote", "origin"]);
+    });
+
+  it.effect("removes an inactive workspace whose commits its bookmark keeps", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW_MS);
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "removed", reason: "Inactive for 30 days" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+        expect(
+          (yield* fixture.jj.listWorkspaces(fixture.repo)).some(
+            (workspace) => workspace.path === fixture.worktree,
+          ),
+        ).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("keeps a workspace with working-copy edits", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/tracked.txt`, "edited\n");
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Has uncommitted changes (1 file)" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("keeps commits that only the workspace keeps", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/tracked.txt`, "first\n");
+        yield* fixture.jjCommand(fixture.worktree, ["commit", "-m", "first"]);
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/second.txt`, "second\n");
+        yield* fixture.jjCommand(fixture.worktree, ["commit", "-m", "second"]);
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Has commits that only this workspace keeps" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("protects ignored files only under any-local-files", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        fixture.setPolicy("any-local-files");
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/.env`, "SECRET=1\n");
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Has ignored files (.env)" },
+        ]);
+      }),
+    ),
+  );
+
+  it.live("deletes an ignored directory under the default policy", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        yield* fixture.fs.makeDirectory(`${fixture.worktree}/dist`, { recursive: true });
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/dist/bundle.js`, "bundle\n");
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([{ outcome: "removed" }]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("removes a workspace with nothing beyond the default branch", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(
+          { ...DEFAULT_SERVER_SETTINGS.storageCleanup, worktreeUnchanged: true },
+          "jj",
+        );
+        yield* withRemote(fixture);
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "removed", reason: "No commits beyond the default branch" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("keeps a workspace with commits beyond the default branch", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(
+          { ...DEFAULT_SERVER_SETTINGS.storageCleanup, worktreeUnchanged: true },
+          "jj",
+        );
+        yield* fixture.fs.writeFileString(`${fixture.worktree}/tracked.txt`, "feature\n");
+        yield* fixture.jjCommand(fixture.worktree, ["commit", "-m", "feature"]);
+        yield* withRemote(fixture);
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Has commits beyond the default branch" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+});
