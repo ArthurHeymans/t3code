@@ -7,6 +7,8 @@ import * as Path from "effect/Path";
 import { ChildProcessSpawner } from "effect/process";
 
 import * as VcsProcess from "./VcsProcess.ts";
+import * as GitVcsDriver from "./GitVcsDriver.ts";
+import * as ServerConfig from "../config.ts";
 import * as VcsProjectConfig from "./VcsProjectConfig.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
 
@@ -24,6 +26,8 @@ const normalizeGitArgs = (args: ReadonlyArray<string>): ReadonlyArray<string> =>
 describe("VcsDriverRegistry", () => {
   const makeDiskBackedLayer = (rootDir: string, calls: string[]) =>
     Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+      Layer.provide(GitVcsDriver.layer),
+      Layer.provide(ServerConfig.layerTest(rootDir, { prefix: "t3-vcs-registry-" })),
       Layer.provide(NodeServices.layer),
       Layer.provide(
         Layer.mock(VcsProjectConfig.VcsProjectConfig)({

@@ -5,6 +5,7 @@ import {
   GitCommandError,
   GitPreparePullRequestThreadResult,
   GitRunStackedActionInput,
+  VcsStatusLocalResult,
 } from "./git.ts";
 
 const decodeGitCommandError = Schema.decodeUnknownSync(Schema.toCodecJson(GitCommandError));
@@ -12,6 +13,20 @@ const decodePreparePullRequestThreadResult = Schema.decodeUnknownSync(
   GitPreparePullRequestThreadResult,
 );
 const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedActionInput);
+const decodeLocalStatus = Schema.decodeUnknownSync(VcsStatusLocalResult);
+
+it("accepts Git status from servers without Jujutsu support", () => {
+  expect(
+    decodeLocalStatus({
+      isRepo: true,
+      hasPrimaryRemote: true,
+      isDefaultRef: false,
+      refName: "feature/test",
+      hasWorkingTreeChanges: false,
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+    }).kind,
+  ).toBe("git");
+});
 
 describe("GitCommandError", () => {
   it("decodes an unknown failure reason as absent", () => {

@@ -89,6 +89,7 @@ export interface GitLocalStatusOptions {
 }
 
 export interface GitRemoteStatusDetails {
+  publication?: { readonly name: string; readonly remoteName: string; readonly remoteRef: string };
   isRepo: boolean;
   defaultBranch: string | null;
   isDefaultBranch: boolean;
@@ -539,6 +540,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   const capabilities = {
     kind: "git" as const,
     supportsWorktrees: true,
+    supportsWorkspaceSelection: true,
     supportsBookmarks: false,
     supportsAtomicSnapshot: false,
     supportsPushDefaultRemote: true,
@@ -559,6 +561,45 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     ).pipe(
       Effect.map((result) => result.exitCode === 0 && result.stdout.trim() === "true"),
       Effect.catchIf(isMissingExecutable, () => Effect.succeed(false)),
+    );
+
+  const listWorkspaces: VcsDriver.VcsDriver["Service"]["listWorkspaces"] = (cwd) =>
+    gitCommand(
+      vcsProcess,
+      "GitVcsDriver.listWorkspaces",
+      cwd,
+      ["worktree", "list", "--porcelain", "-z"],
+      {
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 256 * 1024,
+      },
+    ).pipe(
+      Effect.map((result) => {
+        if (result.exitCode !== 0) return [];
+        const workspaces: Array<{ name: string; path: string; current: boolean }> = [];
+        let workspacePath: string | null = null;
+        let refName: string | null = null;
+        const flush = () => {
+          if (workspacePath !== null) {
+            workspaces.push({
+              name: refName ?? path.basename(workspacePath),
+              path: path.normalize(path.resolve(workspacePath)),
+              current: false,
+            });
+          }
+          workspacePath = null;
+          refName = null;
+        };
+        for (const field of result.stdout.split("\0")) {
+          if (field === "") flush();
+          else if (field.startsWith("worktree ")) workspacePath = field.slice("worktree ".length);
+          else if (field.startsWith("branch refs/heads/"))
+            refName = field.slice("branch refs/heads/".length);
+        }
+        flush();
+        return workspaces;
+      }),
     );
 
   const execute: VcsDriver.VcsDriver["Service"]["execute"] = (input) =>
@@ -1388,6 +1429,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     detectRepository,
     isInsideWorkTree,
     listWorkspaceFiles,
+    listWorkspaces,
     listRemotes,
     filterIgnoredPaths,
     initRepository,

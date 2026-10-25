@@ -10,6 +10,8 @@ import * as Path from "effect/Path";
 import type { VcsDriverKind, VcsError, VcsRepositoryIdentity } from "@t3tools/contracts";
 import { VcsUnsupportedOperationError } from "@t3tools/contracts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import * as GitWorkflow from "./GitWorkflow.ts";
+import * as JjVcsDriver from "./JjVcsDriver.ts";
 import * as VcsProjectConfig from "./VcsProjectConfig.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 
@@ -67,9 +69,15 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const projectConfig = yield* VcsProjectConfig.VcsProjectConfig;
-  const git = yield* GitVcsDriver.makeVcsDriver;
+  const gitCore = yield* GitVcsDriver.GitVcsDriver;
+  const git = {
+    ...(yield* GitVcsDriver.makeVcsDriver),
+    workflow: GitWorkflow.make(gitCore),
+  };
+  const jj = yield* JjVcsDriver.makeVcsDriver();
   const drivers: Partial<Record<VcsDriverKind, VcsDriver.VcsDriver["Service"]>> = {
     git,
+    jj,
   };
 
   const get: VcsDriverRegistry["Service"]["get"] = (kind) => {
@@ -111,6 +119,11 @@ export const make = Effect.gen(function* () {
     if (requestedKind !== "auto" && requestedKind !== "unknown") {
       const driver = yield* get(requestedKind);
       return yield* detectWithDriver(requestedKind, driver, input.cwd);
+    }
+
+    const jjDetected = yield* detectWithDriver("jj", jj, input.cwd);
+    if (jjDetected) {
+      return jjDetected;
     }
 
     return yield* detectWithDriver("git", git, input.cwd);
@@ -207,4 +220,7 @@ export const make = Effect.gen(function* () {
 
 export const layer = Layer.effect(VcsDriverRegistry, make).pipe(
   Layer.provide(VcsProjectConfig.layer),
+  // Reuse this same layer throughout the server graph: workflow and raw Git
+  // operations must share cache invalidation and process permits.
+  Layer.provideMerge(GitVcsDriver.layer),
 );

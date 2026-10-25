@@ -1112,6 +1112,7 @@ export const make = Effect.gen(function* () {
       : null;
 
     return {
+      kind: details.isRepo ? "git" : "unknown",
       isRepo: details.isRepo,
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
       hasPrimaryRemote: details.hasOriginRemote,

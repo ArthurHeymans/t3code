@@ -830,6 +830,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       const status = yield* manager.status({ cwd });
 
       expect(status).toEqual({
+        kind: "unknown",
         isRepo: false,
         hasPrimaryRemote: false,
         isDefaultRef: false,

@@ -7,12 +7,16 @@ import type {
   VcsInitInput,
   VcsListRemotesResult,
   VcsListWorkspaceFilesResult,
+  VcsWorkspace,
+  ReviewDiffFileContentsInput,
+  ReviewDiffFileContentsResult,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
   VcsRepositoryIdentity,
 } from "@t3tools/contracts";
 import { CheckpointRef } from "@t3tools/contracts";
 import * as VcsProcess from "./VcsProcess.ts";
+import type { VcsWorkflow } from "./VcsWorkflow.ts";
 
 export interface VcsCaptureCheckpointInput {
   readonly cwd: string;
@@ -68,29 +72,34 @@ export interface VcsCheckpointOps {
   ) => Effect.Effect<void, VcsError>;
 }
 
-export class VcsDriver extends Context.Service<
-  VcsDriver,
-  {
-    readonly capabilities: VcsDriverCapabilities;
-    readonly execute: (
-      input: Omit<VcsProcess.VcsProcessInput, "command">,
-    ) => Effect.Effect<VcsProcess.VcsProcessOutput, VcsError>;
-    readonly checkpoints?: VcsCheckpointOps;
-    readonly detectRepository: (
-      cwd: string,
-    ) => Effect.Effect<VcsRepositoryIdentity | null, VcsError>;
-    readonly isInsideWorkTree: (cwd: string) => Effect.Effect<boolean, VcsError>;
-    readonly listWorkspaceFiles: (
-      cwd: string,
-    ) => Effect.Effect<VcsListWorkspaceFilesResult, VcsError>;
-    readonly listRemotes: (cwd: string) => Effect.Effect<VcsListRemotesResult, VcsError>;
-    readonly filterIgnoredPaths: (
-      cwd: string,
-      relativePaths: ReadonlyArray<string>,
-    ) => Effect.Effect<ReadonlyArray<string>, VcsError>;
-    readonly initRepository: (input: VcsInitInput) => Effect.Effect<void, VcsError>;
-    readonly getDiffPreview?: (
-      input: ReviewDiffPreviewInput,
-    ) => Effect.Effect<ReviewDiffPreviewResult, VcsError>;
-  }
->()("t3/vcs/VcsDriver") {}
+export interface VcsDriverShape {
+  readonly capabilities: VcsDriverCapabilities;
+  readonly execute: (
+    input: Omit<VcsProcess.VcsProcessInput, "command">,
+  ) => Effect.Effect<VcsProcess.VcsProcessOutput, VcsError>;
+  readonly readGitBackend?: (
+    input: Omit<VcsProcess.VcsProcessInput, "command">,
+  ) => Effect.Effect<VcsProcess.VcsProcessOutput, VcsError>;
+  readonly checkpoints?: VcsCheckpointOps;
+  readonly workflow?: VcsWorkflow;
+  readonly detectRepository: (cwd: string) => Effect.Effect<VcsRepositoryIdentity | null, VcsError>;
+  readonly isInsideWorkTree: (cwd: string) => Effect.Effect<boolean, VcsError>;
+  readonly listWorkspaceFiles: (
+    cwd: string,
+  ) => Effect.Effect<VcsListWorkspaceFilesResult, VcsError>;
+  readonly listWorkspaces: (cwd: string) => Effect.Effect<ReadonlyArray<VcsWorkspace>, VcsError>;
+  readonly listRemotes: (cwd: string) => Effect.Effect<VcsListRemotesResult, VcsError>;
+  readonly filterIgnoredPaths: (
+    cwd: string,
+    relativePaths: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<string>, VcsError>;
+  readonly initRepository: (input: VcsInitInput) => Effect.Effect<void, VcsError>;
+  readonly getDiffPreview?: (
+    input: ReviewDiffPreviewInput,
+  ) => Effect.Effect<ReviewDiffPreviewResult, VcsError>;
+  readonly getDiffFileContents?: (
+    input: ReviewDiffFileContentsInput,
+  ) => Effect.Effect<ReviewDiffFileContentsResult, VcsError>;
+}
+
+export class VcsDriver extends Context.Service<VcsDriver, VcsDriverShape>()("t3/vcs/VcsDriver") {}
