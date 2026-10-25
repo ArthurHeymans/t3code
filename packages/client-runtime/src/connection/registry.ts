@@ -864,8 +864,13 @@ export const make = Effect.gen(function* () {
     );
 
   // Plain HTTP routes are unusable from an HTTPS page, which blocks mixed content.
+  const runtimeGlobal: object = globalThis;
+  const location = "location" in runtimeGlobal ? runtimeGlobal.location : undefined;
   const allowInsecureRoutes =
-    typeof globalThis.location === "undefined" || globalThis.location.protocol !== "https:";
+    typeof location !== "object" ||
+    location === null ||
+    !("protocol" in location) ||
+    location.protocol !== "https:";
 
   /**
    * Learned routes reuse the active route's credential, so they do not revoke pull request routing

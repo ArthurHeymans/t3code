@@ -19,6 +19,8 @@ export { EnvironmentNotRegisteredError, PlatformEnvironmentRemovalError } from "
 export * as EnvironmentSupervisor from "./supervisor.ts";
 export * as Wakeups from "./wakeups.ts";
 
-export { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
-// Flat so consumers' inferred command types can name it.
+export {
+  appendOrchestrationProtocol,
+  orchestrationProtocolCompatibilityError,
+} from "./compatibility.ts";
 export { OutdatedHostUpdateError } from "./outdatedHostUpdate.ts";

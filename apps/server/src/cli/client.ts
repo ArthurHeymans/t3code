@@ -1,0 +1,2421 @@
+import {
+  EnvironmentAttachInput,
+  EnvironmentDetachInput,
+  EnvironmentSendMessage,
+  EnvironmentGatewayError,
+  makeEnvironmentGateway,
+} from "./EnvironmentGateway.ts";
+import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as EffectNodeStream from "@effect/platform-node/NodeStream";
+import * as RpcSession from "@t3tools/client-runtime/rpc";
+import {
+  bootstrapRemoteBearerSession,
+  resolveRemoteWebSocketConnectionUrl,
+} from "@t3tools/client-runtime/authorization";
+import {
+  appendOrchestrationProtocol,
+  BearerConnectionTarget,
+  type PreparedConnection,
+} from "@t3tools/client-runtime/connection";
+import { fetchEnvironmentShellSnapshot } from "@t3tools/client-runtime/state/shell-snapshot-http";
+import { fetchEnvironmentBoundedThreadSnapshot } from "@t3tools/client-runtime/state/bounded-thread-snapshot-http";
+import { fetchEnvironmentThreadHistoryPage } from "@t3tools/client-runtime/state/thread-history-http";
+import {
+  applyShellStreamEvent,
+  mergeShellSnapshotProjects,
+} from "@t3tools/client-runtime/state/shell-reducer";
+import { applyOrchestrationV2ProjectionEvent } from "@t3tools/client-runtime/state/orchestration-v2-projection";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { modelSelectionCommandType } from "@t3tools/shared/model";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  CommandId,
+  ExecutionEnvironmentDescriptor,
+  IsoDateTime,
+  MessageId,
+  ModelSelection,
+  NonNegativeInt,
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2Command,
+  OrchestrationV2ThreadLaunchWorkspaceStrategy,
+  ProjectId,
+  type Project,
+  type ProjectMutation,
+  ProviderApprovalDecision,
+  RunId,
+  TrimmedNonEmptyString,
+  WS_METHODS,
+  ProviderInteractionMode,
+  RuntimeMode,
+  RuntimeRequestId,
+  ThreadId,
+  type OrchestrationV2ArchivedShellSnapshot,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadStreamItem,
+  type OrchestrationV2TurnItem,
+  type ServerConfig,
+  type VcsStatusLocalResult,
+  type OrchestrationV2ShellStreamItem,
+} from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Random from "effect/Random";
+import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import { Command, Flag } from "effect/cli";
+import * as Ndjson from "effect/encoding/Ndjson";
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+// NDJSON stdin is the CLI transport boundary, not an application stream.
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeStream from "node:stream";
+import packageJson from "../../package.json" with { type: "json" };
+
+const PROTOCOL_VERSION = 1;
+const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_OUTPUT_LINE_BYTES = 900_000;
+const MAX_ERROR_CHARS = 1000;
+// Generous: the byte budget below is what keeps shells under the frame limit.
+export const MAX_SHELL_PROJECTS = 1_000;
+const MAX_SHELL_THREADS = 2_000;
+const MAX_DISPLAY_CHARS = 500;
+const MAX_THREAD_ITEMS = 100;
+const MAX_THREAD_TEXT_CHARS = 256_000;
+const MAX_ITEM_TEXT_CHARS = 32_000;
+
+const HelloMessage = Schema.Struct({
+  kind: Schema.Literal("hello"),
+  protocolVersion: Schema.Number,
+  client: Schema.Struct({ name: Schema.String, version: Schema.String }),
+  environment: Schema.Struct({
+    id: Schema.String,
+    endpoint: Schema.String,
+    generation: NonNegativeInt,
+  }),
+});
+
+const RequestMessage = Schema.Struct({
+  kind: Schema.Literal("request"),
+  id: Schema.String,
+  operation: Schema.String,
+  input: Schema.Unknown,
+});
+
+const ThreadMutationBase = {
+  threadId: ThreadId,
+  commandId: CommandId,
+} as const;
+
+const ThreadSendInput = Schema.Struct({
+  ...ThreadMutationBase,
+  messageId: MessageId,
+  text: Schema.String,
+  dispatchMode: Schema.Literals(["auto", "queue", "steer", "restart", "start"]),
+});
+
+const ThreadInterruptInput = Schema.Struct(ThreadMutationBase);
+const ThreadApprovalInput = Schema.Struct({
+  ...ThreadMutationBase,
+  requestId: RuntimeRequestId,
+  decision: ProviderApprovalDecision,
+});
+const ThreadModelSelectionInput = Schema.Struct({
+  ...ThreadMutationBase,
+  modelSelection: ModelSelection,
+});
+const ThreadRuntimeModeInput = Schema.Struct({ ...ThreadMutationBase, runtimeMode: RuntimeMode });
+const ThreadInteractionModeInput = Schema.Struct({
+  ...ThreadMutationBase,
+  interactionMode: ProviderInteractionMode,
+});
+const ThreadSettledInput = Schema.Struct({ ...ThreadMutationBase, settled: Schema.Boolean });
+const ThreadSnoozeInput = Schema.Struct({
+  ...ThreadMutationBase,
+  snoozedUntil: Schema.NullOr(IsoDateTime),
+});
+
+const ThreadCreateInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  text: TrimmedNonEmptyString,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+});
+const ThreadForkInput = Schema.Struct({
+  ...ThreadMutationBase,
+  // Client-supplied like commandId, so an ambiguous retry cannot fork twice.
+  targetThreadId: ThreadId,
+  runId: Schema.NullOr(RunId),
+  title: Schema.optional(TrimmedNonEmptyString),
+});
+const ThreadCommandInput = Schema.Struct({ command: Schema.Unknown });
+const ThreadHistoryInput = Schema.Struct({
+  threadId: ThreadId,
+  beforeItemId: TrimmedNonEmptyString,
+});
+const ThreadSearchInput = Schema.Struct({
+  query: TrimmedNonEmptyString,
+  limit: Schema.optional(Schema.Int),
+});
+const ProviderCommandsInput = Schema.Struct({ instanceId: Schema.String });
+const ProjectCreateInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  title: TrimmedNonEmptyString,
+  workspaceRoot: TrimmedNonEmptyString,
+});
+
+const ProjectSearchEntriesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  query: Schema.String,
+  limit: Schema.optional(Schema.Int),
+});
+
+/**
+ * Thread commands Emacs may dispatch verbatim. Each is validated against the
+ * version-matched command schema; anything that creates threads, changes
+ * workspaces, or needs bridge-side state keeps a dedicated operation.
+ */
+export const PASSTHROUGH_THREAD_COMMANDS = new Set([
+  "thread.archive",
+  "thread.unarchive",
+  "thread.delete",
+  "thread.pin",
+  "thread.unpin",
+  "thread.visit",
+  "thread.mark-unread",
+  "thread.metadata.update",
+  "queued-run.cancel",
+  "queued-run.edit",
+  "queued-run.reorder",
+  "queued-message.promote-to-steer",
+  "queue.resume",
+  "runtime-request.respond",
+  "thread.user-input.dismiss",
+]);
+
+const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationV2Command);
+
+export const decodePassthroughThreadCommand = (command: unknown) =>
+  decodeOrchestrationCommand(command).pipe(
+    Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+    Effect.filterOrFail(
+      (decoded) =>
+        PASSTHROUGH_THREAD_COMMANDS.has(decoded.type) &&
+        // Metadata updates may rename; branch and worktree rebinding stay private.
+        (decoded.type !== "thread.metadata.update" ||
+          Object.keys(decoded).every((key) =>
+            ["type", "commandId", "threadId", "title", "regenerateTitle"].includes(key),
+          )),
+      (decoded) =>
+        fail("unsupported-command", `Command is not available to clients: ${decoded.type}`),
+    ),
+  );
+
+const invalidInput = (cause: unknown) => fail("invalid-input", safeErrorMessage(cause));
+const decodeProjectCreateInput = Schema.decodeUnknownEffect(ProjectCreateInput);
+const decodeThreadCreateInput = Schema.decodeUnknownEffect(ThreadCreateInput);
+const decodeThreadForkInput = Schema.decodeUnknownEffect(ThreadForkInput);
+const decodeThreadCommandInput = Schema.decodeUnknownEffect(ThreadCommandInput);
+const decodeThreadHistoryInput = Schema.decodeUnknownEffect(ThreadHistoryInput);
+const decodeThreadSearchInput = Schema.decodeUnknownEffect(ThreadSearchInput);
+const decodeProviderCommandsInput = Schema.decodeUnknownEffect(ProviderCommandsInput);
+const decodeProjectSearchEntriesInput = Schema.decodeUnknownEffect(ProjectSearchEntriesInput);
+
+export const registerProject = Effect.fn("clientBridge.registerProject")(function* <E>(
+  input: unknown,
+  mutate: (command: ProjectMutation) => Effect.Effect<Project, E>,
+) {
+  const decoded = yield* decodeProjectCreateInput(input).pipe(Effect.mapError(invalidInput));
+  const project = yield* mutate({ type: "project.create", ...decoded });
+  return {
+    project: {
+      id: project.id,
+      name: singleLine(project.repositoryIdentity?.displayName ?? project.title),
+      root: singleLine(project.workspaceRoot, 2_000),
+      threads: [],
+    },
+  };
+});
+
+const decodeThreadSendInput = Schema.decodeUnknownEffect(ThreadSendInput);
+const decodeThreadInterruptInput = Schema.decodeUnknownEffect(ThreadInterruptInput);
+const decodeThreadApprovalInput = Schema.decodeUnknownEffect(ThreadApprovalInput);
+const decodeThreadModelSelectionInput = Schema.decodeUnknownEffect(ThreadModelSelectionInput);
+const decodeThreadRuntimeModeInput = Schema.decodeUnknownEffect(ThreadRuntimeModeInput);
+const decodeThreadInteractionModeInput = Schema.decodeUnknownEffect(ThreadInteractionModeInput);
+const decodeThreadSettledInput = Schema.decodeUnknownEffect(ThreadSettledInput);
+const decodeThreadSnoozeInput = Schema.decodeUnknownEffect(ThreadSnoozeInput);
+
+const CancelMessage = Schema.Struct({
+  kind: Schema.Literal("cancel"),
+  id: Schema.String,
+});
+
+const SubscribeMessage = Schema.Struct({
+  kind: Schema.Literal("subscribe"),
+  subscriptionId: Schema.String,
+  stream: Schema.String,
+  identity: Schema.Unknown,
+  resumeSequence: Schema.optionalKey(NonNegativeInt),
+});
+
+const UnsubscribeMessage = Schema.Struct({
+  kind: Schema.Literal("unsubscribe"),
+  subscriptionId: Schema.String,
+});
+
+const ClientMessage = Schema.Union([
+  HelloMessage,
+  RequestMessage,
+  CancelMessage,
+  SubscribeMessage,
+  UnsubscribeMessage,
+  EnvironmentSendMessage,
+]);
+type ClientMessage = typeof ClientMessage.Type;
+
+const decodeClientMessage = Schema.decodeUnknownEffect(ClientMessage);
+const decodeEnvironmentAttachInput = Schema.decodeUnknownEffect(EnvironmentAttachInput);
+const decodeEnvironmentDetachInput = Schema.decodeUnknownEffect(EnvironmentDetachInput);
+const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
+
+class ClientBridgeError extends Schema.TaggedError<ClientBridgeError>()("ClientBridgeError", {
+  code: Schema.String,
+  message: Schema.String,
+}) {}
+
+interface BridgeConnection {
+  readonly clientEnvironmentId: string;
+  readonly generation: number;
+  readonly prepared: PreparedConnection;
+  readonly session: RpcSession.RpcSession;
+  readonly scope: Scope.Closeable;
+  readonly config: ServerConfig;
+}
+
+export const bridgeSocketUrl = (socketUrl: string): string =>
+  appendOrchestrationProtocol(socketUrl);
+
+export const socketUrlSecrets = (socketUrl: string): ReadonlyArray<string> => {
+  const ticket = URL.parse(socketUrl)?.searchParams.get("wsTicket");
+  return ticket === null || ticket === undefined || ticket.length === 0 ? [] : [ticket];
+};
+
+const preparedSecrets = (prepared: PreparedConnection): ReadonlyArray<string> => {
+  const authorization = prepared.httpAuthorization;
+  const authorizationSecrets: string[] = [];
+  if (authorization?._tag === "Bearer") authorizationSecrets.push(authorization.token);
+  if (authorization?._tag === "Dpop") authorizationSecrets.push(authorization.accessToken);
+  return [...authorizationSecrets, ...socketUrlSecrets(prepared.socketUrl)];
+};
+
+interface NormalizedShellThread {
+  readonly id: string;
+  readonly title: string;
+  readonly status: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly worktree: string;
+  readonly path: string;
+  readonly branch: string | null;
+  readonly updatedAt: string;
+  readonly pinned: boolean;
+  readonly snoozedUntil: string | null;
+  readonly unread: boolean;
+  readonly settled: boolean;
+  readonly parentThreadId: string | null;
+  readonly relationshipToParent: "fork" | "subagent" | null;
+  readonly additions: number | null;
+  readonly deletions: number | null;
+}
+
+interface NormalizedShellProject {
+  readonly id: string;
+  readonly name: string;
+  readonly root: string;
+  readonly threads: ReadonlyArray<NormalizedShellThread>;
+}
+
+interface NormalizedShellPayload {
+  readonly projects: ReadonlyArray<NormalizedShellProject>;
+  truncated: boolean;
+  omittedSettledCount?: number;
+  omittedOtherCount?: number;
+  omittedProjectCount?: number;
+}
+
+export const withWorkspaceStats = (
+  payload: NormalizedShellPayload,
+  stats: ReadonlyMap<string, VcsStatusLocalResult>,
+): NormalizedShellPayload => ({
+  ...payload,
+  projects: payload.projects.map((project) => ({
+    ...project,
+    threads: project.threads.map((thread) => {
+      const status = stats.get(thread.path);
+      return {
+        ...thread,
+        additions: status?.isRepo ? status.workingTree.insertions : null,
+        deletions: status?.isRepo ? status.workingTree.deletions : null,
+      };
+    }),
+  })),
+});
+
+export const normalizeModelCatalog = (providers: ServerConfig["providers"]) => {
+  const catalog = {
+    providers: providers.slice(0, 32).map((provider) => ({
+      instanceId: singleLine(provider.instanceId),
+      name: singleLine(provider.displayName ?? provider.instanceId),
+      driver: singleLine(provider.driver),
+      available:
+        provider.availability !== "unavailable" &&
+        provider.enabled &&
+        provider.installed &&
+        provider.status !== "error" &&
+        provider.status !== "disabled",
+      reason:
+        provider.unavailableReason || provider.message
+          ? singleLine(provider.unavailableReason ?? provider.message ?? "")
+          : null,
+      requiresNewThreadForModelChange: provider.requiresNewThreadForModelChange === true,
+      models: provider.models.map((model) => ({
+        slug: singleLine(model.slug),
+        name: singleLine(model.name),
+        options: (model.capabilities?.optionDescriptors ?? []).slice(0, 16).map((option) =>
+          option.type === "select"
+            ? {
+                id: singleLine(option.id),
+                label: singleLine(option.label),
+                type: option.type,
+                choices: option.options.slice(0, 32).map((choice) => ({
+                  id: singleLine(choice.id),
+                  label: singleLine(choice.label),
+                  isDefault: choice.isDefault === true,
+                })),
+              }
+            : { id: singleLine(option.id), label: singleLine(option.label), type: option.type },
+        ),
+      })),
+    })),
+    truncated:
+      providers.length > 32 ||
+      providers.some((provider) =>
+        provider.models.some(
+          (model) =>
+            (model.capabilities?.optionDescriptors ?? []).length > 16 ||
+            (model.capabilities?.optionDescriptors ?? []).some(
+              (option) => option.type === "select" && option.options.length > 32,
+            ),
+        ),
+      ),
+  };
+  // Bound by encoded size, not model count: multi-provider runtimes such as
+  // Pi can advertise hundreds of models with distinct provider-qualified slugs.
+  // Keep the response below the NDJSON frame limit.
+  while (Buffer.byteLength(encodeJson(catalog), "utf8") > 400_000) {
+    const largest = catalog.providers.reduce<(typeof catalog.providers)[number] | null>(
+      (best, provider) => (provider.models.length > (best?.models.length ?? 0) ? provider : best),
+      null,
+    );
+    if (!largest || largest.models.length === 0) break;
+    largest.models.pop();
+    catalog.truncated = true;
+  }
+  return catalog;
+};
+
+interface NormalizedThreadItem {
+  readonly id: string;
+  readonly type: string;
+  readonly status: string;
+  readonly label: string;
+  readonly title: string | null;
+  readonly text: string | null;
+  readonly detail: string | null;
+  readonly streaming: boolean;
+  readonly actionId: string | null;
+  readonly runId: string | null;
+  readonly runStatus: string | null;
+  readonly runOrdinal: number | null;
+  readonly presentation: "message" | "work";
+  /** File path for file changes, so renderers can visit it. */
+  readonly path?: string;
+  /** Structured questions for pending user-input requests. */
+  readonly questions?: ReadonlyArray<NormalizedUserInputQuestion>;
+}
+
+interface NormalizedUserInputQuestion {
+  readonly id: string;
+  readonly header: string;
+  readonly question: string;
+  readonly multiSelect: boolean;
+  readonly allowCustomAnswer: boolean;
+  readonly options: ReadonlyArray<{
+    readonly label: string;
+    readonly description: string;
+    readonly value: string;
+  }>;
+}
+
+interface NormalizedQueuedRun {
+  readonly runId: string;
+  readonly position: number | null;
+  readonly held: boolean;
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+interface NormalizedThreadPayload {
+  readonly thread: {
+    readonly id: string;
+    readonly projectId: string;
+    readonly title: string;
+    readonly status: string;
+    readonly provider: string;
+    readonly model: string;
+    readonly modelSelection: ModelSelection;
+    readonly activeRunModel: string | null;
+    readonly activeRunProvider: string | null;
+    readonly hasStartedSession: boolean;
+    readonly worktree: string;
+    readonly worktreePath: string | null;
+    readonly branch: string | null;
+    readonly runtimeMode: string;
+    readonly interactionMode: string;
+    readonly activeRunId: string | null;
+    readonly tokenUsage: { readonly usedTokens: number; readonly maxTokens: number | null } | null;
+  } | null;
+  readonly items: ReadonlyArray<NormalizedThreadItem>;
+  readonly attention?: ReadonlyArray<NormalizedThreadItem>;
+  readonly pendingRequestCount?: number;
+  readonly queued?: ReadonlyArray<NormalizedQueuedRun>;
+  /** Older items exist; load them with `thread.history` before the first item. */
+  hasOlderHistory?: boolean;
+  truncated: boolean;
+  readonly deleted?: boolean;
+  readonly error?: string;
+}
+
+export const safeErrorMessage = (cause: unknown, secrets: ReadonlyArray<string> = []): string => {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  return secrets
+    .filter((secret) => secret.length > 0)
+    .reduce((message, secret) => message.replaceAll(secret, "[redacted]"), raw)
+    .replaceAll(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1[redacted]@")
+    .replaceAll(/(authorization:\s*(?:bearer|dpop)\s+)[^\s]+/gi, "$1[redacted]")
+    .replaceAll(/([?&]wsTicket=)[^&\s]+/gi, "$1[redacted]")
+    .replaceAll(/([?&]token=)[^&\s]+/gi, "$1[redacted]")
+    .slice(0, MAX_ERROR_CHARS);
+};
+
+const isControl = (character: string): boolean => {
+  const code = character.codePointAt(0) ?? 0;
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+};
+
+const singleLine = (value: string, limit = MAX_DISPLAY_CHARS): string =>
+  Array.from(value, (character) => (isControl(character) ? " " : character))
+    .join("")
+    .trim()
+    .split(/\s+/u)
+    .join(" ")
+    .slice(0, limit);
+
+const bodyText = (value: string, limit = MAX_ITEM_TEXT_CHARS): string =>
+  Array.from(value.replaceAll("\r\n", "\n").replaceAll("\r", "\n"), (character) =>
+    isControl(character) && character !== "\n" && character !== "\t" ? "" : character,
+  )
+    .join("")
+    .slice(0, limit);
+
+const decodeUrl = Schema.decodeUnknownEffect(Schema.URLFromString);
+const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+const writeRecord = (record: unknown): Effect.Effect<void, ClientBridgeError> => {
+  const line = encodeJson(record);
+  if (Buffer.byteLength(line, "utf8") > MAX_OUTPUT_LINE_BYTES) {
+    return Effect.fail(
+      fail("output-too-large", `Normalized output exceeds ${String(MAX_OUTPUT_LINE_BYTES)} bytes.`),
+    );
+  }
+  return Effect.callback<void, ClientBridgeError>((resume) => {
+    process.stdout.write(`${line}\n`, (error) => {
+      resume(
+        error === null || error === undefined
+          ? Effect.void
+          : Effect.fail(fail("stdout-failed", safeErrorMessage(error))),
+      );
+    });
+  });
+};
+
+const fail = (code: string, message: string): ClientBridgeError =>
+  new ClientBridgeError({ code, message });
+
+export const superviseSubscription = <A, E, R>(
+  attempt: Effect.Effect<A, E, R>,
+  retryDelay: Duration.Input = "1 second",
+): Effect.Effect<never, never, R> =>
+  Effect.forever(
+    attempt.pipe(
+      Effect.catchCause(() => Effect.void),
+      Effect.andThen(Effect.sleep(retryDelay)),
+    ),
+  );
+
+export const superviseBridgeConnection = Effect.fn("clientBridge.superviseBridgeConnection")(
+  function* <A, CloseError, RenewError, TransitionError, R, R2>(
+    initial: A,
+    closed: (current: A) => Effect.Effect<never, CloseError>,
+    renew: (current: A) => Effect.Effect<A, RenewError, R>,
+    transition: (
+      phase: "retrying" | "ready",
+      current: A,
+    ) => Effect.Effect<void, TransitionError, R2>,
+    options: {
+      readonly retryDelay?: (attempt: number) => Duration.Input;
+      readonly shouldRetry?: (error: RenewError) => boolean;
+      readonly onFailure?: (error: RenewError) => Effect.Effect<void, TransitionError, R2>;
+    } = {},
+  ) {
+    let current = initial;
+    while (true) {
+      yield* Effect.exit(closed(current));
+      yield* transition("retrying", current);
+      let attempt = 0;
+      while (true) {
+        const result = yield* Effect.result(renew(current));
+        if (Result.isSuccess(result)) {
+          current = result.success;
+          break;
+        }
+        if (options.onFailure) yield* options.onFailure(result.failure);
+        if (options.shouldRetry?.(result.failure) === false)
+          return yield* Effect.fail(result.failure);
+        attempt += 1;
+        const jitter = options.retryDelay ? 0 : yield* Random.nextIntBetween(0, 250);
+        yield* Effect.sleep(
+          options.retryDelay?.(attempt) ??
+            Duration.millis(Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5)) + jitter),
+        );
+      }
+      yield* transition("ready", current);
+    }
+  },
+);
+
+const parseEndpoint = Effect.fn("clientBridge.parseEndpoint")(function* (endpoint: string) {
+  const url = yield* decodeUrl(endpoint).pipe(
+    Effect.mapError((cause) => fail("invalid-endpoint", safeErrorMessage(cause))),
+  );
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return yield* fail("invalid-endpoint", "The environment endpoint must use HTTP or HTTPS.");
+  }
+  if (url.username.length > 0 || url.password.length > 0) {
+    return yield* fail("invalid-endpoint", "The environment endpoint must not contain userinfo.");
+  }
+  url.hash = "";
+  url.search = "";
+  url.pathname = url.pathname.replace(/\/$/, "");
+  const httpBaseUrl = url.toString().replace(/\/$/, "");
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/";
+  return { httpBaseUrl, wsBaseUrl: url.toString() };
+});
+
+const fetchEnvironmentDescriptor = Effect.fn("clientBridge.fetchEnvironmentDescriptor")(function* (
+  httpBaseUrl: string,
+) {
+  const client = yield* HttpClient.HttpClient;
+  const response = yield* client
+    .execute(HttpClientRequest.get(`${httpBaseUrl}/.well-known/t3/environment`))
+    .pipe(Effect.mapError((cause) => fail("environment-unreachable", safeErrorMessage(cause))));
+  return yield* HttpClientResponse.filterStatusOk(response).pipe(
+    Effect.flatMap(HttpClientResponse.schemaBodyJson(ExecutionEnvironmentDescriptor)),
+    Effect.mapError((cause) => fail("invalid-environment-descriptor", safeErrorMessage(cause))),
+  );
+});
+
+const readAccessToken = Effect.fn("clientBridge.readAccessToken")(function* (httpBaseUrl: string) {
+  const accessToken = process.env.T3_CLIENT_ACCESS_TOKEN?.trim();
+  if (accessToken !== undefined && accessToken.length > 0) {
+    process.env.T3_CLIENT_ACCESS_TOKEN = "";
+    return accessToken;
+  }
+  const pairingToken = process.env.T3_CLIENT_PAIRING_TOKEN?.trim();
+  if (pairingToken === undefined || pairingToken.length === 0) {
+    return yield* fail(
+      "authentication-required",
+      "Set T3_CLIENT_PAIRING_TOKEN to a fresh pairing token or T3_CLIENT_ACCESS_TOKEN to a bearer token.",
+    );
+  }
+  process.env.T3_CLIENT_PAIRING_TOKEN = "";
+  const platform = yield* HostProcess.Platform;
+  const result = yield* bootstrapRemoteBearerSession({
+    httpBaseUrl,
+    credential: pairingToken,
+    scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+    clientMetadata: {
+      label: "t3-code.el",
+      deviceType: "desktop",
+      os: platform,
+    },
+  }).pipe(
+    Effect.mapError((cause) =>
+      fail("authentication-failed", safeErrorMessage(cause, [pairingToken])),
+    ),
+  );
+  if (result.token_type !== "Bearer") {
+    return yield* fail("authentication-failed", "The server did not issue a bearer token.");
+  }
+  return result.access_token;
+});
+
+const ticketError = (cause: { readonly _tag: string }, bearerToken: string) =>
+  fail(
+    cause._tag === "EnvironmentAuthInvalidError" ||
+      cause._tag === "EnvironmentScopeRequiredError" ||
+      (cause._tag === "RemoteEnvironmentAuthUndeclaredStatusError" &&
+        "status" in cause &&
+        (cause.status === 401 || cause.status === 403))
+      ? "authentication-failed"
+      : "websocket-ticket-failed",
+    safeErrorMessage(cause, [bearerToken]),
+  );
+
+const establishSession = Effect.fn("clientBridge.establishSession")(function* (
+  prepared: PreparedConnection,
+  bearerToken: string,
+) {
+  const sessions = yield* RpcSession.RpcSessionFactory;
+  const scope = yield* Scope.make();
+  const secrets = [bearerToken, ...socketUrlSecrets(prepared.socketUrl)];
+  return yield* Effect.gen(function* () {
+    const session = yield* sessions.connect(prepared).pipe(
+      Effect.provideService(Scope.Scope, scope),
+      Effect.mapError((cause) => fail("connection-failed", safeErrorMessage(cause, secrets))),
+    );
+    yield* session.ready.pipe(
+      Effect.mapError((cause) => fail("connection-failed", safeErrorMessage(cause, secrets))),
+    );
+    const config = yield* session.initialConfig.pipe(
+      Effect.mapError((cause) => fail("config-failed", safeErrorMessage(cause, secrets))),
+    );
+    return { session, scope, config };
+  }).pipe(Effect.onError((cause) => Scope.close(scope, Exit.failCause(cause))));
+});
+
+const connect = Effect.fn("clientBridge.connect")(function* (message: typeof HelloMessage.Type) {
+  if (message.protocolVersion !== PROTOCOL_VERSION) {
+    return yield* fail(
+      "protocol-mismatch",
+      `Expected protocol ${String(PROTOCOL_VERSION)}, received ${String(message.protocolVersion)}.`,
+    );
+  }
+  const { httpBaseUrl, wsBaseUrl } = yield* parseEndpoint(message.environment.endpoint);
+  const descriptor = yield* fetchEnvironmentDescriptor(httpBaseUrl);
+  const bearerToken = yield* readAccessToken(httpBaseUrl);
+  const socketUrl = bridgeSocketUrl(
+    yield* resolveRemoteWebSocketConnectionUrl({
+      httpBaseUrl,
+      wsBaseUrl,
+      bearerToken,
+    }).pipe(Effect.mapError((cause) => ticketError(cause, bearerToken))),
+  );
+  const target = new BearerConnectionTarget({
+    environmentId: descriptor.environmentId,
+    label: descriptor.label,
+    connectionId: "stdio-client",
+  });
+  const prepared: PreparedConnection = {
+    environmentId: descriptor.environmentId,
+    label: descriptor.label,
+    httpBaseUrl,
+    socketUrl,
+    httpAuthorization: { _tag: "Bearer", token: bearerToken },
+    target,
+  };
+  const { session, scope, config } = yield* establishSession(prepared, bearerToken);
+  return {
+    clientEnvironmentId: message.environment.id,
+    generation: message.environment.generation,
+    prepared,
+    session,
+    scope,
+    config,
+  } satisfies BridgeConnection;
+});
+
+// The WebSocket ticket is short-lived. A server restart closes the socket, so
+// reconnecting the old RpcSession (or reusing its URL) cannot restore streams.
+const reconnect = Effect.fn("clientBridge.reconnect")(function* (current: BridgeConnection) {
+  const authorization = current.prepared.httpAuthorization;
+  if (authorization?._tag !== "Bearer") {
+    return yield* fail("connection-failed", "The bridge has no reusable bearer credential.");
+  }
+  const bearerToken = authorization.token;
+  const { wsBaseUrl } = yield* parseEndpoint(current.prepared.httpBaseUrl);
+  const socketUrl = bridgeSocketUrl(
+    yield* resolveRemoteWebSocketConnectionUrl({
+      httpBaseUrl: current.prepared.httpBaseUrl,
+      wsBaseUrl,
+      bearerToken,
+    }).pipe(Effect.mapError((cause) => ticketError(cause, bearerToken))),
+  );
+  const prepared = { ...current.prepared, socketUrl };
+  const { session, scope, config } = yield* establishSession(prepared, bearerToken);
+  return { ...current, prepared, session, scope, config } satisfies BridgeConnection;
+});
+
+const normalizeThreadStatus = (thread: OrchestrationV2ShellSnapshot["threads"][number]): string => {
+  if (thread.pendingRuntimeRequest !== null) return "waiting-approval";
+  switch (thread.status) {
+    case "running":
+    case "failed":
+    case "idle":
+      return thread.status;
+    default:
+      return thread.activeRunId === null ? "idle" : "running";
+  }
+};
+
+const optionalIso = (value: DateTime.Utc | null | undefined): string | null =>
+  value === null || value === undefined ? null : DateTime.formatIso(value);
+
+const threadIsSettled = (
+  thread: OrchestrationV2ShellSnapshot["threads"][number],
+  _now: string,
+): boolean =>
+  thread.settledOverride === "settled" &&
+  !["running", "waiting-approval"].includes(normalizeThreadStatus(thread));
+
+// Mirrors the web sidebar: a completion is unseen only once the server tracks
+// visits and the latest run finished after the last one.
+const hasUnseenCompletion = (thread: OrchestrationV2ShellSnapshot["threads"][number]): boolean =>
+  thread.latestRunCompletedAt !== null &&
+  thread.latestRunCompletedAt !== undefined &&
+  thread.lastVisitedAt !== null &&
+  thread.lastVisitedAt !== undefined &&
+  DateTime.toEpochMillis(thread.latestRunCompletedAt) >
+    DateTime.toEpochMillis(thread.lastVisitedAt);
+
+const shellThreadHasProjection = (
+  thread: OrchestrationV2ShellSnapshot["threads"][number],
+): boolean =>
+  thread.lineage.rootThreadId === thread.id || thread.lineage.relationshipToParent !== null;
+
+export const normalizeShellSnapshot = (
+  snapshot: OrchestrationV2ShellSnapshot,
+  now = DateTime.formatIso(DateTime.nowUnsafe()),
+): NormalizedShellPayload => {
+  const candidates = snapshot.threads
+    .filter(shellThreadHasProjection)
+    .map((thread) => ({ thread, settled: threadIsSettled(thread, now) }));
+  const byId = new Map(candidates.map((candidate) => [candidate.thread.id, candidate]));
+  const working = (thread: (typeof candidates)[number]["thread"]) =>
+    ["running", "waiting-approval"].includes(normalizeThreadStatus(thread));
+  // A working agent must not lose its parent to the settled-thread budget.
+  const workingAncestors = new Set<string>();
+  for (const { thread } of candidates) {
+    if (!working(thread)) continue;
+    let parentId = thread.lineage.parentThreadId;
+    while (parentId !== null && !workingAncestors.has(parentId)) {
+      workingAncestors.add(parentId);
+      parentId = byId.get(parentId)?.thread.lineage.parentThreadId ?? null;
+    }
+  }
+  const priority = ({ thread, settled }: (typeof candidates)[number]) =>
+    working(thread) || workingAncestors.has(thread.id) ? 0 : settled ? 2 : 1;
+  const projectPriority = new Map<string, number>();
+  for (const candidate of candidates) {
+    const id = candidate.thread.projectId;
+    projectPriority.set(id, Math.min(projectPriority.get(id) ?? 3, priority(candidate)));
+  }
+  const rankedProjects = snapshot.projects
+    .map((project, index) => ({ project, index }))
+    .sort(
+      (a, b) =>
+        (projectPriority.get(a.project.id) ?? 3) - (projectPriority.get(b.project.id) ?? 3) ||
+        a.index - b.index,
+    );
+  const projectIds = new Set(
+    rankedProjects.slice(0, MAX_SHELL_PROJECTS).map(({ project }) => project.id),
+  );
+  const includedProjects = snapshot.projects.filter((project) => projectIds.has(project.id));
+  const selected = candidates
+    .filter(({ thread }) => projectIds.has(thread.projectId))
+    .sort(
+      (a, b) =>
+        priority(a) - priority(b) ||
+        (priority(a) === 2
+          ? DateTime.toEpochMillis(b.thread.updatedAt) - DateTime.toEpochMillis(a.thread.updatedAt)
+          : 0),
+    )
+    .slice(0, MAX_SHELL_THREADS);
+  const selectedIds = new Set(selected.map(({ thread }) => thread.id));
+  const payload: NormalizedShellPayload = {
+    projects: includedProjects.map((project) => ({
+      id: project.id,
+      name: singleLine(project.repositoryIdentity?.displayName ?? project.title),
+      root: singleLine(project.workspaceRoot, 2_000),
+      threads: candidates
+        .filter(({ thread }) => thread.projectId === project.id && selectedIds.has(thread.id))
+        .map(({ thread, settled }) => ({
+          id: thread.id,
+          title: singleLine(thread.title),
+          status: normalizeThreadStatus(thread),
+          provider: singleLine(thread.providerInstanceId),
+          model: singleLine(thread.modelSelection.model),
+          worktree: singleLine(thread.worktreePath ?? "root"),
+          path: singleLine(thread.worktreePath ?? project.workspaceRoot, 2_000),
+          branch: thread.branch === null ? null : singleLine(thread.branch),
+          updatedAt: DateTime.formatIso(thread.updatedAt),
+          pinned: thread.pinnedAt !== null && thread.pinnedAt !== undefined,
+          snoozedUntil: optionalIso(thread.snoozedUntil),
+          unread: hasUnseenCompletion(thread),
+          settled,
+          parentThreadId: thread.lineage.parentThreadId,
+          relationshipToParent: thread.lineage.relationshipToParent,
+          additions: null,
+          deletions: null,
+        })),
+    })),
+    truncated: false,
+  };
+  // Count selection is not the only bound: evict the oldest settled rows first
+  // when long display names make the encoded projection exceed the byte budget.
+  while (Buffer.byteLength(encodeJson(payload), "utf8") > 700_000) {
+    const victim = selected.pop();
+    if (victim !== undefined) {
+      const project = payload.projects.find(({ id }) => id === victim.thread.projectId);
+      const index = project?.threads.findIndex(({ id }) => id === victim.thread.id) ?? -1;
+      if (project !== undefined && index >= 0) {
+        (project.threads as NormalizedShellThread[]).splice(index, 1);
+      }
+    } else {
+      const projectId = rankedProjects.findLast(({ project }) =>
+        payload.projects.some(({ id }) => id === project.id),
+      )?.project.id;
+      if (projectId === undefined) break;
+      const index = payload.projects.findIndex(({ id }) => id === projectId);
+      (payload.projects as NormalizedShellProject[]).splice(index, 1);
+    }
+  }
+  const visibleProjects = new Set(payload.projects.map(({ id }) => id));
+  const visibleThreads = new Set(
+    payload.projects.flatMap(({ threads }) => threads.map(({ id }) => id)),
+  );
+  const omitted = candidates.filter(({ thread }) => !visibleThreads.has(thread.id));
+  const omittedProjects = snapshot.projects.length - visibleProjects.size;
+  if (omitted.length > 0 || omittedProjects > 0) {
+    payload.truncated = true;
+    payload.omittedSettledCount = omitted.filter(({ settled }) => settled).length;
+    payload.omittedOtherCount = omitted.length - payload.omittedSettledCount;
+    payload.omittedProjectCount = omittedProjects;
+  }
+  return payload;
+};
+
+const clipText = (value: string | null | undefined, limit = MAX_ITEM_TEXT_CHARS) =>
+  value === null || value === undefined ? null : bodyText(value, limit);
+
+const clipUtf8Bytes = (value: string, limit: number): string => {
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.length <= limit) return value;
+  return encoded
+    .subarray(0, limit)
+    .toString("utf8")
+    .replace(/\ufffd$/u, "");
+};
+
+const planStepMarker = (status: "pending" | "running" | "completed"): string => {
+  switch (status) {
+    case "completed":
+      return "✓";
+    case "running":
+      return "●";
+    case "pending":
+      return "○";
+  }
+};
+
+const normalizeTurnItem = (item: OrchestrationV2TurnItem): NormalizedThreadItem => {
+  const base = (
+    label: string,
+    text: string | null = null,
+    detail: string | null = null,
+    title = item.title,
+  ): NormalizedThreadItem => ({
+    id: singleLine(item.id, 4_000),
+    type: item.type,
+    status: item.status,
+    label: singleLine(label),
+    title: title === null ? null : singleLine(title),
+    text: clipText(text),
+    detail: clipText(detail),
+    streaming: "streaming" in item && item.streaming === true,
+    actionId: null,
+    runId: item.runId === null ? null : singleLine(item.runId, 4_000),
+    runStatus: null,
+    runOrdinal: null,
+    presentation: "message",
+  });
+
+  switch (item.type) {
+    case "user_message":
+      return base("You", item.text);
+    case "assistant_message":
+      return base("Assistant", item.text);
+    case "reasoning":
+      return base("Thinking", item.text);
+    case "proposed_plan":
+      return base("Plan", item.markdown);
+    case "todo_list":
+      return base(
+        "Todo",
+        item.explanation ?? null,
+        item.steps.map((step) => `${planStepMarker(step.status)} ${step.text}`).join("\n"),
+      );
+    case "user_input_request":
+      return {
+        ...base(
+          "Input needed",
+          item.questions.map((question) => `${question.header}: ${question.question}`).join("\n"),
+        ),
+        actionId: item.requestId,
+        questions: item.questions.slice(0, 16).map((question) => ({
+          // Answers are keyed by this ID, so it must round-trip unchanged.
+          id: question.id,
+          header: singleLine(question.header),
+          question: bodyText(question.question, 2_000),
+          multiSelect: question.multiSelect === true,
+          allowCustomAnswer: question.allowCustomAnswer !== false,
+          options: question.options.slice(0, 32).map((option) => ({
+            label: singleLine(option.label),
+            description: singleLine(option.description),
+            // Provider option values must round-trip unchanged.
+            value: option.value ?? option.label,
+          })),
+        })),
+      };
+    case "file_change":
+      return {
+        ...base(
+          "File change",
+          item.fileName,
+          item.diffStr ??
+            (item.oldStr !== undefined || item.newStr !== undefined
+              ? `--- before\n${item.oldStr ?? ""}\n+++ after\n${item.newStr ?? ""}`
+              : null),
+        ),
+        path: singleLine(item.fileName, 2_000),
+      };
+    case "command_execution":
+      return base("Command", item.input, item.output ?? null);
+    case "file_search":
+      return base(
+        "File search",
+        item.pattern ?? null,
+        item.results
+          ?.map(
+            (result) =>
+              `${result.fileName}${result.line === undefined ? "" : `:${String(result.line)}`}${result.preview === undefined ? "" : `: ${result.preview}`}`,
+          )
+          .join("\n") ?? null,
+      );
+    case "web_search":
+      return base(
+        "Web search",
+        item.patterns?.join(" · ") ?? null,
+        item.results
+          ?.map(
+            (result) =>
+              `${result.title ?? result.url ?? "Result"}${result.url === undefined ? "" : `: ${result.url}`}`,
+          )
+          .join("\n") ?? null,
+      );
+    case "approval_request":
+      return {
+        ...base("Approval needed", item.prompt ?? item.requestKind),
+        actionId: item.requestId,
+      };
+    case "checkpoint":
+      return base("Checkpoint", null, item.files.map((file) => file.path).join("\n"));
+    case "run_interrupt_request":
+      return base("Interrupt requested", item.message);
+    case "run_interrupt_result":
+      return base("Interrupt result", item.message);
+    case "error":
+      return base("Error", item.failure.message, item.failure.code);
+    case "compaction":
+      return base("Compaction", item.summary ?? null);
+    case "handoff":
+      return base("Handoff", item.summary ?? item.strategy);
+    case "fork":
+      return base("Fork", `Created thread ${item.targetThreadId}`);
+    case "thread_created":
+      return base("Thread created", `${item.targetModel} · ${item.targetThreadId}`);
+    case "subagent":
+      return base("Agent", item.prompt, item.result ?? item.progress ?? null);
+    case "dynamic_tool":
+      // Arbitrary tool payloads may contain credentials. Keep them behind the
+      // bridge boundary until a tool-specific safe presentation exists.
+      return base(item.toolName === null ? "Tool" : `Tool · ${item.toolName}`);
+    default: {
+      const futureItem = item as { readonly type: string };
+      return base("Activity", null, null, futureItem.type);
+    }
+  }
+};
+
+const normalizeProjectionStatus = (projection: OrchestrationV2ThreadProjection): string => {
+  if (projection.runtimeRequests.some((request) => request.status === "pending")) {
+    return "waiting-approval";
+  }
+  const latest = projection.runs.reduce<(typeof projection.runs)[number] | null>(
+    (current, run) => (current === null || run.ordinal > current.ordinal ? run : current),
+    null,
+  );
+  if (latest?.status === "failed") return "failed";
+  if (
+    latest !== null &&
+    ["preparing", "queued", "starting", "running", "waiting"].includes(latest.status)
+  ) {
+    return "running";
+  }
+  return "idle";
+};
+
+// Run metadata comes from the projection's complete control-plane arrays, so
+// the same normalizer serves the live window and older history pages.
+const threadItemNormalizer = (projection: OrchestrationV2ThreadProjection) => {
+  const runs = new Map(projection.runs.map((run) => [run.id, run]));
+  const userRuns = new Map(projection.runs.map((run) => [run.userMessageId, run]));
+  // Match the web's last-assistant-per-run presentation, but only fold
+  // commentary after completion. Active assistant output remains readable.
+  const lastAssistant = new Map<string, string>();
+  for (const { item } of projection.visibleTurnItems) {
+    if (item.type === "assistant_message" && item.runId !== null) {
+      lastAssistant.set(item.runId, item.id);
+    }
+  }
+  return (item: OrchestrationV2TurnItem): NormalizedThreadItem => {
+    const run =
+      item.runId !== null
+        ? runs.get(item.runId)
+        : item.type === "user_message"
+          ? userRuns.get(item.messageId)
+          : undefined;
+    const completed = run?.status === "completed" && run.completedAt !== null;
+    const runId = item.runId ?? run?.id ?? null;
+    return {
+      ...normalizeTurnItem(item),
+      runId: runId === null ? null : singleLine(runId, 4_000),
+      runStatus: run?.status ?? null,
+      runOrdinal: run?.ordinal ?? null,
+      presentation:
+        completed &&
+        item.type === "assistant_message" &&
+        !item.streaming &&
+        lastAssistant.get(run.id) !== item.id
+          ? "work"
+          : "message",
+    };
+  };
+};
+
+/** Apply the shared text budget newest-first, returning chronological items. */
+const budgetItems = (
+  items: ReadonlyArray<NormalizedThreadItem>,
+): { readonly items: NormalizedThreadItem[]; readonly clipped: boolean } => {
+  let remaining = MAX_THREAD_TEXT_CHARS;
+  let clipped = false;
+  const budgeted = items
+    .toReversed()
+    .map((item) => {
+      const take = (value: string | null): string | null => {
+        if (value === null) return null;
+        const encodedLength = Buffer.byteLength(value, "utf8");
+        const result = clipUtf8Bytes(value, remaining);
+        if (Buffer.byteLength(result, "utf8") < encodedLength) clipped = true;
+        remaining -= Buffer.byteLength(result, "utf8");
+        return result;
+      };
+      return { ...item, detail: take(item.detail), text: take(item.text) };
+    })
+    .toReversed();
+  return { items: budgeted, clipped };
+};
+
+const latestTokenUsage = (projection: OrchestrationV2ThreadProjection) => {
+  const usage = projection.providerTurns
+    .flatMap((turn) => (turn.tokenUsage === undefined ? [] : [turn.tokenUsage]))
+    .reduce<OrchestrationV2ThreadProjection["providerTurns"][number]["tokenUsage"] | null>(
+      (latest, next) =>
+        latest === null || latest === undefined || next.updatedAt > latest.updatedAt
+          ? next
+          : latest,
+      null,
+    );
+  return usage === null || usage === undefined
+    ? null
+    : { usedTokens: usage.usedTokens, maxTokens: usage.maxTokens ?? null };
+};
+
+const queuedRuns = (projection: OrchestrationV2ThreadProjection): NormalizedQueuedRun[] => {
+  const messages = new Map(projection.messages.map((message) => [message.id, message]));
+  return projection.runs
+    .filter((run) => run.status === "queued")
+    .toSorted(
+      (a, b) =>
+        (a.queuePosition ?? Number.MAX_SAFE_INTEGER) -
+          (b.queuePosition ?? Number.MAX_SAFE_INTEGER) || a.ordinal - b.ordinal,
+    )
+    .slice(0, 50)
+    .map((run) => {
+      const original = messages.get(run.userMessageId)?.text ?? "";
+      const text = clipUtf8Bytes(bodyText(original), 4_000);
+      return {
+        runId: singleLine(run.id, 4_000),
+        position: run.queuePosition ?? null,
+        held: run.queueHeld === true,
+        text,
+        // Editing a preview would replace the full message with it.
+        truncated: text !== original,
+      };
+    });
+};
+
+export const normalizeThreadProjection = (
+  projection: OrchestrationV2ThreadProjection,
+  serverHasOlderHistory = false,
+): NormalizedThreadPayload => {
+  const visible = projection.visibleTurnItems.slice(-MAX_THREAD_ITEMS);
+  const activeRun = projection.runs.findLast((run) =>
+    ["preparing", "starting", "running", "waiting"].includes(run.status),
+  );
+  const normalize = threadItemNormalizer(projection);
+  const pending = projection.runtimeRequests.filter((request) => request.status === "pending");
+  const pendingIds = new Set(pending.map((request) => request.id));
+  // Attention is independent of the recent-history window. Keep this list
+  // separately bounded, and retain the full count when details are unavailable.
+  const attention = projection.visibleTurnItems
+    .filter(
+      ({ item }) =>
+        (item.type === "approval_request" || item.type === "user_input_request") &&
+        pendingIds.has(item.requestId),
+    )
+    .slice(-20)
+    .map(({ item }) => {
+      const normalized = normalize(item);
+      return {
+        ...normalized,
+        status: "waiting",
+        text: clipUtf8Bytes(normalized.text ?? "", 2_000),
+        detail: null,
+      };
+    });
+  const olderInWindow = projection.visibleTurnItems.length > visible.length;
+  const budgeted = budgetItems(visible.map((row) => normalize(row.item)));
+  const items = budgeted.items;
+  const payload: NormalizedThreadPayload = {
+    thread: {
+      id: singleLine(projection.thread.id, 4_000),
+      projectId: singleLine(projection.thread.projectId, 4_000),
+      title: singleLine(projection.thread.title),
+      status: normalizeProjectionStatus(projection),
+      provider: singleLine(projection.thread.providerInstanceId),
+      model: singleLine(projection.thread.modelSelection.model),
+      modelSelection: projection.thread.modelSelection,
+      activeRunModel: activeRun?.modelSelection.model ?? null,
+      activeRunProvider: activeRun?.modelSelection.instanceId ?? null,
+      hasStartedSession: projection.providerSessions.length > 0,
+      worktree: singleLine(projection.thread.worktreePath ?? "root"),
+      worktreePath:
+        projection.thread.worktreePath === null
+          ? null
+          : singleLine(projection.thread.worktreePath, 2_000),
+      branch: projection.thread.branch === null ? null : singleLine(projection.thread.branch),
+      runtimeMode: projection.thread.runtimeMode,
+      interactionMode: projection.thread.interactionMode,
+      activeRunId: activeRun?.id ?? null,
+      tokenUsage: latestTokenUsage(projection),
+    },
+    items,
+    attention,
+    pendingRequestCount: pending.length,
+    queued: queuedRuns(projection),
+    hasOlderHistory: olderInWindow || serverHasOlderHistory,
+    truncated: olderInWindow || budgeted.clipped,
+  };
+  while (Buffer.byteLength(encodeJson(payload), "utf8") > 700_000 && items.length > 0) {
+    items.shift();
+    payload.truncated = true;
+    payload.hasOlderHistory = true;
+  }
+  return payload;
+};
+
+/** Older rows not yet sent, and the server cursor for anything older still. */
+interface ThreadHistorySegment {
+  readonly rows: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
+  readonly cursor: string | null;
+}
+
+/**
+ * Per-thread paging state. The live projection only holds the server's
+ * bounded window; rows before it are reached through opaque server cursors.
+ * Segments are keyed by the first item already sent to the client, which is
+ * what it pages backwards from.
+ */
+export interface ThreadHistoryState {
+  projection: OrchestrationV2ThreadProjection;
+  windowCursor: string | null;
+  readonly segments: Map<string, ThreadHistorySegment>;
+}
+
+export interface ThreadHistoryPageSource {
+  readonly items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
+  readonly nextCursor: string | null;
+  readonly hasMoreHistory: boolean;
+}
+
+/**
+ * Older items immediately before `beforeItemId`, normalized and bounded like
+ * the live window. Items are chronological. Rows that do not fit are kept for
+ * the next request rather than dropped.
+ */
+export const serveThreadHistory = Effect.fn("clientBridge.serveThreadHistory")(function* <E, R>(
+  state: ThreadHistoryState,
+  beforeItemId: string,
+  fetchPage: (cursor: string) => Effect.Effect<ThreadHistoryPageSource, E, R>,
+) {
+  const window = state.projection.visibleTurnItems;
+  const index = window.findIndex((row) => row.item.id === beforeItemId);
+  let segment =
+    index >= 0
+      ? { rows: window.slice(0, index), cursor: state.windowCursor }
+      : state.segments.get(beforeItemId);
+  if (segment === undefined) {
+    return yield* fail(
+      "history-unavailable",
+      "The bridge has no history position for that item; reopen the thread.",
+    );
+  }
+  if (segment.rows.length === 0 && segment.cursor !== null) {
+    const page = yield* fetchPage(segment.cursor);
+    segment = { rows: page.items, cursor: page.hasMoreHistory ? page.nextCursor : null };
+  }
+  const normalize = threadItemNormalizer(state.projection);
+  const start = Math.max(0, segment.rows.length - MAX_THREAD_ITEMS);
+  const { items } = budgetItems(segment.rows.slice(start).map((row) => normalize(row.item)));
+  let dropped = 0;
+  while (Buffer.byteLength(encodeJson(items), "utf8") > 700_000 && items.length > 1) {
+    items.shift();
+    dropped += 1;
+  }
+  const remaining = { rows: segment.rows.slice(0, start + dropped), cursor: segment.cursor };
+  // An empty server page still advances the cursor; retry from the same item.
+  state.segments.set(items[0]?.id ?? beforeItemId, remaining);
+  return { items, hasMore: remaining.rows.length > 0 || remaining.cursor !== null };
+});
+
+export const normalizeArchivedThreads = (snapshot: OrchestrationV2ArchivedShellSnapshot) => {
+  const projects = new Map(snapshot.projects.map((project) => [project.id, project]));
+  return {
+    threads: snapshot.threads
+      .filter((thread) => thread.deletedAt === null)
+      .toSorted((a, b) => DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt))
+      .slice(0, 500)
+      .map((thread) => {
+        const project = projects.get(thread.projectId);
+        return {
+          id: thread.id,
+          title: singleLine(thread.title),
+          projectId: thread.projectId,
+          projectName: singleLine(
+            project?.repositoryIdentity?.displayName ?? project?.title ?? thread.projectId,
+          ),
+          provider: singleLine(thread.providerInstanceId),
+          model: singleLine(thread.modelSelection.model),
+          updatedAt: DateTime.formatIso(thread.updatedAt),
+        };
+      }),
+  };
+};
+
+export const normalizeProviderCommands = (
+  providers: ServerConfig["providers"],
+  instanceId: string,
+) => {
+  const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+  return {
+    slashCommands: (provider?.slashCommands ?? []).slice(0, 200).map((command) => ({
+      name: singleLine(command.name),
+      description: command.description === undefined ? null : singleLine(command.description),
+    })),
+    skills: (provider?.skills ?? [])
+      .filter((skill) => skill.enabled)
+      .slice(0, 200)
+      .map((skill) => ({
+        name: singleLine(skill.name),
+        description: singleLine(skill.shortDescription ?? skill.description ?? ""),
+        userInvocationOnly: skill.userInvocationOnly === true,
+      })),
+  };
+};
+
+const deletedThreadPayload: NormalizedThreadPayload = {
+  thread: null,
+  items: [],
+  truncated: false,
+  deleted: true,
+};
+
+export const threadResumeInput = (threadId: typeof ThreadId.Type, snapshotSequence: number) => ({
+  threadId,
+  afterSequence: snapshotSequence,
+  requestCompletionMarker: true as const,
+  snapshotFallback: "error" as const,
+});
+
+export const reduceThreadProjection = (
+  projection: OrchestrationV2ThreadProjection,
+  event: OrchestrationV2DomainEvent,
+  serverHasOlderHistory = false,
+): {
+  readonly projection: OrchestrationV2ThreadProjection | null;
+  readonly payload: NormalizedThreadPayload | null;
+} => {
+  if (event.type === "thread.deleted") {
+    return { projection: null, payload: deletedThreadPayload };
+  }
+  const next = applyOrchestrationV2ProjectionEvent(projection, event);
+  return {
+    projection: next,
+    payload: next === null ? null : normalizeThreadProjection(next, serverHasOlderHistory),
+  };
+};
+
+const lineLimiter = (): NodeStream.Transform => {
+  let pendingBytes = 0;
+  return new NodeStream.Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      let start = 0;
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (chunk[index] !== 0x0a) continue;
+        const lineBytes = pendingBytes + index - start;
+        if (lineBytes > MAX_LINE_BYTES) {
+          callback(new Error(`NDJSON line exceeds ${String(MAX_LINE_BYTES)} bytes.`));
+          return;
+        }
+        pendingBytes = 0;
+        start = index + 1;
+      }
+      pendingBytes += chunk.length - start;
+      if (pendingBytes > MAX_LINE_BYTES) {
+        callback(new Error(`NDJSON line exceeds ${String(MAX_LINE_BYTES)} bytes.`));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+};
+
+const stdioFlag = Flag.Boolean("stdio").pipe(
+  Flag.withDescription("Run the versioned NDJSON client bridge on stdin/stdout."),
+  Flag.withDefault(false),
+);
+
+const runClientBridge = Effect.fn("clientBridge.run")(function* () {
+  const connection = yield* Ref.make<BridgeConnection | null>(null);
+  const reconnecting = yield* Ref.make(false);
+  const firstReady = yield* Deferred.make<BridgeConnection>();
+  const connectionReady = yield* Ref.make(firstReady);
+  const subscriptions = yield* Ref.make(new Map<string, Fiber.Fiber<void, unknown>>());
+  // History paging needs the subscription's live window and server cursor.
+  const threadHistories = new Map<string, ThreadHistoryState>();
+  const subscriptionThreads = new Map<string, string>();
+  const gateway = yield* makeEnvironmentGateway(
+    (environmentId) =>
+      Effect.flatMap(Ref.get(connection), (current) =>
+        current === null
+          ? Effect.fail(fail("not-ready", "Send hello first."))
+          : current.session.client[WS_METHODS.localConnectionsResolve]({ environmentId }).pipe(
+              Effect.mapError(() => fail("sharing-unavailable", "Shared entry unavailable.")),
+            ),
+      ).pipe(
+        Effect.mapError(
+          () => new EnvironmentGatewayError({ message: "Shared entry unavailable." }),
+        ),
+      ),
+    (record) =>
+      writeRecord(record).pipe(
+        Effect.mapError(() => new EnvironmentGatewayError({ message: "Output unavailable." })),
+      ),
+  );
+  let environmentsAvailable = false;
+  yield* Effect.addFinalizer(() =>
+    Ref.get(connection).pipe(
+      Effect.flatMap((current) => (current ? Scope.close(current.scope, Exit.void) : Effect.void)),
+    ),
+  );
+
+  const monitorConnection = (initial: BridgeConnection) => {
+    let lastFailure: string | undefined;
+    return superviseBridgeConnection(
+      initial,
+      (current) => current.session.closed,
+      reconnect,
+      (phase, current) =>
+        Effect.gen(function* () {
+          if (phase === "retrying") {
+            yield* Ref.set(reconnecting, true);
+            yield* Ref.set(connectionReady, yield* Deferred.make<BridgeConnection>());
+            yield* Scope.close(current.scope, Exit.void);
+          } else {
+            lastFailure = undefined;
+            yield* Ref.set(connection, current);
+            yield* Deferred.succeed(yield* Ref.get(connectionReady), current);
+            yield* Ref.set(reconnecting, false);
+          }
+          yield* writeRecord(
+            phase === "ready"
+              ? { kind: "state", phase }
+              : { kind: "state", phase, message: "WebSocket disconnected" },
+          );
+        }),
+      {
+        shouldRetry: (error) => error.code !== "authentication-failed",
+        onFailure: (error) =>
+          error.message === lastFailure
+            ? Effect.void
+            : writeRecord({ kind: "state", phase: "retrying", message: error.message }).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    lastFailure = error.message;
+                  }),
+                ),
+              ),
+      },
+    ).pipe(
+      Effect.catch((error) =>
+        writeRecord({ kind: "fatal", code: error.code, message: error.message }).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              process.exitCode = 1;
+              process.stdin.destroy();
+            }),
+          ),
+        ),
+      ),
+    );
+  };
+
+  const stopSubscription = Effect.fn("clientBridge.stopSubscription")(function* (
+    subscriptionId: string,
+  ) {
+    const current = yield* Ref.get(subscriptions);
+    const fiber = current.get(subscriptionId);
+    if (fiber === undefined) return;
+    const threadId = subscriptionThreads.get(subscriptionId);
+    if (threadId !== undefined) {
+      subscriptionThreads.delete(subscriptionId);
+      threadHistories.delete(threadId);
+    }
+    yield* Fiber.interrupt(fiber);
+    yield* Ref.update(subscriptions, (value) => {
+      const next = new Map(value);
+      next.delete(subscriptionId);
+      return next;
+    });
+  });
+
+  const requireConnection = Effect.fn("clientBridge.requireConnection")(function* () {
+    const current = yield* Ref.get(connection);
+    if (current === null) {
+      return yield* fail("not-ready", "Send hello before requests or subscriptions.");
+    }
+    return current;
+  });
+
+  const awaitConnection = Effect.fn("clientBridge.awaitConnection")(function* () {
+    return yield* Deferred.await(yield* Ref.get(connectionReady));
+  });
+
+  const threadProjection = Effect.fn("clientBridge.threadProjection")(function* (
+    current: BridgeConnection,
+    threadId: typeof ThreadId.Type,
+  ) {
+    const snapshot = yield* fetchEnvironmentBoundedThreadSnapshot({
+      prepared: current.prepared,
+      threadId,
+      signer: Option.none(),
+    });
+    return snapshot.projection;
+  });
+
+  const handleRequest = Effect.fn("clientBridge.handleRequest")(function* (
+    current: BridgeConnection,
+    message: typeof RequestMessage.Type,
+  ) {
+    const dispatch = current.session.client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand];
+    switch (message.operation) {
+      case "environment.attach": {
+        if (!environmentsAvailable || message.input === null)
+          return yield* fail(
+            "sharing-unavailable",
+            "Use a local primary with an access:read admin token and enable connection sharing.",
+          );
+        const input = yield* decodeEnvironmentAttachInput(message.input).pipe(
+          Effect.mapError(() => fail("invalid-input", "Invalid attachment input.")),
+        );
+        if (input.clientEnvironmentId === current.clientEnvironmentId)
+          return yield* fail("invalid-input", "Cannot replace the root environment.");
+        return yield* gateway
+          .attach(input)
+          .pipe(
+            Effect.mapError(() => fail("attach-failed", "Cannot attach this shared environment.")),
+          );
+      }
+      case "environment.detach": {
+        const input = yield* decodeEnvironmentDetachInput(message.input).pipe(
+          Effect.mapError(() => fail("invalid-input", "Invalid detach input.")),
+        );
+        return yield* gateway.detach(input.clientEnvironmentId);
+      }
+      case "server.getConfig":
+        return {
+          serverVersion: current.config.environment.serverVersion,
+          environment: current.config.environment,
+          providers: current.config.providers,
+          capabilities: {
+            shell: true,
+            threads: true,
+            mutations: true,
+            threadSections: true,
+            modelSelection: true,
+            shellResumeCompletionMarker: current.config.shellResumeCompletionMarker === true,
+            threadResumeCompletionMarker: current.config.threadResumeCompletionMarker === true,
+            threadSnapshotPagination: current.config.threadSnapshotPagination === true,
+            threadLifecycle: true,
+            composerCompletion: true,
+            projectRegistration: true,
+          },
+        };
+      case "model.catalog":
+        return normalizeModelCatalog(current.config.providers);
+      case "thread.send": {
+        const input = yield* decodeThreadSendInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        const projection = yield* threadProjection(current, input.threadId);
+        const activeRun = projection.runs.findLast((run) =>
+          ["preparing", "starting", "running", "waiting"].includes(run.status),
+        );
+        const activeProviderThread =
+          activeRun === undefined
+            ? undefined
+            : projection.providerThreads.find((thread) => thread.id === activeRun.providerThreadId);
+        const activeProviderSession =
+          activeProviderThread?.providerSessionId === null ||
+          activeProviderThread?.providerSessionId === undefined
+            ? undefined
+            : projection.providerSessions.find(
+                (session) => session.id === activeProviderThread.providerSessionId,
+              );
+        const capabilities = activeProviderSession?.capabilities.turns;
+        const requestedMode = input.dispatchMode;
+        const dispatchMode =
+          activeRun === undefined || requestedMode === "start"
+            ? ({ type: "start_immediately" } as const)
+            : requestedMode === "steer"
+              ? ({ type: "steer_active", targetRunId: activeRun.id } as const)
+              : requestedMode === "restart"
+                ? ({ type: "restart_active", targetRunId: activeRun.id } as const)
+                : requestedMode === "queue"
+                  ? ({ type: "queue_after_active" } as const)
+                  : capabilities?.supportsActiveSteering === true
+                    ? ({ type: "steer_active", targetRunId: activeRun.id } as const)
+                    : capabilities?.supportsQueuedMessages === true
+                      ? ({ type: "queue_after_active" } as const)
+                      : capabilities?.supportsSteeringByInterruptRestart === true
+                        ? ({ type: "restart_active", targetRunId: activeRun.id } as const)
+                        : ({ type: "queue_after_active" } as const);
+        return yield* dispatch({
+          type: "message.dispatch",
+          commandId: input.commandId,
+          createdBy: "user",
+          creationSource: "server",
+          threadId: input.threadId,
+          messageId: input.messageId,
+          text: input.text,
+          attachments: [],
+          dispatchMode,
+        });
+      }
+      case "thread.interrupt": {
+        const input = yield* decodeThreadInterruptInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        const projection = yield* threadProjection(current, input.threadId);
+        const activeRun = projection.runs.findLast((run) =>
+          ["preparing", "starting", "running", "waiting"].includes(run.status),
+        );
+        if (activeRun === undefined) return { sequence: 0 };
+        return yield* dispatch({
+          type: "run.interrupt",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          runId: activeRun.id,
+        });
+      }
+      case "thread.approval.respond": {
+        const input = yield* decodeThreadApprovalInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        return yield* dispatch({
+          type: "runtime-request.respond",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          requestId: input.requestId,
+          decision: input.decision,
+        });
+      }
+      case "thread.modelSelection.set": {
+        const input = yield* decodeThreadModelSelectionInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        const projection = yield* threadProjection(current, input.threadId);
+        return yield* dispatch({
+          type: modelSelectionCommandType(
+            projection.thread.providerInstanceId,
+            input.modelSelection,
+          ),
+          commandId: input.commandId,
+          threadId: input.threadId,
+          modelSelection: input.modelSelection,
+        });
+      }
+      case "thread.runtimeMode.set": {
+        const input = yield* decodeThreadRuntimeModeInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        return yield* dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          runtimeMode: input.runtimeMode,
+        });
+      }
+      case "thread.interactionMode.set": {
+        const input = yield* decodeThreadInteractionModeInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        return yield* dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          interactionMode: input.interactionMode,
+        });
+      }
+      case "thread.settled.set": {
+        const input = yield* decodeThreadSettledInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        return yield* dispatch(
+          input.settled
+            ? { type: "thread.settle", commandId: input.commandId, threadId: input.threadId }
+            : {
+                type: "thread.unsettle",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                reason: "user",
+              },
+        );
+      }
+      case "thread.snooze.set": {
+        const input = yield* decodeThreadSnoozeInput(message.input).pipe(
+          Effect.mapError((cause) => fail("invalid-input", safeErrorMessage(cause))),
+        );
+        return yield* dispatch(
+          input.snoozedUntil === null
+            ? {
+                type: "thread.unsnooze",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                reason: "user",
+              }
+            : {
+                type: "thread.snooze",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                snoozedUntil: input.snoozedUntil,
+              },
+        );
+      }
+      case "thread.create": {
+        const input = yield* decodeThreadCreateInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const launch = current.session.client[ORCHESTRATION_V2_WS_METHODS.launchThread];
+        const result = yield* launch({
+          commandId: input.commandId,
+          creationSource: "server",
+          projectId: input.projectId,
+          title: input.title ?? singleLine(input.text, 80),
+          generateTitle: input.title === undefined,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          workspaceStrategy: input.workspaceStrategy,
+          initialMessage: { text: input.text, attachments: [] },
+        });
+        return { threadId: result.threadId };
+      }
+      case "thread.fork": {
+        const input = yield* decodeThreadForkInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        yield* dispatch({
+          type: "thread.fork",
+          commandId: input.commandId,
+          createdBy: "user",
+          creationSource: "server",
+          sourceThreadId: input.threadId,
+          targetThreadId: input.targetThreadId,
+          sourcePoint:
+            input.runId === null ? { type: "latest_stable" } : { type: "run", runId: input.runId },
+          ...(input.title === undefined ? {} : { title: input.title }),
+        });
+        return { threadId: input.targetThreadId };
+      }
+      case "thread.command": {
+        const input = yield* decodeThreadCommandInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        return yield* dispatch(yield* decodePassthroughThreadCommand(input.command));
+      }
+      case "thread.history": {
+        const input = yield* decodeThreadHistoryInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const state = threadHistories.get(input.threadId);
+        if (state === undefined) {
+          return yield* fail(
+            "history-unavailable",
+            "Subscribe to the thread before loading its history.",
+          );
+        }
+        return yield* serveThreadHistory(state, input.beforeItemId, (cursor) =>
+          fetchEnvironmentThreadHistoryPage({
+            prepared: current.prepared,
+            threadId: input.threadId,
+            cursor,
+            signer: Option.none(),
+          }).pipe(
+            Effect.mapError((cause) =>
+              fail("history-failed", safeErrorMessage(cause, preparedSecrets(current.prepared))),
+            ),
+          ),
+        );
+      }
+      case "thread.search": {
+        const input = yield* decodeThreadSearchInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const result = yield* current.session.client[ORCHESTRATION_V2_WS_METHODS.searchThreads]({
+          query: input.query,
+          limit: Math.min(50, Math.max(1, input.limit ?? 30)),
+        });
+        return {
+          matches: result.matches.map((match) => ({
+            threadId: match.threadId,
+            projectId: match.projectId,
+            source: match.source,
+            snippet: singleLine(match.snippet),
+          })),
+        };
+      }
+      case "threads.archived": {
+        const snapshot = yield* current.session.client[
+          ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot
+        ]({});
+        return normalizeArchivedThreads(snapshot);
+      }
+      case "provider.commands": {
+        const input = yield* decodeProviderCommandsInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        return normalizeProviderCommands(current.config.providers, input.instanceId);
+      }
+      case "project.create":
+        return yield* registerProject(
+          message.input,
+          current.session.client[WS_METHODS.projectsMutate],
+        );
+      case "project.searchEntries": {
+        const input = yield* decodeProjectSearchEntriesInput(message.input).pipe(
+          Effect.mapError(invalidInput),
+        );
+        const result = yield* current.session.client[WS_METHODS.projectsSearchEntries]({
+          cwd: input.cwd,
+          query: input.query.trim().slice(0, 256),
+          limit: Math.min(200, Math.max(1, input.limit ?? 50)),
+        });
+        return {
+          entries: result.entries
+            .slice(0, 200)
+            .map((entry) => ({ path: singleLine(entry.path, 2_000), kind: entry.kind })),
+          truncated: result.truncated,
+        };
+      }
+      default:
+        return yield* fail("unsupported-operation", `Unsupported operation: ${message.operation}`);
+    }
+  });
+
+  const respondToRequest = Effect.fn("clientBridge.respondToRequest")(function* (
+    current: BridgeConnection,
+    message: typeof RequestMessage.Type,
+  ) {
+    if (yield* Ref.get(reconnecting)) {
+      yield* writeRecord({
+        kind: "response",
+        id: message.id,
+        error: {
+          code: "bridge-retrying",
+          message: "WebSocket reconnecting; message was not dispatched.",
+        },
+      });
+      return;
+    }
+    yield* handleRequest(current, message).pipe(
+      Effect.matchCauseEffect({
+        onFailure: (cause) =>
+          writeRecord({
+            kind: "response",
+            id: message.id,
+            error: {
+              code: "request-failed",
+              message: safeErrorMessage(Cause.squash(cause), preparedSecrets(current.prepared)),
+            },
+          }),
+        onSuccess: (result) => writeRecord({ kind: "response", id: message.id, result }),
+      }),
+    );
+  });
+
+  const startShellSubscription = Effect.fn("clientBridge.startShellSubscription")(function* (
+    message: typeof SubscribeMessage.Type,
+  ) {
+    yield* requireConnection();
+    yield* stopSubscription(message.subscriptionId);
+    let outputSequence = message.resumeSequence ?? 0;
+    const runOnce = Effect.gen(function* () {
+      const current = yield* awaitConnection();
+      const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeShell];
+      const snapshot = yield* fetchEnvironmentShellSnapshot({
+        prepared: current.prepared,
+        signer: Option.none(),
+      }).pipe(
+        Effect.mapError((cause) =>
+          fail("shell-snapshot-failed", safeErrorMessage(cause, preparedSecrets(current.prepared))),
+        ),
+      );
+      const latest = yield* Ref.make(snapshot);
+      let basePayload = normalizeShellSnapshot(snapshot);
+      const stats = new Map<string, VcsStatusLocalResult>();
+      const watchers = new Map<string, Fiber.Fiber<void, never>>();
+      let statsDirty = false;
+      let lastPayload = withWorkspaceStats(basePayload, stats);
+      const publishStats = Effect.fn("clientBridge.publishWorkspaceStats")(function* () {
+        const payload = withWorkspaceStats(basePayload, stats);
+        if (encodeJson(payload) === encodeJson(lastPayload)) return;
+        lastPayload = payload;
+        outputSequence += 1;
+        yield* writeRecord({
+          kind: "event",
+          subscriptionId: message.subscriptionId,
+          generation: current.generation,
+          sequence: outputSequence,
+          payload,
+        });
+      });
+      const reconcileStats = Effect.fn("clientBridge.watchWorkspaceStats")(function* () {
+        // One shared server-side VCS watcher per active workspace, not per thread.
+        const paths = new Set(
+          basePayload.projects.flatMap((project) =>
+            project.threads.filter((thread) => !thread.settled).map((thread) => thread.path),
+          ),
+        );
+        for (const [path, fiber] of watchers) {
+          if (paths.has(path)) continue;
+          yield* Fiber.interrupt(fiber);
+          watchers.delete(path);
+          stats.delete(path);
+        }
+        for (const path of paths) {
+          if (watchers.has(path)) continue;
+          const fiber = yield* current.session.client[WS_METHODS.subscribeVcsStatus]({
+            cwd: path,
+          }).pipe(
+            Stream.runForEach((event) => {
+              if (event._tag === "remoteUpdated") return Effect.void;
+              return Effect.sync(() => {
+                stats.set(path, event.local);
+                statsDirty = true;
+              });
+            }),
+            // Older servers and inaccessible workspaces show unknown, not zero.
+            Effect.catchCause(() =>
+              Effect.sync(() => {
+                stats.delete(path);
+                statsDirty = true;
+              }),
+            ),
+            Effect.forkScoped,
+          );
+          watchers.set(path, fiber);
+        }
+      });
+      outputSequence += 1;
+      yield* writeRecord({
+        kind: "snapshot",
+        subscriptionId: message.subscriptionId,
+        generation: current.generation,
+        sequence: outputSequence,
+        payload: lastPayload,
+      });
+      yield* reconcileStats();
+      const subscribeInput =
+        current.config.shellResumeCompletionMarker === true
+          ? {
+              afterSequence: snapshot.snapshotSequence,
+              requestCompletionMarker: true as const,
+            }
+          : { afterSequence: snapshot.snapshotSequence };
+      const serverUpdates = method(subscribeInput).pipe(
+        Stream.map((item) => ({ _tag: "Server" as const, item })),
+      );
+      const clockUpdates = Stream.tick("1 minute").pipe(
+        Stream.map(() => ({ _tag: "Clock" as const })),
+      );
+      // Coalesce filesystem bursts and serialize stats with shell sequence numbers.
+      const statsUpdates = Stream.tick("1 second").pipe(
+        Stream.map(() => ({ _tag: "Stats" as const })),
+      );
+      yield* Stream.merge(Stream.merge(serverUpdates, clockUpdates), statsUpdates).pipe(
+        Stream.runForEach((update) =>
+          Effect.gen(function* () {
+            if (update._tag === "Stats") {
+              if (!statsDirty) return;
+              statsDirty = false;
+              yield* publishStats();
+              return;
+            }
+            if (update._tag === "Clock") {
+              const value = yield* Ref.get(latest);
+              basePayload = normalizeShellSnapshot(value);
+              yield* reconcileStats();
+              yield* publishStats();
+              return;
+            }
+            const item: OrchestrationV2ShellStreamItem = update.item;
+            if (item.kind === "synchronized") {
+              outputSequence += 1;
+              yield* writeRecord({
+                kind: "synchronized",
+                subscriptionId: message.subscriptionId,
+                generation: current.generation,
+                sequence: outputSequence,
+              });
+              return;
+            }
+            const previous = yield* Ref.get(latest);
+            let next: OrchestrationV2ShellSnapshot;
+            if (item.kind === "snapshot") {
+              next = mergeShellSnapshotProjects(
+                previous,
+                item.snapshot,
+                item.resolvedRepositoryIdentityRoots === undefined
+                  ? undefined
+                  : { resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots },
+              );
+            } else {
+              next = applyShellStreamEvent(previous, item);
+            }
+            yield* Ref.set(latest, next);
+            basePayload = normalizeShellSnapshot(next);
+            yield* reconcileStats();
+            lastPayload = withWorkspaceStats(basePayload, stats);
+            outputSequence += 1;
+            yield* writeRecord({
+              kind: item.kind === "snapshot" ? "snapshot" : "event",
+              subscriptionId: message.subscriptionId,
+              generation: current.generation,
+              sequence: outputSequence,
+              payload: lastPayload,
+            });
+          }),
+        ),
+      );
+    });
+    const run = superviseSubscription(Effect.scoped(runOnce));
+    const fiber = yield* Effect.forkScoped(run);
+    yield* Ref.update(subscriptions, (value) => {
+      const next = new Map(value);
+      next.set(message.subscriptionId, fiber);
+      return next;
+    });
+  });
+
+  const startThreadSubscription = Effect.fn("clientBridge.startThreadSubscription")(function* (
+    message: typeof SubscribeMessage.Type,
+  ) {
+    yield* requireConnection();
+    const threadId = yield* decodeThreadId(message.identity).pipe(
+      Effect.mapError((cause) => fail("invalid-thread-identity", safeErrorMessage(cause))),
+    );
+    yield* stopSubscription(message.subscriptionId);
+    let outputSequence = message.resumeSequence ?? 0;
+    const runOnce = Effect.gen(function* () {
+      const current = yield* awaitConnection();
+      const method = current.session.client[ORCHESTRATION_V2_WS_METHODS.subscribeThread];
+      // Some deployed routers reject provider-derived thread IDs containing encoded
+      // path separators even when the ID is escaped as one segment. Fall back to a
+      // one-shot RPC snapshot, normalize it immediately, then resume from its sequence.
+      const snapshot = yield* fetchEnvironmentBoundedThreadSnapshot({
+        prepared: current.prepared,
+        threadId,
+        signer: Option.none(),
+      }).pipe(
+        Effect.catchCause(() =>
+          method({ threadId, requestCompletionMarker: true }).pipe(
+            Stream.runHead,
+            Effect.flatMap(
+              Option.match({
+                onNone: () =>
+                  fail("thread-snapshot-missing", "Thread stream ended before its snapshot."),
+                onSome: (item) =>
+                  item.kind === "snapshot"
+                    ? Effect.succeed(item)
+                    : fail(
+                        "thread-snapshot-missing",
+                        "Thread stream did not begin with a snapshot.",
+                      ),
+              }),
+            ),
+          ),
+        ),
+      );
+      let latest: OrchestrationV2ThreadProjection | null = snapshot.projection;
+      // The bounded window's history cursor persists while live events extend
+      // the window; only a new snapshot replaces it. Pages already served
+      // stay valid because their cursors are keyed by item.
+      const remember = (
+        projection: OrchestrationV2ThreadProjection,
+        cursor: string | null | undefined,
+      ) => {
+        threadHistories.set(threadId, {
+          projection,
+          windowCursor: cursor ?? null,
+          segments: threadHistories.get(threadId)?.segments ?? new Map(),
+        });
+        return cursor !== null && cursor !== undefined;
+      };
+      subscriptionThreads.set(message.subscriptionId, threadId);
+      let serverHasOlderHistory = remember(
+        snapshot.projection,
+        snapshot.hasMoreHistory === true ? snapshot.historyCursor : null,
+      );
+      outputSequence += 1;
+      yield* writeRecord({
+        kind: "snapshot",
+        subscriptionId: message.subscriptionId,
+        generation: current.generation,
+        sequence: outputSequence,
+        payload: normalizeThreadProjection(snapshot.projection, serverHasOlderHistory),
+      });
+      yield* method(threadResumeInput(threadId, snapshot.snapshotSequence)).pipe(
+        Stream.runForEach((item: OrchestrationV2ThreadStreamItem) =>
+          Effect.gen(function* () {
+            if (item.kind === "synchronized") {
+              outputSequence += 1;
+              yield* writeRecord({
+                kind: "synchronized",
+                subscriptionId: message.subscriptionId,
+                generation: current.generation,
+                sequence: outputSequence,
+              });
+              return;
+            }
+            if (item.kind === "snapshot") {
+              latest = item.projection;
+              serverHasOlderHistory = remember(
+                item.projection,
+                item.hasMoreHistory === true ? item.historyCursor : null,
+              );
+              outputSequence += 1;
+              yield* writeRecord({
+                kind: "snapshot",
+                subscriptionId: message.subscriptionId,
+                generation: current.generation,
+                sequence: outputSequence,
+                payload: normalizeThreadProjection(latest, serverHasOlderHistory),
+              });
+              return;
+            }
+            if (item.kind !== "event" || latest === null) return;
+            const reduced = reduceThreadProjection(latest, item.event, serverHasOlderHistory);
+            if (reduced.payload === null) return;
+            latest = reduced.projection;
+            const history = threadHistories.get(threadId);
+            if (history !== undefined && latest !== null) history.projection = latest;
+            outputSequence += 1;
+            yield* writeRecord({
+              kind: "event",
+              subscriptionId: message.subscriptionId,
+              generation: current.generation,
+              sequence: outputSequence,
+              payload: reduced.payload,
+            });
+          }),
+        ),
+      );
+    });
+    const run = superviseSubscription(
+      runOnce.pipe(
+        Effect.tapCause((cause) =>
+          Effect.gen(function* () {
+            const current = yield* requireConnection();
+            outputSequence += 1;
+            yield* writeRecord({
+              kind: "snapshot",
+              subscriptionId: message.subscriptionId,
+              generation: current.generation,
+              sequence: outputSequence,
+              payload: {
+                thread: null,
+                items: [],
+                truncated: false,
+                error: safeErrorMessage(Cause.squash(cause), preparedSecrets(current.prepared)),
+              } satisfies NormalizedThreadPayload,
+            });
+          }),
+        ),
+      ),
+    );
+    const fiber = yield* Effect.forkScoped(run);
+    yield* Ref.update(subscriptions, (value) => {
+      const next = new Map(value);
+      next.set(message.subscriptionId, fiber);
+      return next;
+    });
+  });
+
+  const handleMessage = Effect.fn("clientBridge.handleMessage")(function* (message: ClientMessage) {
+    switch (message.kind) {
+      case "hello": {
+        if ((yield* Ref.get(connection)) !== null) {
+          return yield* fail("already-ready", "The bridge accepts one hello per process.");
+        }
+        const connected = yield* connect(message);
+        yield* Ref.set(connection, connected);
+        yield* Deferred.succeed(firstReady, connected);
+        yield* monitorConnection(connected).pipe(Effect.forkScoped);
+        if (
+          process.env.T3_CLIENT_INTERNAL_CHILD !== "1" &&
+          connected.config.localConnections === true
+        ) {
+          environmentsAvailable = yield* connected.session.client[WS_METHODS.localConnectionsGet](
+            {},
+          ).pipe(
+            Effect.tap(gateway.reconcile),
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+          if (environmentsAvailable) {
+            yield* superviseSubscription(
+              Effect.gen(function* () {
+                const current = yield* awaitConnection();
+                yield* current.session.client[WS_METHODS.localConnectionsSubscribe]({}).pipe(
+                  Stream.runForEach(gateway.reconcile),
+                );
+              }),
+            ).pipe(Effect.forkScoped);
+          }
+        }
+        yield* writeRecord({
+          kind: "ready",
+          protocolVersion: PROTOCOL_VERSION,
+          bridgeVersion: packageJson.version,
+          pinnedT3Version: packageJson.version,
+          serverVersion: connected.config.environment.serverVersion,
+          environmentId: connected.clientEnvironmentId,
+          capabilities: {
+            shell: true,
+            threads: true,
+            mutations: true,
+            threadSections: true,
+            modelSelection: true,
+            threadLifecycle: true,
+            composerCompletion: true,
+            projectRegistration: true,
+            terminal: false,
+            environments: environmentsAvailable,
+            serverEnvironmentId: connected.config.environment.environmentId,
+          },
+        });
+        return;
+      }
+      case "environment.send":
+        yield* gateway.send(message.environmentId, message.message).pipe(
+          Effect.catch(() =>
+            writeRecord({
+              kind: "state",
+              phase: "ready",
+              message: "Child input rejected: unknown attachment or invalid child message.",
+            }),
+          ),
+        );
+        return;
+      case "request": {
+        const current = yield* requireConnection();
+        yield* respondToRequest(current, message);
+        return;
+      }
+      case "cancel":
+        return;
+      case "subscribe":
+        if (message.stream === "environments") {
+          if (!environmentsAvailable || message.identity !== null)
+            return yield* fail(
+              "sharing-unavailable",
+              "Connection sharing requires a local admin connection; identity must be null.",
+            );
+          yield* stopSubscription(message.subscriptionId);
+          let sequence = message.resumeSequence ?? 0;
+          const run = superviseSubscription(
+            Effect.gen(function* () {
+              const current = yield* awaitConnection();
+              let first = true;
+              yield* current.session.client[WS_METHODS.localConnectionsSubscribe]({}).pipe(
+                Stream.runForEach((payload) =>
+                  Effect.gen(function* () {
+                    yield* writeRecord({
+                      kind: first ? "snapshot" : "event",
+                      subscriptionId: message.subscriptionId,
+                      generation: current.generation,
+                      sequence: ++sequence,
+                      payload,
+                    });
+                    first = false;
+                  }),
+                ),
+              );
+            }),
+          );
+          const fiber = yield* run.pipe(Effect.forkScoped);
+          yield* Ref.update(subscriptions, (value) =>
+            new Map(value).set(message.subscriptionId, fiber),
+          );
+          return;
+        }
+        if (message.stream === "shell") {
+          yield* startShellSubscription(message);
+          return;
+        }
+        if (message.stream === "thread") {
+          yield* startThreadSubscription(message);
+          return;
+        }
+        return yield* fail(
+          "unsupported-subscription",
+          `Unsupported subscription stream: ${message.stream}`,
+        );
+      case "unsubscribe":
+        yield* stopSubscription(message.subscriptionId);
+        return;
+      default:
+        return yield* fail("invalid-message", "Unknown client message kind.");
+    }
+  });
+
+  const limiter = lineLimiter();
+  process.stdin.pipe(limiter);
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      process.stdin.unpipe(limiter);
+      limiter.destroy();
+    }),
+  );
+
+  yield* EffectNodeStream.fromReadable<Uint8Array, ClientBridgeError>({
+    evaluate: () => limiter,
+    closeOnDone: false,
+    onError: (cause) => fail("stdin-failed", safeErrorMessage(cause)),
+  }).pipe(
+    Stream.pipeThroughChannel(Ndjson.decode({ ignoreEmptyLines: true })),
+    Stream.mapError((cause) => fail("invalid-ndjson", safeErrorMessage(cause))),
+    Stream.mapEffect((value) =>
+      decodeClientMessage(value).pipe(
+        Effect.mapError((cause) => fail("invalid-message", safeErrorMessage(cause))),
+      ),
+    ),
+    Stream.runForEach(handleMessage),
+  );
+});
+
+const ClientBridgeLayer = Layer.mergeAll(
+  FetchHttpClient.layer,
+  Layer.succeed(FetchHttpClient.RequestInit, { redirect: "error" }),
+  RpcSession.layerWithOptions({}).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor)),
+);
+
+export const clientCommand = Command.make("client", { stdio: stdioFlag }).pipe(
+  Command.withDescription("Run a version-matched T3 client bridge."),
+  Command.withHandler(({ stdio }) =>
+    stdio
+      ? runClientBridge().pipe(
+          Effect.catch((error) =>
+            writeRecord({
+              kind: "fatal",
+              code: error.code,
+              message: error.message,
+            }).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  process.exitCode = 1;
+                }),
+              ),
+              Effect.catch(() =>
+                Effect.sync(() => {
+                  process.exitCode = 1;
+                }),
+              ),
+            ),
+          ),
+          Effect.provide(ClientBridgeLayer),
+        )
+      : Effect.fail(fail("stdio-required", "Pass --stdio to run the client bridge.")),
+  ),
+);

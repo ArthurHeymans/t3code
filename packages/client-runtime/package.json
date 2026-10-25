@@ -263,6 +263,14 @@
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
     },
+    "./state/shell-reducer": {
+      "types": "./src/state/shellReducer.ts",
+      "default": "./src/state/shellReducer.ts"
+    },
+    "./state/shell-snapshot-http": {
+      "types": "./src/state/shellSnapshotHttp.ts",
+      "default": "./src/state/shellSnapshotHttp.ts"
+    },
     "./state/source-control": {
       "types": "./src/state/sourceControl.ts",
       "default": "./src/state/sourceControl.ts"
@@ -326,6 +334,14 @@
     "./state/thread-settled": {
       "types": "./src/state/threadSettled.ts",
       "default": "./src/state/threadSettled.ts"
+    },
+    "./state/bounded-thread-snapshot-http": {
+      "types": "./src/state/boundedThreadSnapshotHttp.ts",
+      "default": "./src/state/boundedThreadSnapshotHttp.ts"
+    },
+    "./state/thread-history-http": {
+      "types": "./src/state/threadHistoryHttp.ts",
+      "default": "./src/state/threadHistoryHttp.ts"
     },
     "./state/thread-search": {
       "types": "./src/state/threadSearch.ts",
