@@ -140,7 +140,12 @@ export class GitManager extends Context.Service<
     /** refresh queries the host; freshGitState rereads only git state and is required before persisting. */
     readonly branchPullRequest: (
       input: { readonly cwd: string; readonly branch: string },
-      options?: { readonly refresh?: boolean; readonly freshGitState?: boolean },
+      options?: {
+        readonly refresh?: boolean;
+        readonly freshGitState?: boolean;
+        /** Cleanup still needs the merged PR after the host deleted its branch. */
+        readonly includeUnpublishedHistory?: boolean;
+      },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -1215,6 +1220,7 @@ export const make = Effect.gen(function* () {
       defaultBranch: string | null;
       localBranchExists?: boolean;
       remoteName?: string | null;
+      includeUnpublishedHistory?: boolean;
     },
   ) =>
     [
@@ -1224,6 +1230,7 @@ export const make = Effect.gen(function* () {
       details.defaultBranch ?? "",
       details.localBranchExists === false ? "0" : "1",
       details.remoteName ?? "",
+      details.includeUnpublishedHistory === true ? "1" : "0",
       String(prLookupEpoch(cwd)),
     ].join("\u0000");
   const prLookupFailureStreakByKey = new Map<string, number>();
@@ -1273,7 +1280,9 @@ export const make = Effect.gen(function* () {
         defaultBranch = "",
         branchExists = "1",
         remoteName = "",
+        unpublishedHistory = "0",
       ] = key.split("\u0000");
+      const includeUnpublishedHistory = unpublishedHistory === "1";
       const details = {
         branch,
         upstreamRef: upstreamRef.length > 0 ? upstreamRef : null,
@@ -1320,8 +1329,10 @@ export const make = Effect.gen(function* () {
           probe,
         );
         if (
-          !lookup ||
-          (probe?.published === false && (workflow.kind === "jj" || details.localBranchExists))
+          (!lookup && !includeUnpublishedHistory) ||
+          (probe?.published === false &&
+            !includeUnpublishedHistory &&
+            (workflow.kind === "jj" || details.localBranchExists))
         ) {
           return { latest: null, headContext };
         }
@@ -2594,7 +2605,11 @@ export const make = Effect.gen(function* () {
   const lookupBranchPullRequest = Effect.fn("lookupBranchPullRequest")(function* (
     cacheCwd: string,
     branch: string,
-    options: { readonly refresh: boolean; readonly freshGitState: boolean },
+    options: {
+      readonly refresh: boolean;
+      readonly freshGitState: boolean;
+      readonly includeUnpublishedHistory?: boolean;
+    },
   ) {
     const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
       rememberPrLookupGitState(cacheCwd, key, options.freshGitState, read);
@@ -2718,6 +2733,7 @@ export const make = Effect.gen(function* () {
       upstreamRef,
       defaultBranch,
       localBranchExists,
+      includeUnpublishedHistory: options.includeUnpublishedHistory === true,
       ...(localBranchExists ? {} : { remoteName }),
     });
     if (options.refresh) {
@@ -2796,14 +2812,17 @@ export const make = Effect.gen(function* () {
       const cacheCwd = yield* normalizeStatusCacheKey(cwd);
       const refresh = options?.refresh === true;
       const freshGitState = refresh || options?.freshGitState === true;
+      const includeUnpublishedHistory = options?.includeUnpublishedHistory === true;
       const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
         refresh,
         freshGitState,
+        includeUnpublishedHistory,
       });
       if (pullRequest === null || pullRequest.state === "open" || freshGitState) return pullRequest;
       return yield* lookupBranchPullRequest(cacheCwd, branch, {
         refresh: false,
         freshGitState: true,
+        includeUnpublishedHistory,
       });
     },
     (effect, input) => effect.pipe(withWorkflow(input.cwd)),

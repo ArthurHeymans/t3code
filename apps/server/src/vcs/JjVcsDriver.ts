@@ -57,7 +57,10 @@ export interface JjVcsDriverShape extends VcsDriver.VcsDriverShape {
   readonly createWorktree: (
     input: VcsCreateWorktreeInput,
   ) => Effect.Effect<VcsCreateWorktreeResult, VcsError>;
-  readonly removeWorktree: (input: VcsRemoveWorktreeInput) => Effect.Effect<void, VcsError>;
+  readonly removeWorktree: (
+    input: VcsRemoveWorktreeInput,
+    options?: { readonly expectedCommitSha?: string },
+  ) => Effect.Effect<void, VcsError>;
   readonly renameBookmark: (input: {
     readonly cwd: string;
     readonly oldBranch: string;
@@ -1595,7 +1598,7 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
 
   const removeWorktree: JjVcsDriverShape["removeWorktree"] = Effect.fn(
     "JjVcsDriver.removeWorktree",
-  )(function* (input) {
+  )(function* (input, options) {
     const requestedPath = path.normalize(path.resolve(input.cwd, input.path));
     if (
       !(yield* fileSystem.exists(requestedPath).pipe(
@@ -1693,6 +1696,33 @@ export const makeVcsDriverShape = Effect.fn("makeJjVcsDriverShape")(function* ()
           }),
       ),
     );
+    // Detaching metadata blocks new snapshots; compare the registered working
+    // copy afterwards so a commit raced in during removal is never forgotten.
+    if (options?.expectedCommitSha !== undefined) {
+      const current = yield* resolveCommit(
+        "JjVcsDriver.removeWorktree.expected",
+        input.cwd,
+        `${jjString(workspace.name)}@`,
+      );
+      if (current !== options.expectedCommitSha) {
+        yield* fileSystem.rename(detachedMetadata, path.join(requestedPath, ".jj")).pipe(
+          Effect.mapError(
+            (cause) =>
+              new VcsRepositoryDetectionError({
+                cwd: input.cwd,
+                operation: "JjVcsDriver.removeWorktree",
+                detail: "Workspace changed during removal, and its metadata could not be restored.",
+                cause,
+              }),
+          ),
+        );
+        return yield* new VcsRepositoryDetectionError({
+          operation: "JjVcsDriver.removeWorktree",
+          cwd: input.cwd,
+          detail: "Workspace changed during removal.",
+        });
+      }
+    }
     yield* fileSystem.remove(requestedPath, { recursive: true, force: input.force === true }).pipe(
       Effect.mapError(
         (cause) =>

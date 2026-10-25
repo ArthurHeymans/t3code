@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeFS from "node:fs";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -242,6 +243,7 @@ const cleanupFixture = (
     worktreeOnDelete: true,
   },
   vcs: "git" | "jj" = "git",
+  wrapJj?: (jj: JjVcsDriver.JjVcsDriver["Service"]) => JjVcsDriver.JjVcsDriver["Service"],
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -293,7 +295,7 @@ const cleanupFixture = (
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
     const context = yield* Layer.build(StorageCleanup.layer).pipe(
-      Effect.provideService(JjVcsDriver.JjVcsDriver, jj),
+      Effect.provideService(JjVcsDriver.JjVcsDriver, wrapJj ? wrapJj(jj) : jj),
       Effect.provideService(GitVcsDriver.GitVcsDriver, {
         ...git,
         execute: (input) =>
@@ -2005,6 +2007,79 @@ describe("Jujutsu workspace cleanup", () => {
         const report = yield* fixture.service.runNow;
         expect(jjEntries(report, fixture.worktree)).toMatchObject([{ outcome: "removed" }]);
         expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("keeps a workspace ref that resume could not recreate", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj");
+        const workspace = (yield* fixture.jj.listWorkspaces(fixture.repo)).find(
+          (entry) => entry.path === fixture.worktree,
+        );
+        fixture.setThreads([
+          shell({ branch: `${workspace!.name}@`, worktreePath: fixture.worktree }),
+        ]);
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Workspace refs have no bookmark to restore" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("rechecks the working copy after measuring", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        let statusCalls = 0;
+        const fixture = yield* cleanupFixture(undefined, "jj", (driver) => ({
+          ...driver,
+          localStatus: (cwd) =>
+            Effect.gen(function* () {
+              if (++statusCalls === 2) {
+                NodeFS.writeFileSync(`${cwd}/late.txt`, "late work\n");
+                yield* driver.execute({
+                  operation: "test.lateCommit",
+                  cwd,
+                  args: ["commit", "-m", "late"],
+                });
+              }
+              return yield* driver.localStatus(cwd);
+            }),
+        }));
+        const report = yield* fixture.service.runNow;
+        expect(jjEntries(report, fixture.worktree)).toMatchObject([
+          { outcome: "kept", reason: "Repository or branch changed since check" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("refuses to forget a workspace that changed during removal", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture(undefined, "jj", (driver) => ({
+          ...driver,
+          removeWorktree: (input, options) =>
+            Effect.gen(function* () {
+              NodeFS.writeFileSync(`${input.path}/late.txt`, "late work\n");
+              yield* driver.execute({
+                operation: "test.lateCommit",
+                cwd: input.path,
+                args: ["commit", "-m", "late"],
+              });
+              return yield* driver.removeWorktree(input, options);
+            }),
+        }));
+        const report = yield* fixture.service.runNow;
+        const [entry] = jjEntries(report, fixture.worktree);
+        expect(entry?.outcome).toBe("failed");
+        expect(entry?.reason).toContain("Workspace changed during removal.");
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+        expect(yield* fixture.fs.exists(`${fixture.worktree}/late.txt`)).toBe(true);
       }),
     ),
   );

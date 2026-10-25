@@ -9,11 +9,23 @@ import { jjCommit } from "./jjExpressions.ts";
 
 const UNTRACKED_ENTRY_LIMIT = 20_000;
 
+interface WorkspaceScan {
+  readonly untracked: ReadonlyArray<string>;
+  readonly ignored: ReadonlyArray<string>;
+  readonly truncated: boolean;
+}
+
 interface JjWorkspaceInspection {
-  /** Commit the thread's bookmark names, or the working-copy change for a workspace ref. */
+  /** Commit the thread's bookmark names, or the working-copy change when it names none. */
   readonly headSha: string | null;
+  readonly workingCopySha: string | null;
   readonly branchChanged: boolean;
   readonly localChanges: string | null;
+  /** Files the keep policy allows deleting before removal. */
+  readonly localFiles: {
+    readonly untracked: ReadonlyArray<string>;
+    readonly ignored: ReadonlyArray<string>;
+  };
   /** Non-empty commits reachable from `@` that no local or remote bookmark keeps. */
   readonly unbookmarkedWork: boolean;
 }
@@ -57,6 +69,13 @@ const untrackedPaths = Effect.fn("JjWorktreeCleanup.untrackedPaths")(function* (
       truncated: true,
     };
   const tracked = new Set(listed.paths);
+  // A directory that still holds tracked files is not disposable local output.
+  const trackedDirectories = new Set(
+    listed.paths.flatMap((file) => {
+      const parts = file.split("/");
+      return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
+    }),
+  );
   const ignored = new Set<string>();
   const candidates: string[] = [];
   let entries = 0;
@@ -70,7 +89,7 @@ const untrackedPaths = Effect.fn("JjWorktreeCleanup.untrackedPaths")(function* (
   const notIgnored = new Set(yield* jj.filterIgnoredPaths(cwd, topCandidates));
   const pending: string[] = [];
   for (const relative of topCandidates) {
-    if (notIgnored.has(relative)) pending.push(relative);
+    if (notIgnored.has(relative) || trackedDirectories.has(relative)) pending.push(relative);
     else ignored.add(relative);
   }
 
@@ -105,25 +124,22 @@ const untrackedPaths = Effect.fn("JjWorktreeCleanup.untrackedPaths")(function* (
   return { untracked: [...untracked], ignored: [...ignored], truncated: false };
 });
 
-const localChangesReason = Effect.fn("JjWorktreeCleanup.localChangesReason")(function* (
-  jj: JjVcsDriverShape,
-  cwd: string,
+const localChangesReason = (
   keepWhen: WorktreeKeepWhen,
   hasWorkingTreeChanges: boolean,
   changedFiles: number,
-) {
+  scan: WorkspaceScan | null,
+) => {
   if (hasWorkingTreeChanges)
     return `has uncommitted changes (${changedFiles} ${changedFiles === 1 ? "file" : "files"})`;
-  if (keepWhen === "tracked-changes") return null;
-  // Jujutsu tracks every file it can snapshot, so what remains on disk is an
-  // ignored file or one too large to track.
-  const scan = yield* untrackedPaths(jj, cwd);
+  if (scan === null) return null;
   if (scan.truncated) return "local files exceed the inspection limit";
+  if (keepWhen === "tracked-changes") return null;
   if (scan.untracked.length > 0) return `has untracked files (${scan.untracked[0]})`;
   if (keepWhen === "uncommitted-changes") return null;
   const firstIgnored = scan.ignored.find((entry) => !entry.split("/").includes("node_modules"));
   return firstIgnored === undefined ? null : `has ignored files (${firstIgnored})`;
-});
+};
 
 const branchName = (branch: string) => branch.slice(0, -1);
 
@@ -148,8 +164,9 @@ export const inspectJjWorkspace = Effect.fn("JjWorktreeCleanup.inspect")(functio
           path.resolve(workspace.path) === path.resolve(input.cwd),
       )
     : !(status.jj?.bookmarks ?? []).includes(input.branch);
+  const change = yield* jj.currentChange(input.cwd);
   const headSha = input.branch.endsWith("@")
-    ? ((yield* jj.currentChange(input.cwd))?.commitId ?? null)
+    ? (change?.commitId ?? null)
     : ((yield* jj.listBookmarks(input.cwd)).find(
         (bookmark) =>
           bookmark.remoteName === null &&
@@ -157,6 +174,9 @@ export const inspectJjWorkspace = Effect.fn("JjWorktreeCleanup.inspect")(functio
           bookmark.target !== null &&
           !bookmark.conflict,
       )?.target ?? null);
+  // Jujutsu tracks every file it can snapshot, so what remains on disk is an
+  // ignored file or one too large to track.
+  const scan = status.hasWorkingTreeChanges ? null : yield* untrackedPaths(jj, input.cwd);
   const unbookmarked = yield* commits(
     jj,
     input.cwd,
@@ -164,14 +184,18 @@ export const inspectJjWorkspace = Effect.fn("JjWorktreeCleanup.inspect")(functio
   );
   return {
     headSha,
+    workingCopySha: change?.commitId ?? null,
     branchChanged,
-    localChanges: yield* localChangesReason(
-      jj,
-      input.cwd,
+    localChanges: localChangesReason(
       input.keepWhen,
       status.hasWorkingTreeChanges,
       status.workingTree.files.length,
+      scan,
     ),
+    localFiles:
+      scan === null || scan.truncated
+        ? { untracked: [], ignored: [] }
+        : { untracked: scan.untracked, ignored: scan.ignored },
     unbookmarkedWork: unbookmarked.length > 0,
   } satisfies JjWorkspaceInspection;
 });
@@ -190,11 +214,7 @@ export const resolveJjTrunk = Effect.fn("JjWorktreeCleanup.resolveTrunk")(functi
   if (branch === null) return null;
   // The merged and unchanged rules compare against the remote's current
   // default, not a stale tracking bookmark.
-  const fetched = yield* jj.fetchRemote({ cwd: repositoryCwd, remoteName }).pipe(
-    Effect.as(true),
-    Effect.orElseSucceed(() => false),
-  );
-  if (!fetched) return null;
+  yield* jj.fetchRemote({ cwd: repositoryCwd, remoteName });
   const commitSha = yield* jj
     .resolveRemoteTrackingCommit({
       cwd: repositoryCwd,

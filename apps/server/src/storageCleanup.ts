@@ -830,6 +830,9 @@ const make = Effect.gen(function* () {
           Effect.map((info) => info.type === "File"),
           Effect.orElseSucceed(() => false),
         );
+        // Forgetting a workspace ref removes the only name resume could use.
+        if (jjWorkspace && branch.endsWith("@"))
+          return keep("workspace refs have no bookmark to restore");
         if (jjWorkspace) {
           const registered = yield* jj.listWorkspaces(repositoryCwd).pipe(
             Effect.map((workspaces) =>
@@ -872,6 +875,8 @@ const make = Effect.gen(function* () {
             ? jjInspection.headSha
             : (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha;
         if (headSha === null) return keep("workspace has no head commit");
+        if (jjInspection !== null && jjInspection.workingCopySha === null)
+          return keep("workspace has no head commit");
         const old =
           !deleted &&
           settings.worktreeAfterDays !== null &&
@@ -888,6 +893,7 @@ const make = Effect.gen(function* () {
         const timeBased = deleted || old || settled;
         let eligible = timeBased;
         let contentInTrunk = false;
+        let jjTrunk: JjTrunk | null = null;
         let removalReason = deleted
           ? "thread was deleted"
           : old
@@ -895,24 +901,29 @@ const make = Effect.gen(function* () {
             : `settled for ${settledDays} days`;
         if (!eligible && (settings.worktreeUnchanged || settings.worktreeOnMerge)) {
           if (jjInspection !== null) {
-            const trunk = yield* jjTrunkFor(repositoryCwd);
-            if (trunk === null) return keep("default branch is unavailable");
-            const integrated = yield* jjHeadIntegrated(jj, worktreePath, headSha, trunk.commitSha);
+            jjTrunk = yield* jjTrunkFor(repositoryCwd);
+            if (jjTrunk === null) return keep("default branch is unavailable");
+            const integrated = yield* jjHeadIntegrated(
+              jj,
+              worktreePath,
+              headSha,
+              jjTrunk.commitSha,
+            );
             if (
               settings.worktreeUnchanged &&
-              (yield* jjHeadUnchanged(jj, worktreePath, trunk.commitSha))
+              (yield* jjHeadUnchanged(jj, worktreePath, jjTrunk.commitSha))
             ) {
               eligible = true;
               contentInTrunk = true;
               removalReason = "no commits beyond the default branch";
-            } else if (settings.worktreeOnMerge && !branch.endsWith("@")) {
+            } else if (settings.worktreeOnMerge) {
               const pullRequest = yield* gitManager.branchPullRequest(
                 { cwd: worktreePath, branch },
-                { refresh: true },
+                { refresh: true, includeUnpublishedHistory: true },
               );
               eligible = storageCleanupPullRequestMerged(pullRequest, {
                 branch,
-                defaultBranch: trunk.branch,
+                defaultBranch: jjTrunk.branch,
                 headSha,
                 integrated,
               });
@@ -1090,10 +1101,17 @@ const make = Effect.gen(function* () {
           const finalChanges = yield* localChangesReason(worktreePath, settings);
           if (finalChanges !== null) return keep(finalChanges);
         } else {
-          if (finalJjInspection.branchChanged || finalJjInspection.headSha !== headSha)
+          if (
+            finalJjInspection.branchChanged ||
+            finalJjInspection.headSha !== headSha ||
+            finalJjInspection.workingCopySha !== jjInspection?.workingCopySha
+          )
             return keep("repository or branch changed since check");
           if (finalJjInspection.localChanges !== null) return keep(finalJjInspection.localChanges);
-          if (finalJjInspection.unbookmarkedWork && !contentInTrunk)
+          if (
+            finalJjInspection.unbookmarkedWork &&
+            !(jjTrunk !== null && (yield* jjHeadUnchanged(jj, worktreePath, jjTrunk.commitSha)))
+          )
             return keep("has commits that only this workspace keeps");
         }
         const current = resolveWorktreeCleanup(
@@ -1130,7 +1148,24 @@ const make = Effect.gen(function* () {
             run: (args) => cleanupGit(repositoryCwd, [...args], "git worktree remove"),
           });
         } else {
-          yield* jj.removeWorktree({ cwd: repositoryCwd, path: worktreePath, force: true });
+          // Jujutsu refuses to forget a workspace that still has untracked or
+          // ignored files, which the keep policy allows discarding.
+          yield* Effect.forEach(
+            [...finalJjInspection.localFiles.untracked, ...finalJjInspection.localFiles.ignored],
+            (relative) => {
+              const target = path.resolve(worktreePath, relative);
+              return target.startsWith(`${worktreePath}${path.sep}`)
+                ? fs.remove(target, { recursive: true }).pipe(Effect.ignore)
+                : Effect.void;
+            },
+            { concurrency: 1, discard: true },
+          );
+          yield* jj.removeWorktree(
+            { cwd: repositoryCwd, path: worktreePath, force: false },
+            finalJjInspection.workingCopySha === null
+              ? {}
+              : { expectedCommitSha: finalJjInspection.workingCopySha },
+          );
         }
         entries.push({ ...entry, outcome: "removed", reason: sentence(removalReason), bytes });
         yield* gitManager.invalidateStatus(project.workspaceRoot);
