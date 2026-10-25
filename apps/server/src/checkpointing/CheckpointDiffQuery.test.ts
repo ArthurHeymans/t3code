@@ -15,6 +15,7 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as CheckpointDiffQuery from "./CheckpointDiffQuery.ts";
 import * as CheckpointStore from "./CheckpointStore.ts";
+import * as ServerConfig from "../config.ts";
 import { CheckpointRefUnavailableError, CheckpointTurnRangeUnavailableError } from "./Errors.ts";
 
 const threadId = ThreadId.make("thread:checkpoint-diff-v2");
@@ -196,6 +197,7 @@ const layerStore = CheckpointStore.layer.pipe(
   Layer.provide(NodeServices.layer),
 );
 const layerTest = Layer.merge(layerStore, layerVcsProcess).pipe(
+  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-checkpoint-diff-" })),
   Layer.provideMerge(NodeServices.layer),
   Layer.provideMerge(NodeCrypto.layer),
 );

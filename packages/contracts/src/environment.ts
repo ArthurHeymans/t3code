@@ -126,6 +126,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   projectCloneTracking: Schema.optionalKey(Schema.Boolean),
   /** Server answers projects.listIgnoredFiles. */
   ignoredFileListing: Schema.optionalKey(Schema.Boolean),
+  /** Accepts native JJ workflow actions and the clone/init VCS selection. */
+  jujutsuWorkflows: Schema.optionalKey(Schema.Boolean),
   environmentIcon: Schema.optionalKey(Schema.Boolean),
   desktopAppUpdate: Schema.optionalKey(Schema.Boolean),
   /** Subscribe to command output only when advertised; older servers never send it. */

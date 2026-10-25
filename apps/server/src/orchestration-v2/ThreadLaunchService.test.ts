@@ -192,6 +192,7 @@ function makeHarness(options: HarnessOptions = {}) {
       listShells: () => Effect.die("unused"),
     }),
     Layer.mock(GitWorkflow.GitWorkflowService)({
+      validateWorktreePath: () => Effect.void,
       createWorktree,
       renameBranch,
       fetchWorktreeBaseCommit:

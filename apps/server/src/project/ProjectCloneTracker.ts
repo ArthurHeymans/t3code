@@ -84,6 +84,7 @@ interface TrackedClone {
     /** What git is given; may carry credentials and never leaves the server. */
     readonly cloneUrl: string;
     readonly destinationPath: string;
+    readonly vcsKind?: "git" | "jj";
     readonly repository: SourceControlRepositoryInfo | null;
   };
 }
@@ -216,7 +217,11 @@ export const make = Effect.gen(function* () {
     const pulses = yield* Queue.sliding<void>(1);
     yield* watchForStall(projectId, pulses).pipe(Effect.forkScoped);
     return yield* repositories.cloneRepository(
-      { remoteUrl: tracked.input.cloneUrl, destinationPath: tracked.input.destinationPath },
+      {
+        remoteUrl: tracked.input.cloneUrl,
+        destinationPath: tracked.input.destinationPath,
+        ...(tracked.input.vcsKind ? { vcsKind: tracked.input.vcsKind } : {}),
+      },
       {
         onProgress: (update) =>
           Queue.offer(pulses, undefined).pipe(Effect.andThen(progress(projectId, update))),
@@ -293,6 +298,7 @@ export const make = Effect.gen(function* () {
           hooks,
           input: {
             cloneUrl: prepared.cloneUrl,
+            ...(input.vcsKind ? { vcsKind: input.vcsKind } : {}),
             destinationPath: prepared.destinationPath,
             repository: prepared.repository,
           },

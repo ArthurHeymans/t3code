@@ -12,6 +12,8 @@ import * as ProcessRunner from "../processRunner.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import { explicitBareRepositoryEnv } from "../vcs/VcsProcess.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Option from "effect/Option";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
 const DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY = 512;
 // Minute-by-minute sweeps need cached hits; clone, publish and PR discovery force refresh.
@@ -135,6 +137,7 @@ function buildRepositoryIdentity(input: {
 class RepositoryIdentityCacheKey extends Data.Class<{
   readonly rootPath: string;
   readonly isBare: boolean;
+  readonly isJj?: boolean;
 }> {}
 
 const resolveRepositoryIdentityCacheKey = Effect.fn("RepositoryIdentityResolver.resolveCacheKey")(
@@ -226,6 +229,42 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
   options: RepositoryIdentityResolverOptions = {},
 ) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  const vcs = Option.getOrNull(yield* Effect.serviceOption(VcsDriverRegistry.VcsDriverRegistry));
+  const detect = (cwd: string) =>
+    vcs ? vcs.detect({ cwd }).pipe(Effect.orElseSucceed(() => null)) : Effect.succeed(null);
+  const resolveRoot = Effect.fnUntraced(function* (cwd: string) {
+    const handle = yield* detect(cwd);
+    return handle?.kind === "jj"
+      ? new RepositoryIdentityCacheKey({
+          rootPath: handle.repository.rootPath,
+          isBare: false,
+          isJj: true,
+        })
+      : yield* resolveRepositoryIdentityCacheKey(cwd).pipe(
+          Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+        );
+  });
+  const resolveIdentity = Effect.fnUntraced(function* (cacheKey: RepositoryIdentityCacheKey) {
+    if (cacheKey.isJj) {
+      const handle = yield* detect(cacheKey.rootPath);
+      if (handle?.kind !== "jj") return null;
+      const inventory = yield* handle.driver
+        .listRemotes(cacheKey.rootPath)
+        .pipe(Effect.orElseSucceed(() => null));
+      const remotes = new Map(inventory?.remotes.map((remote) => [remote.name, remote.url]));
+      const remote = pickPrimaryRemote(remotes);
+      return remote
+        ? buildRepositoryIdentity({
+            ...remote,
+            originUrl: remotes.get("origin"),
+            rootPath: cacheKey.rootPath,
+          })
+        : null;
+    }
+    return yield* resolveRepositoryIdentityFromCacheKey(cacheKey).pipe(
+      Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+    );
+  });
   const cacheCapacity = options.cacheCapacity ?? DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY;
   const refine = options.refine ?? Effect.succeed;
   const timeToLive = (exit: Exit.Exit<unknown>) =>
@@ -238,10 +277,7 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
     });
 
   const repositoryRootCache = yield* Cache.makeWith<string, RepositoryIdentityCacheKey | null>(
-    (cwd) =>
-      resolveRepositoryIdentityCacheKey(cwd).pipe(
-        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
-      ),
+    resolveRoot,
     { capacity: cacheCapacity, timeToLive },
   );
 
@@ -250,8 +286,7 @@ export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (
     RepositoryIdentity | null
   >(
     (cacheKey) =>
-      resolveRepositoryIdentityFromCacheKey(cacheKey).pipe(
-        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
+      resolveIdentity(cacheKey).pipe(
         Effect.filterOrElse(
           (identity): identity is null => identity === null,
           (identity) => refine(identity).pipe(Effect.orElseSucceed(() => identity)),

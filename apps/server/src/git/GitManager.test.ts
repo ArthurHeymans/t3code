@@ -694,6 +694,11 @@ function makeManager(input?: {
     layerServerSettings,
   ).pipe(
     Layer.provideMerge(layerSourceControlRegistry),
+    Layer.provideMerge(
+      Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+        Layer.provide(VcsProjectConfig.layer),
+      ),
+    ),
     Layer.provideMerge(layerVcsDriver),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -3753,6 +3758,60 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("routes commits, publication, PR lookup and workspaces through native JJ", () =>
+    Effect.gen(function* () {
+      const root = yield* makeTempDir("t3-jj-manager-");
+      const repoDir = NodePath.join(root, "repo");
+      const process = yield* VcsProcess.VcsProcess;
+      const jj = (cwd: string, args: readonly string[]) =>
+        process.run({ cwd, command: "jj", args, operation: "test.nativeJj" });
+      yield* jj(root, ["git", "init", "--no-colocate", repoDir]);
+      yield* jj(repoDir, ["config", "set", "--repo", "user.name", "Test"]);
+      yield* jj(repoDir, ["config", "set", "--repo", "user.email", "test@example.com"]);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "base.txt"), "base\n");
+      yield* jj(repoDir, ["commit", "-m", "base"]);
+      yield* jj(repoDir, ["bookmark", "create", "main", "-r", "@-"]);
+      const remote = yield* createBareRemote();
+      yield* jj(repoDir, ["git", "remote", "add", "origin", remote]);
+      yield* jj(repoDir, ["git", "push", "--bookmark", "main"]);
+      yield* jj(repoDir, ["bookmark", "create", "feature/native"]);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "feature.txt"), "native change\n");
+      const pullRequest = {
+        number: 92,
+        title: "Native JJ",
+        url: "https://github.com/pingdotgg/codething-mvp/pull/92",
+        baseRefName: "main",
+        headRefName: "feature/native",
+      };
+      const { manager } = yield* makeManager({
+        providerScenario: { prListOtherwise: [pullRequest], pullRequest },
+      });
+      const committed = yield* runStackedAction(manager, {
+        cwd: repoDir,
+        action: "commit_push",
+        commitMessage: "Native change",
+      });
+      expect(committed.commit.status).toBe("created");
+      expect(committed.push.status).toBe("pushed");
+      expect((yield* manager.status({ cwd: repoDir })).kind).toBe("jj");
+      expect(
+        (yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/native" }))?.number,
+      ).toBe(92);
+      const workspace = NodePath.join(root, "review");
+      yield* manager.createWorktree({
+        cwd: repoDir,
+        refName: "feature/native",
+        newRefName: "feature/review",
+        path: workspace,
+      });
+      expect(NodeFS.existsSync(NodePath.join(workspace, ".jj"))).toBe(true);
+      expect(NodeFS.existsSync(NodePath.join(repoDir, ".git"))).toBe(false);
+      expect(NodeFS.readFileSync(NodePath.join(workspace, "feature.txt"), "utf8")).toBe(
+        "native change\n",
+      );
+    }),
+  );
+
   const setUpLocalCheckoutPullRequest = Effect.fnUntraced(function* (
     reportedHead: (pullHead: string) => string | undefined = (pullHead) => pullHead,
     syncCheckoutWithPullHead = true,
@@ -3814,6 +3873,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         const registry = yield* Layer.build(
           VcsDriverRegistry.layer.pipe(
             Layer.provide(VcsProjectConfig.layer),
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-pr-checkout-" })),
             Layer.provide(VcsProcess.layer),
           ),
         );

@@ -31,6 +31,9 @@ import {
 } from "../project/gitCloneProgress.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as SourceControlProvider from "@t3tools/source-control-core/server/SourceControlProvider";
+import * as Option from "effect/Option";
+import * as JjVcsDriver from "../vcs/JjVcsDriver.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { cloneUrlForProtocol, cloneUrlProtocol } from "@t3tools/shared/cloneUrl";
@@ -192,6 +195,8 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const jj = Option.getOrNull(yield* Effect.serviceOption(JjVcsDriver.JjVcsDriver));
+  const vcs = Option.getOrNull(yield* Effect.serviceOption(VcsDriverRegistry.VcsDriverRegistry));
   const path = yield* Path.Path;
   const providers = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
 
@@ -326,6 +331,31 @@ export const make = Effect.gen(function* () {
     cloneUrl: string,
     options?: SourceControlCloneOptions,
   ) {
+    if (input.vcsKind === "jj") {
+      if (!jj)
+        return yield* new SourceControlRepositoryError({
+          operation: "cloneRepository",
+          provider: input.provider ?? SourceControlProviderKind.make("unknown"),
+          detail: "Jujutsu is unavailable.",
+        });
+      yield* jj
+        .execute({
+          cwd: path.dirname(destinationPath),
+          operation: "cloneRepository.jjProbe",
+          args: ["--version"],
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new SourceControlRepositoryError({
+                operation: "cloneRepository",
+                provider: input.provider ?? SourceControlProviderKind.make("unknown"),
+                detail: "Jujutsu is unavailable.",
+                cause,
+              }),
+          ),
+        );
+    }
     const onProgress = options?.onProgress;
     // Git mixes progress and diagnostics on stderr; retain non-progress tail lines for failure details.
     const stderrTail: Array<string> = [];
@@ -400,6 +430,9 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+    if (input.vcsKind === "jj" && jj) {
+      yield* jj.initRepository({ cwd: prepared.destinationPath, kind: "jj" });
+    }
     return {
       cwd: prepared.destinationPath,
       remoteUrl,
@@ -457,6 +490,11 @@ export const make = Effect.gen(function* () {
         operation: "publishRepository",
         provider: input.provider,
       });
+      const isJj =
+        jj !== null && vcs !== null && (yield* vcs.resolve({ cwd: input.cwd })).kind === "jj";
+      // Validate locally before creating a remote repository. A missing CLI or
+      // broken working copy should not leave a newly created host repository.
+      if (isJj && jj) yield* jj.localStatus(input.cwd);
       const provider = yield* providers.get(providerKind);
       const urls = yield* provider.createRepository({
         cwd: input.cwd,
@@ -464,6 +502,49 @@ export const make = Effect.gen(function* () {
         visibility: input.visibility,
       });
       const remoteUrl = selectRemoteUrl(urls, input.protocol);
+      if (isJj && jj) {
+        const native = (args: readonly string[]) =>
+          jj.execute({
+            cwd: input.cwd,
+            operation: "publishRepository.jj",
+            args,
+            timeoutMs: 60_000,
+            env: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
+          });
+        const names = new Set(
+          (yield* jj.listRemotes(input.cwd)).remotes.map((remote) => remote.name),
+        );
+        const preferred = input.remoteName?.trim() || "origin";
+        let remoteName = preferred;
+        for (let suffix = 2; names.has(remoteName); suffix++) remoteName = `${preferred}-${suffix}`;
+        yield* native(["git", "remote", "add", "--", remoteName, remoteUrl]);
+        const status = yield* jj.localStatus(input.cwd);
+        const change = yield* jj.currentChange(input.cwd);
+        const bookmark = (yield* jj.listBookmarks(input.cwd)).find(
+          (bookmark) => bookmark.remoteName === null && bookmark.name === status.refName,
+        );
+        if (
+          !status.refName ||
+          status.hasWorkingTreeChanges ||
+          (change?.description === null && bookmark?.target === change.commitId)
+        )
+          return {
+            repository: toRepositoryInfo(providerKind, urls),
+            remoteName,
+            remoteUrl,
+            branch: status.refName ?? "@",
+            status: "remote_added" as const,
+          };
+        const pushed = yield* jj.workflow.publish(input.cwd, status.refName, { remoteName });
+        return {
+          repository: toRepositoryInfo(providerKind, urls),
+          remoteName,
+          remoteUrl,
+          branch: pushed.branch,
+          upstreamBranch: pushed.upstreamBranch,
+          status: "pushed" as const,
+        };
+      }
       const remoteName = yield* git.ensureRemote({
         cwd: input.cwd,
         preferredName: input.remoteName?.trim() || "origin",
