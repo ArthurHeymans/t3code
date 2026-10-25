@@ -247,6 +247,20 @@ Claude Code, Codex, ChatGPT and other agents T3 Code did not start can drive
 threads on an environment through its MCP server. See
 [outside agents](./outside-agents.md) for setup.
 
+## Sharing connections with local clients
+
+Connect to your local primary server through `localhost` or `127.0.0.1`, then enable
+**Settings → Connections → Share connections with local clients** to let clients
+such as Emacs discover and use your saved bearer connections. This explicitly
+copies enabled connections and their tokens to that local server, encrypted at rest. Relay credentials and the
+primary connection are excluded. Local clients need administrator read access.
+
+Changes sync while sharing is enabled. Switching sharing off clears the shared
+copy and disconnects attached clients without forgetting your browser connections.
+The server can still listen on `0.0.0.0` or `::` for other devices; sharing is
+restricted to local administrator connections and is unavailable from remote or
+tunnel origins.
+
 ## Manage or revoke access
 
 On the host, **Settings → Connections** lets authorized administrators create

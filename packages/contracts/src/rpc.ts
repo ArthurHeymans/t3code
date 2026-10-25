@@ -7,6 +7,11 @@ import {
 } from "./orchestrationV2.ts";
 import { OrchestrationDispatchCommandError } from "./orchestrationDispatch.ts";
 import {
+  LocalConnectionsSnapshot,
+  LocalConnectionSecret,
+  LocalConnectionsError,
+} from "./localConnections.ts";
+import {
   McpAppCallToolInput,
   McpAppCallToolResult,
   McpAppReadResourceInput,
@@ -297,7 +302,6 @@ import {
   DeviceSession,
   DeviceShutdownInput,
 } from "./device.ts";
-import {} from "./previewAutomation.ts";
 import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
@@ -477,6 +481,9 @@ export const WS_METHODS = {
 
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
+  localConnectionsGet: "localConnections.get",
+  localConnectionsResolve: "localConnections.resolve",
+  localConnectionsSubscribe: "localConnections.subscribe",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -604,6 +611,23 @@ const WsServerProbeRpc = Rpc.make(WS_METHODS.serverProbe, {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: EnvironmentAuthorizationError,
+});
+
+const WsLocalConnectionsGetRpc = Rpc.make(WS_METHODS.localConnectionsGet, {
+  payload: Schema.Struct({}),
+  success: LocalConnectionsSnapshot,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
+});
+const WsLocalConnectionsResolveRpc = Rpc.make(WS_METHODS.localConnectionsResolve, {
+  payload: Schema.Struct({ environmentId: Schema.String }),
+  success: LocalConnectionSecret,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
+});
+const WsLocalConnectionsSubscribeRpc = Rpc.make(WS_METHODS.localConnectionsSubscribe, {
+  payload: Schema.Struct({}),
+  success: LocalConnectionsSnapshot,
+  stream: true,
+  error: Schema.Union([LocalConnectionsError, EnvironmentAuthorizationError]),
 });
 
 const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
@@ -1909,6 +1933,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsLocalConnectionsGetRpc,
+  WsLocalConnectionsResolveRpc,
+  WsLocalConnectionsSubscribeRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

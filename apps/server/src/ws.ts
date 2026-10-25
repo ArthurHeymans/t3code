@@ -1,4 +1,5 @@
-import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
+import { OrchestrationDispatchCommandError, LocalConnectionsError } from "@t3tools/contracts";
+import * as LocalConnections from "./connections/LocalConnections.ts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -7,14 +8,12 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Base64 from "effect/encoding/Base64";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
@@ -216,7 +215,6 @@ import * as ProjectService from "./project/ProjectService.ts";
 import { threadWorkspaceRoot } from "./project/threadWorkspaceRoot.ts";
 import * as ManagedProjectFolders from "./project/ManagedProjectFolders.ts";
 import { projectMutationOperation } from "./project/ProjectMutation.ts";
-import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
@@ -1232,6 +1230,7 @@ export const layerWsRpc = (
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
+  localCatalogRequest = false,
 ) =>
   Layer.effectContext(
     Effect.gen(function* () {
@@ -1300,7 +1299,6 @@ export const layerWsRpc = (
             );
       const usage = yield* UsageService.UsageService;
       const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
-      const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
       const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
       const repositoryIdentityResolver =
@@ -1337,6 +1335,14 @@ export const layerWsRpc = (
       const storageCleanup = yield* StorageCleanup.StorageCleanup;
       const databaseStorage = yield* DatabaseStorage.DatabaseStorage;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const localConnections = yield* LocalConnections.LocalConnections;
+      const localCatalogGuard = localCatalogRequest
+        ? Effect.void
+        : Effect.fail(
+            new LocalConnectionsError({
+              message: "Connection sharing requires a local connection.",
+            }),
+          );
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1740,6 +1746,7 @@ export const layerWsRpc = (
         );
 
         return {
+          localConnections: localCatalogRequest && localConnections.available,
           environment,
           auth,
           cwd: config.cwd,
@@ -2208,6 +2215,12 @@ export const layerWsRpc = (
           ),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) => loadServerConfig({ usageLimitsCommand: false }),
+        [WS_METHODS.localConnectionsGet]: () =>
+          localCatalogGuard.pipe(Effect.andThen(localConnections.snapshot)),
+        [WS_METHODS.localConnectionsResolve]: ({ environmentId }) =>
+          localCatalogGuard.pipe(Effect.andThen(localConnections.resolve(environmentId))),
+        [WS_METHODS.localConnectionsSubscribe]: () =>
+          Stream.unwrap(localCatalogGuard.pipe(Effect.as(localConnections.changes))),
         [WS_METHODS.serverSearchAcpRegistry]: (input) =>
           acpRegistryCatalog
             .search(input)
@@ -3266,6 +3279,7 @@ export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
+    const localCatalogConfig = yield* ServerConfig.ServerConfig;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -3340,6 +3354,7 @@ export const layer = Layer.unwrap(
               clientAnalyticsProps,
               previewAutomationBroker,
               serverBrowser,
+              LocalConnections.isLocalConnectionsRequest(request, localCatalogConfig.devUrl),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Handler-context reporters see only request defects, not server-wide defects.

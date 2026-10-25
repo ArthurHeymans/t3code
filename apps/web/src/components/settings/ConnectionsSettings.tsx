@@ -1,4 +1,5 @@
 import { SessionPermissions } from "./SessionPermissions";
+import { LocalConnectionSharing } from "./LocalConnectionSharing";
 import { ChevronRightIcon, EllipsisIcon } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
 import { useState } from "react";
@@ -1026,6 +1027,7 @@ export function ConnectionsSettings() {
 
   const primarySettings = (
     <>
+      <LocalConnectionSharing />
       {primaryEnvironmentId !== null ? (
         <>
           <SettingsSection

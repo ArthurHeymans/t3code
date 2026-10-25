@@ -1,3 +1,4 @@
+import { catalogForLocalSharing } from "./localSharing";
 import {
   ConnectionCatalogDocument,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
@@ -472,6 +473,7 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
       );
     }
     yield* Ref.set(state, Option.some(catalog));
+    yield* Effect.sync(() => catalogForLocalSharing(catalog));
     return catalog;
   });
 
@@ -483,6 +485,7 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
           const next = transform(yield* loadUnlocked());
           yield* backend.write(yield* encodeCatalog(next));
           yield* Ref.set(state, Option.some(next));
+          yield* Effect.sync(() => catalogForLocalSharing(next));
         }),
       );
     },
