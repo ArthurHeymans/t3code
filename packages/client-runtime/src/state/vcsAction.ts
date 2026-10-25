@@ -78,6 +78,7 @@ export interface RunVcsStackedActionInput {
   readonly action: GitStackedAction;
   readonly commitMessage?: string;
   readonly featureBranch?: boolean;
+  readonly confirmedDefaultRef?: boolean;
   readonly filePaths?: ReadonlyArray<string>;
   readonly threadId?: ThreadId;
   readonly projectId?: ProjectId;
@@ -469,7 +470,8 @@ export function createVcsActionManager<R, E>(
           cwd: target.cwd,
           action: input.action,
           ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-          ...(input.featureBranch ? { featureBranch: true } : {}),
+          ...(input.featureBranch !== undefined ? { featureBranch: input.featureBranch } : {}),
+          ...(input.confirmedDefaultRef === true ? { confirmedDefaultRef: true } : {}),
           ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
           ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
           ...(input.projectId !== undefined ? { projectId: input.projectId } : {}),

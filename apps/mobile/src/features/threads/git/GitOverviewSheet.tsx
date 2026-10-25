@@ -152,6 +152,7 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
   const runActionWithPrompt = async (input: GitActionRequestInput) => {
     if (!canWriteSourceControl) return;
     const confirmableAction =
+      input.action === "commit" ||
       input.action === "push" ||
       input.action === "create_pr" ||
       input.action === "commit_push" ||
@@ -163,14 +164,18 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
       branchName &&
       confirmableAction &&
       !input.featureBranch &&
-      requiresDefaultBranchConfirmation(input.action, isDefaultRef)
+      requiresDefaultBranchConfirmation(input.action, isDefaultRef, gitStatus.data?.kind)
     ) {
       navigation.navigate("GitConfirm", {
         environmentId: String(environmentId),
         threadId: String(threadId),
         confirmAction: confirmableAction,
         branchName,
-        includesCommit: String(input.action === "commit_push" || input.action === "commit_push_pr"),
+        includesCommit: String(
+          input.action === "commit" ||
+            input.action === "commit_push" ||
+            input.action === "commit_push_pr",
+        ),
       });
       return;
     }

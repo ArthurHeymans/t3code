@@ -128,7 +128,10 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const threadId = props.threadId;
   const { gitStatus, gitOperationLabel, onPull, onRunAction } = props;
 
-  const currentBranchLabel = gitStatus?.refName ?? props.currentBranch ?? "Detached HEAD";
+  const currentBranchLabel =
+    gitStatus?.refName ??
+    props.currentBranch ??
+    (gitStatus?.kind === "jj" ? "Working-copy change" : "Detached HEAD");
   const busy = gitOperationLabel !== null;
   const isRepo = gitStatus?.isRepo ?? true;
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
@@ -137,10 +140,10 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const quickAction = (() => {
     if (!isRepo) {
       return {
-        label: "Git unavailable",
+        label: "Source control unavailable",
         disabled: true,
         kind: "show_hint" as const,
-        hint: "This workspace is not a git repository.",
+        hint: "This workspace is not a supported repository.",
       };
     }
     const action = resolveQuickAction(gitStatus, busy, isDefaultRef, hasPrimaryRemote);
@@ -185,6 +188,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const runActionWithPrompt = async (input: GitActionRequestInput) => {
     if (!canWriteSourceControl) return;
     const confirmableAction =
+      input.action === "commit" ||
       input.action === "push" ||
       input.action === "create_pr" ||
       input.action === "commit_push" ||
@@ -196,7 +200,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
       branchName &&
       confirmableAction &&
       !input.featureBranch &&
-      requiresDefaultBranchConfirmation(input.action, isDefaultRef)
+      requiresDefaultBranchConfirmation(input.action, isDefaultRef, gitStatus?.kind)
     ) {
       if (props.hasThread === false) {
         Dialog.alert(

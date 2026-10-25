@@ -22,7 +22,8 @@ type GitCommitSheetProps = StaticScreenProps<{
   readonly threadId: string;
 }>;
 
-export function GitCommitSheet(_props: GitCommitSheetProps) {
+export function GitCommitSheet(props: GitCommitSheetProps) {
+  const { environmentId, threadId } = props.route.params;
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -43,6 +44,8 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
 
   const busy = gitState.gitOperationLabel !== null;
   const isDefaultRef = gitStatus.data?.isDefaultRef ?? false;
+  const vcsKind = gitStatus.data?.kind;
+  const refName = gitStatus.data?.refName;
   const allFiles = gitStatus.data?.workingTree?.files ?? [];
 
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
@@ -57,6 +60,18 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
   const runCommitAction = async (featureBranch: boolean) => {
     if (!canWriteSourceControl || (featureBranch && !canChangeThreadBranch)) return;
     const commitMessage = dialogCommitMessage.trim();
+    if (!featureBranch && isDefaultRef && vcsKind === "jj") {
+      navigation.navigate("GitConfirm", {
+        environmentId,
+        threadId,
+        confirmAction: "commit",
+        branchName: refName ?? "",
+        includesCommit: "true",
+        ...(commitMessage ? { commitMessage } : {}),
+        ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path).join(",") } : {}),
+      });
+      return;
+    }
     navigation.goBack();
     await gitActions.onRunSelectedThreadGitAction({
       action: "commit",

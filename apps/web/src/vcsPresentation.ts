@@ -1,0 +1,58 @@
+import type { VcsDriverKind } from "@t3tools/contracts";
+import { supportsVcsWorkflowActions } from "@t3tools/shared/git";
+
+export interface VcsTerms {
+  readonly systemName: string;
+  readonly repositoryNoun: string;
+  readonly refNoun: string;
+  readonly refNounPlural: string;
+  readonly currentRefFallback: string;
+}
+
+export interface VcsActionPresentation {
+  readonly supportsGitWorkflowActions: boolean;
+  readonly unsupportedGitWorkflowDescription: string;
+}
+
+const gitLikeTerms: VcsTerms = {
+  systemName: "Git",
+  repositoryNoun: "repository",
+  refNoun: "branch",
+  refNounPlural: "branches",
+  currentRefFallback: "checkout",
+};
+
+const unknownTerms: VcsTerms = {
+  systemName: "VCS",
+  repositoryNoun: "repository",
+  refNoun: "ref",
+  refNounPlural: "refs",
+  currentRefFallback: "checkout",
+};
+
+export function resolveVcsTerms(kind: VcsDriverKind | null | undefined): VcsTerms {
+  if (kind === "jj") {
+    return {
+      systemName: "JJ",
+      repositoryNoun: "workspace",
+      refNoun: "bookmark",
+      refNounPlural: "bookmarks",
+      currentRefFallback: "working copy",
+    };
+  }
+
+  return kind === "git" ? gitLikeTerms : unknownTerms;
+}
+
+export function resolveVcsActionPresentation(
+  kind: VcsDriverKind | null | undefined,
+  supportsWorkflowActions?: boolean,
+): VcsActionPresentation {
+  const terms = resolveVcsTerms(kind);
+  const supportsGitWorkflowActions = supportsVcsWorkflowActions(kind, supportsWorkflowActions);
+
+  return {
+    supportsGitWorkflowActions,
+    unsupportedGitWorkflowDescription: `Git commit, push, and PR actions are not available for this ${terms.systemName} ${terms.repositoryNoun}.`,
+  };
+}

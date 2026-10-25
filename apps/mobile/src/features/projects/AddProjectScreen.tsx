@@ -110,6 +110,7 @@ interface EnvironmentOption {
   readonly connectionError: string | null;
   readonly connectionErrorTraceId: string | null;
   readonly supportsCloneTracking: boolean;
+  readonly supportsJujutsuWorkflows: boolean;
 }
 
 const environmentOptionOrder = Order.mapInput(
@@ -393,6 +394,7 @@ function useEnvironmentOptions(): ReadonlyArray<EnvironmentOption> {
         connectionError: runtime?.connectionError ?? null,
         connectionErrorTraceId: runtime?.connectionErrorTraceId ?? null,
         supportsCloneTracking: config?.environment.capabilities.projectCloneTracking === true,
+        supportsJujutsuWorkflows: config?.environment.capabilities.jujutsuWorkflows === true,
       };
     });
     return Arr.sort(
@@ -1281,6 +1283,7 @@ export function AddProjectDestinationScreen(props: {
   const canCloneProject = canWriteSourceControl && canCreateProject;
   const createProject = useCreateProject(environment);
   const remoteUrl = stringParam(props.remoteUrl);
+  const [cloneWithJj, setCloneWithJj] = useState(false);
   const repositoryTitle = stringParam(props.repositoryTitle);
   const prompt = stringParam(props.prompt);
   const repositoryName = stringParam(props.repositoryName)?.trim() ?? "";
@@ -1325,6 +1328,7 @@ export function AddProjectDestinationScreen(props: {
           createdAt: new Date().toISOString(),
           remoteUrl,
           destinationPath: resolved.path,
+          ...(cloneWithJj && environment.supportsJujutsuWorkflows ? { vcsKind: "jj" } : {}),
         },
       });
       if (AsyncResult.isFailure(startResult)) {
@@ -1362,6 +1366,7 @@ export function AddProjectDestinationScreen(props: {
       input: {
         remoteUrl,
         destinationPath: resolved.path,
+        ...(cloneWithJj && environment.supportsJujutsuWorkflows ? { vcsKind: "jj" } : {}),
       },
     });
     if (AsyncResult.isFailure(cloneResult)) {
@@ -1389,6 +1394,31 @@ export function AddProjectDestinationScreen(props: {
       {environment ? (
         <>
           <ProjectPathInput value={pathInput} onChangeText={setPathInput} onSubmit={submitPath} />
+          {environment.supportsJujutsuWorkflows ? (
+            <ListSection>
+              <ListRow
+                isFirst
+                title="Use Jujutsu"
+                icon={
+                  <SymbolView
+                    name="arrow.triangle.branch"
+                    size={20}
+                    tintColorClassName="accent-icon-muted"
+                    type="monochrome"
+                  />
+                }
+                subtitle="Clone as a colocated JJ repository"
+                right={
+                  <ThemedSwitch
+                    accessibilityLabel="Use Jujutsu"
+                    value={cloneWithJj}
+                    onValueChange={setCloneWithJj}
+                  />
+                }
+                onPress={() => setCloneWithJj((value) => !value)}
+              />
+            </ListSection>
+          ) : null}
           <PrimaryActionButton
             label="Clone project"
             disabled={!canCloneProject || isBrowseNavigating || isSubmitting || !remoteUrl}
