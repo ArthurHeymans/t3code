@@ -83,7 +83,7 @@ const untrackedPaths = Effect.fn("JjWorktreeCleanup.untrackedPaths")(function* (
   // Classify the top level first so build output and dependency folders are
   // not walked file by file.
   const top = (yield* fileSystem.readDirectory(cwd)).filter(
-    (name) => name !== ".jj" && name !== ".git" && name !== "node_modules",
+    (name) => name !== ".jj" && name !== ".git",
   );
   const topCandidates = top.filter((name) => !tracked.has(name));
   const notIgnored = new Set(yield* jj.filterIgnoredPaths(cwd, topCandidates));
@@ -108,12 +108,15 @@ const untrackedPaths = Effect.fn("JjWorktreeCleanup.untrackedPaths")(function* (
       candidates.push(relative);
       continue;
     }
-    if ((yield* fileSystem.stat(absolute)).type !== "Directory") {
+    if (
+      (yield* fileSystem.stat(absolute)).type !== "Directory" ||
+      (path.basename(relative) === "node_modules" && !trackedDirectories.has(relative))
+    ) {
       candidates.push(relative);
       continue;
     }
     for (const name of yield* fileSystem.readDirectory(absolute)) {
-      if (name === "node_modules" || name === ".jj" || name === ".git") continue;
+      if (name === ".jj" || name === ".git") continue;
       const child = `${relative}/${name}`;
       if (!tracked.has(child)) pending.push(child);
     }

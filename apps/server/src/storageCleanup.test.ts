@@ -1,5 +1,4 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as NodeFS from "node:fs";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -17,6 +16,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type WorktreeKeepWhen,
   type StorageCleanupSettings,
+  type StorageCleanupReport,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ServerConfig from "./config.ts";
@@ -1915,7 +1915,7 @@ it.live("keeps saved usage data when removing a settled checkout", () =>
 );
 
 describe("Jujutsu workspace cleanup", () => {
-  const jjEntries = (report: { entries: ReadonlyArray<{ path: string | null }> }, path: string) =>
+  const jjEntries = (report: StorageCleanupReport, path: string) =>
     report.entries.filter((entry) => entry.path === path);
 
   const withRemote = (fixture: Effect.Success<ReturnType<typeof cleanupFixture>>) =>
@@ -2011,6 +2011,36 @@ describe("Jujutsu workspace cleanup", () => {
     ),
   );
 
+  it.live.each(["uncommitted-changes", "any-local-files"] as const)(
+    "removes ignored dependency directories under %s",
+    (keepWhen) =>
+      runCleanupTest(
+        Effect.gen(function* () {
+          const fixture = yield* cleanupFixture(undefined, "jj");
+          fixture.setPolicy(keepWhen);
+          yield* fixture.fs.makeDirectory(`${fixture.worktree}/packages/app`, { recursive: true });
+          yield* fixture.fs.writeFileString(
+            `${fixture.worktree}/packages/app/package.json`,
+            "{}\n",
+          );
+          yield* fixture.jjCommand(fixture.worktree, ["commit", "-m", "add package"]);
+          yield* fixture.jjCommand(fixture.worktree, ["bookmark", "set", "feature", "-r", "@-"]);
+          for (const directory of ["node_modules", "packages/app/node_modules"]) {
+            yield* fixture.fs.makeDirectory(`${fixture.worktree}/${directory}`, {
+              recursive: true,
+            });
+            yield* fixture.fs.writeFileString(
+              `${fixture.worktree}/${directory}/output.js`,
+              "output\n",
+            );
+          }
+          const report = yield* fixture.service.runNow;
+          expect(jjEntries(report, fixture.worktree)).toMatchObject([{ outcome: "removed" }]);
+          expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+        }),
+      ),
+  );
+
   it.live("keeps a workspace ref that resume could not recreate", () =>
     runCleanupTest(
       Effect.gen(function* () {
@@ -2033,13 +2063,14 @@ describe("Jujutsu workspace cleanup", () => {
   it.live("rechecks the working copy after measuring", () =>
     runCleanupTest(
       Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
         let statusCalls = 0;
         const fixture = yield* cleanupFixture(undefined, "jj", (driver) => ({
           ...driver,
           localStatus: (cwd) =>
             Effect.gen(function* () {
               if (++statusCalls === 2) {
-                NodeFS.writeFileSync(`${cwd}/late.txt`, "late work\n");
+                yield* fs.writeFileString(`${cwd}/late.txt`, "late work\n").pipe(Effect.orDie);
                 yield* driver.execute({
                   operation: "test.lateCommit",
                   cwd,
@@ -2061,11 +2092,12 @@ describe("Jujutsu workspace cleanup", () => {
   it.live("refuses to forget a workspace that changed during removal", () =>
     runCleanupTest(
       Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
         const fixture = yield* cleanupFixture(undefined, "jj", (driver) => ({
           ...driver,
           removeWorktree: (input, options) =>
             Effect.gen(function* () {
-              NodeFS.writeFileSync(`${input.path}/late.txt`, "late work\n");
+              yield* fs.writeFileString(`${input.path}/late.txt`, "late work\n").pipe(Effect.orDie);
               yield* driver.execute({
                 operation: "test.lateCommit",
                 cwd: input.path,
