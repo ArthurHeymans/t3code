@@ -374,7 +374,11 @@ const make = Effect.gen(function* () {
         input.workspaceStrategy.type === "existing_worktree"
           ? input.workspaceStrategy.worktreePath
           : null;
-      if (input.workspaceStrategy.type === "existing_worktree") {
+      // Scratch folders use existing_worktree bindings but are not VCS worktrees.
+      if (
+        input.workspaceStrategy.type === "existing_worktree" &&
+        !(yield* managedFolders.isScratchProject(input.projectId))
+      ) {
         yield* git
           .validateWorktreePath({
             cwd: project.workspaceRoot,

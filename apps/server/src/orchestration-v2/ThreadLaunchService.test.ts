@@ -854,6 +854,12 @@ function scratchHarness() {
       detail: "Failed to resolve the VCS driver for this Git command.",
     });
   const harness = makeHarness({
+    git: {
+      validateWorktreePath: (input) =>
+        input.cwd === scratchRoot
+          ? Effect.fail(notARepository("GitWorkflowService.route", input.cwd))
+          : Effect.void,
+    },
     managedFolders: Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
       namedProjectsRoot: "/projects",
       isScratchProject: (id) => Effect.succeed(id === projectId),
@@ -929,6 +935,60 @@ function scheduledTaskInput(id: string, targetProjectId: ProjectId) {
     interactionMode: "default" as const,
   };
 }
+
+it.effect("launches No project in its own folder without a repository", () => {
+  const harness = scratchHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:scratch-root",
+        thread: "thread:launch:scratch-root",
+        message: "Tidy my notes",
+      }),
+    );
+    const scratch = yield* preparationSettled(launched.threadId);
+    assert.equal(scratch.runs[0]?.status, "starting");
+    assert.equal(scratch.thread.worktreePath, "/scratch/folder-1");
+    assert.equal(harness.runSetup.mock.calls[0]?.[0]?.worktreePath, "/scratch/folder-1");
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("rejects an existing worktree when repository validation fails", () => {
+  const detail = "The workspace does not belong to this repository.";
+  const harness = makeHarness({
+    git: {
+      validateWorktreePath: (input) =>
+        Effect.fail(
+          new GitCommandError({
+            operation: "JjVcsDriver.validateWorktreePath",
+            command: "jj root",
+            cwd: input.cwd,
+            detail,
+          }),
+        ),
+    },
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:invalid-worktree",
+        thread: "thread:launch:invalid-worktree",
+        message: "Build the feature",
+        workspace: { type: "existing_worktree", worktreePath: "/other-repo-worktree" },
+      }),
+    );
+    const projection = yield* preparationSettled(launched.threadId);
+    assert.equal(projection.runs[0]?.status, "failed");
+    assert.include(
+      projection.turnItems.find((item) => item.type === "error")?.failure.message ?? "",
+      detail,
+    );
+    assert.equal(harness.runSetup.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
 
 it.effect("launches a worktree request for Scratch at the root, in its own folder", () => {
   const harness = scratchHarness();
